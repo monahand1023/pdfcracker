@@ -52,11 +52,20 @@ This builds three binaries: `pdfcrack` (standalone), `server` (distributed coord
 
 ### Checkpoints
 
-Interrupted runs are saved automatically. Resume with:
+Interrupted runs (Ctrl+C) are saved automatically. Resume any attack mode with `-r`:
 
 ```bash
+# Resume brute-force
 ./pdfcrack -f document.pdf -b -l 8 -r
+
+# Resume mask attack (pattern is saved in checkpoint)
+./pdfcrack -f document.pdf -m "?u?u?u?d?d?d?d" -r
+
+# Resume hybrid attack (suffix length is saved)
+./pdfcrack -f document.pdf -d words.txt -H 3 -r
 ```
+
+Checkpoints store the attack mode, position, and all mode-specific parameters (mask pattern, hybrid suffix length, auto-mode phase). The checkpoint file is placed next to the PDF.
 
 ## Distributed Cracking
 
@@ -128,15 +137,15 @@ Or allow it when macOS shows the "Allow incoming connections?" dialog on first r
 
 Tested on M4 Pro (14 cores):
 
-| Revision | Speed (CPU+GPU) | Notes |
-|----------|----------------|-------|
-| R2 (40-bit RC4) | ~4.5M/s | Fastest |
-| R3 (128-bit RC4) | ~300K/s | Most common |
-| R4 (AES-128) | ~300K/s | Same crypto as R3 |
-| R5 (AES-256) | ~20M/s | SHA-256 based |
-| R6 (AES-256) | ~3K/s | Deliberately slow KDF |
+| Revision | Speed | Engine | Notes |
+|----------|-------|--------|-------|
+| R2 (40-bit RC4) | ~15.9M/s | NEON SIMD | Fastest |
+| R3 (128-bit RC4) | ~812K/s | NEON SIMD | Most common |
+| R4 (AES-128) | ~812K/s | NEON SIMD | Same crypto as R3 |
+| R5 (AES-256) | ~104M/s | Metal GPU | SHA-256 based |
+| R6 (AES-256) | ~14K/s | CPU only | Deliberately slow KDF |
 
-GPU acceleration provides ~30% speedup for R2-R4 by offloading MD5 key derivation to Metal while CPU handles RC4 verification.
+The engine is auto-selected at startup: NEON SIMD for R2-R4 (4 passwords per core via ARM vector registers), Metal GPU for R5 (full SHA-256 verification on-chip). Use `-G` to force CPU-only mode.
 
 ## Supported PDF Encryption
 
