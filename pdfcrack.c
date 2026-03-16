@@ -49,6 +49,11 @@ static char        g_password[MAX_PASS_LEN + 1] = {0};
 static atomic_long g_tested  = 0;
 static atomic_long g_total   = 0;   /* 0 = unknown */
 
+/* ── overall progress (brute-force across all lengths) ─────────── */
+static long        g_overall_total  = 0;  /* precomputed total across all lengths */
+static atomic_int  g_current_len    = 0;  /* current password length being tested */
+static long        g_completed_prior = 0; /* completed candidates from prior lengths */
+
 /* ── config (read-only after parse) ──────────────────────────── */
 static const char *g_pdf_path = NULL;
 static const char *g_charset  = NULL;
@@ -98,6 +103,31 @@ static inline int test_password_cg(CGPDFDocumentRef doc, const char *pass)
 }
 
 /* ================================================================
+ * Human-readable number formatting
+ * ================================================================ */
+static void fmt_num(long n, char *buf, size_t sz)
+{
+    if (n >= 1000000000L)
+        snprintf(buf, sz, "%.1fB", (double)n / 1e9);
+    else if (n >= 1000000L)
+        snprintf(buf, sz, "%.1fM", (double)n / 1e6);
+    else if (n >= 10000L)
+        snprintf(buf, sz, "%.1fK", (double)n / 1e3);
+    else
+        snprintf(buf, sz, "%ld", n);
+}
+
+static void fmt_time(long secs, char *buf, size_t sz)
+{
+    if (secs >= 3600)
+        snprintf(buf, sz, "%ldh%02ldm", secs / 3600, (secs % 3600) / 60);
+    else if (secs >= 60)
+        snprintf(buf, sz, "%ldm%02lds", secs / 60, secs % 60);
+    else
+        snprintf(buf, sz, "%lds", secs);
+}
+
+/* ================================================================
  * Progress thread
  * ================================================================ */
 static void print_bar(double pct)
@@ -133,29 +163,84 @@ static void *progress_thread(void *arg)
         for (int i = 0; i < 8; i++) avg_rate += avg_buf[i];
         avg_rate /= 8;
 
-        fputs("\r  ", stderr);
+        char s_cur[16], s_total[16], s_rate[16], s_elapsed[16], s_eta[16];
+        fmt_num(rate, s_rate, sizeof(s_rate));
+        fmt_time(elapsed, s_elapsed, sizeof(s_elapsed));
 
-        if (total > 0) {
+        /* Overall progress line (brute-force only, when we have overall totals) */
+        long ov_total = g_overall_total;
+        if (ov_total > 0) {
+            long ov_cur = g_completed_prior + cur;
+            double ov_pct = (double)ov_cur / (double)ov_total * 100.0;
+            if (ov_pct > 100.0) ov_pct = 100.0;
+
+            char s_ov_cur[16], s_ov_total[16], s_ov_eta[16];
+            fmt_num(ov_cur, s_ov_cur, sizeof(s_ov_cur));
+            fmt_num(ov_total, s_ov_total, sizeof(s_ov_total));
+
+            long ov_eta = -1;
+            if (avg_rate > 0 && ov_total > ov_cur)
+                ov_eta = (ov_total - ov_cur) / avg_rate;
+
+            fprintf(stderr, "\r\033[K  Overall ");
+            print_bar(ov_pct);
+            if (ov_eta >= 0) {
+                fmt_time(ov_eta, s_ov_eta, sizeof(s_ov_eta));
+                fprintf(stderr, " %5.1f%%  %s/%s  ETA %s",
+                        ov_pct, s_ov_cur, s_ov_total, s_ov_eta);
+            } else {
+                fprintf(stderr, " %5.1f%%  %s/%s",
+                        ov_pct, s_ov_cur, s_ov_total);
+            }
+
+            /* Current length line */
+            int cur_len = atomic_load(&g_current_len);
+            if (total > 0 && cur_len > 0) {
+                double pct = (double)cur / (double)total * 100.0;
+                if (pct > 100.0) pct = 100.0;
+                fmt_num(cur, s_cur, sizeof(s_cur));
+                fmt_num(total, s_total, sizeof(s_total));
+
+                fprintf(stderr, "\n\033[K  Len %d  ", cur_len);
+                print_bar(pct);
+                fprintf(stderr, " %5.1f%%  %s/%s  %s/s  %s",
+                        pct, s_cur, s_total, s_rate, s_elapsed);
+
+                long eta = -1;
+                if (avg_rate > 0 && total > cur)
+                    eta = (total - cur) / avg_rate;
+                if (eta >= 0) {
+                    fmt_time(eta, s_eta, sizeof(s_eta));
+                    fprintf(stderr, "  ETA %s", s_eta);
+                }
+                fprintf(stderr, "   \033[A"); /* move cursor back up */
+            }
+        } else if (total > 0) {
+            /* Single-level progress (dictionary mode) */
             double pct = (double)cur / (double)total * 100.0;
             if (pct > 100.0) pct = 100.0;
+            fmt_num(cur, s_cur, sizeof(s_cur));
+            fmt_num(total, s_total, sizeof(s_total));
+
+            fprintf(stderr, "\r\033[K  ");
             print_bar(pct);
 
             long eta = -1;
             if (avg_rate > 0 && total > cur)
                 eta = (total - cur) / avg_rate;
 
-            if (eta >= 0)
-                fprintf(stderr,
-                    " %5.1f%%  %ld/%ld  %ld/s  elapsed %lds  ETA %lds   ",
-                    pct, cur, total, rate, elapsed, eta);
-            else
-                fprintf(stderr,
-                    " %5.1f%%  %ld/%ld  %ld/s  elapsed %lds   ",
-                    pct, cur, total, rate, elapsed);
+            if (eta >= 0) {
+                fmt_time(eta, s_eta, sizeof(s_eta));
+                fprintf(stderr, " %5.1f%%  %s/%s  %s/s  %s  ETA %s",
+                        pct, s_cur, s_total, s_rate, s_elapsed, s_eta);
+            } else {
+                fprintf(stderr, " %5.1f%%  %s/%s  %s/s  %s",
+                        pct, s_cur, s_total, s_rate, s_elapsed);
+            }
         } else {
-            fprintf(stderr,
-                "  tested: %-12ld  %ld/s  elapsed: %lds   ",
-                cur, rate, elapsed);
+            fmt_num(cur, s_cur, sizeof(s_cur));
+            fprintf(stderr, "\r\033[K  tested: %s  %s/s  %s",
+                    s_cur, s_rate, s_elapsed);
         }
         fflush(stderr);
     }
@@ -739,12 +824,19 @@ int main(int argc, char *argv[])
 
     /* ── Brute-force attack ────────────────────────────────────── */
     else {
+        /* Precompute overall total across all lengths */
+        long ov_sum = 0;
+        for (int l = 1; l <= max_len; l++)
+            ov_sum += count_for_length(l);
+        g_overall_total = ov_sum;
+        g_completed_prior = 0;
+
         fprintf(stderr, "Mode   : brute-force (len 1..%d, charset \"%s\")\n\n",
                 max_len, charset);
 
         for (int len = 1; len <= max_len && !atomic_load(&g_found); len++) {
             long total = count_for_length(len);
-            fprintf(stderr, "\n  [len %d] %ld candidates\n", len, total);
+            atomic_store(&g_current_len, len);
 
             atomic_store(&g_tested, 0);
             atomic_store(&g_total, total);
@@ -779,6 +871,7 @@ int main(int argc, char *argv[])
                 }
             }
             for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+            g_completed_prior += total;
         }
     }
 
