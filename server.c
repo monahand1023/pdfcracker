@@ -125,6 +125,9 @@ static const char *g_pdf_path = NULL;
 /* Listen fd (for shutdown) */
 static int g_listenfd = -1;
 
+/* Server binary directory (for serving files over HTTP) */
+static char g_server_dir[PATH_MAX] = ".";
+
 /* ================================================================
  * Load PDF file into memory
  * ================================================================ */
@@ -520,6 +523,118 @@ static int find_client_by_uuid(const char *uuid)
 /* ================================================================
  * Client handler thread
  * ================================================================ */
+/* ================================================================
+ * HTTP bootstrap — serve client binary on the same port
+ * ================================================================ */
+
+static void http_serve_file(int fd, const char *path, const char *content_type)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        dprintf(fd, "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        return;
+    }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    dprintf(fd, "HTTP/1.0 200 OK\r\n"
+                "Content-Type: %s\r\n"
+                "Content-Length: %ld\r\n"
+                "\r\n", content_type, sz);
+
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        write(fd, buf, n);
+    }
+    fclose(fp);
+}
+
+static void handle_http_request(int fd, const char *request_line)
+{
+    /* Parse "GET /path HTTP/1.x" */
+    char path[256] = {0};
+    if (sscanf(request_line, "GET /%255s", path) < 1) {
+        /* GET / — serve a simple help page */
+        const char *body =
+            "pdfcracker - run this on any Mac to join:\n\n"
+            "  curl http://THIS_IP:THIS_PORT/join.sh | bash\n\n";
+        dprintf(fd, "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: %zu\r\n"
+                    "\r\n%s", strlen(body), body);
+        return;
+    }
+
+    /* Drain remaining HTTP headers */
+    char hdr[MAX_LINE];
+    while (sock_readline(fd, hdr, sizeof(hdr)) > 0) {
+        if (hdr[0] == '\0' || hdr[0] == '\r') break;
+    }
+
+    /* Only serve known files */
+    if (strcmp(path, "client") == 0) {
+        char fpath[PATH_MAX];
+        snprintf(fpath, sizeof(fpath), "%s/client", g_server_dir);
+        http_serve_file(fd, fpath, "application/octet-stream");
+    } else if (strcmp(path, "pdf_md5.metallib") == 0) {
+        char fpath[PATH_MAX];
+        snprintf(fpath, sizeof(fpath), "%s/pdf_md5.metallib", g_server_dir);
+        http_serve_file(fd, fpath, "application/octet-stream");
+    } else if (strcmp(path, "join.sh") == 0) {
+        /* Generate join.sh dynamically with correct IP and port */
+        struct sockaddr_in local_addr;
+        socklen_t local_len = sizeof(local_addr);
+        char server_ip[INET_ADDRSTRLEN] = "SERVER_IP";
+        int server_port = DEFAULT_PORT;
+        if (getsockname(fd, (struct sockaddr *)&local_addr, &local_len) == 0) {
+            inet_ntop(AF_INET, &local_addr.sin_addr, server_ip, sizeof(server_ip));
+            server_port = ntohs(local_addr.sin_port);
+        }
+        /* If bound to 0.0.0.0, try to detect real IP */
+        if (strcmp(server_ip, "0.0.0.0") == 0) {
+            struct sockaddr_in peer_addr;
+            socklen_t peer_len = sizeof(peer_addr);
+            if (getpeername(fd, (struct sockaddr *)&peer_addr, &peer_len) == 0) {
+                /* Use the local address that routes to this peer */
+                getsockname(fd, (struct sockaddr *)&local_addr, &local_len);
+                inet_ntop(AF_INET, &local_addr.sin_addr, server_ip, sizeof(server_ip));
+            }
+        }
+
+        char body[2048];
+        int blen = snprintf(body, sizeof(body),
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "DIR=\"$HOME/.pdfcracker\"\n"
+            "mkdir -p \"$DIR\"\n"
+            "echo \"Downloading client...\"\n"
+            "curl -sL http://%s:%d/client -o \"$DIR/client\"\n"
+            "curl -sL http://%s:%d/pdf_md5.metallib -o \"$DIR/pdf_md5.metallib\"\n"
+            "chmod +x \"$DIR/client\"\n"
+            "echo \"Starting pdfcracker client -> %s:%d\"\n"
+            "echo \"Press Ctrl+C to stop.\"\n"
+            "echo \"---\"\n"
+            "cd \"$DIR\"\n"
+            "exec ./client -s %s -p %d\n",
+            server_ip, server_port,
+            server_ip, server_port,
+            server_ip, server_port,
+            server_ip, server_port);
+        dprintf(fd, "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: %d\r\n"
+                    "\r\n%s", blen, body);
+    } else {
+        dprintf(fd, "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+    }
+}
+
+/* ================================================================
+ * Client handler
+ * ================================================================ */
+
 static void *client_handler(void *arg)
 {
     int fd = *(int *)arg;
@@ -536,8 +651,18 @@ static void *client_handler(void *arg)
         inet_ntop(AF_INET, &peer_addr.sin_addr, ip_str, sizeof(ip_str));
     }
 
-    /* ── Handshake: expect HELLO <ncores> <uuid> <proto_version> ── */
+    /* ── Read first line: HELLO (protocol) or GET (HTTP bootstrap) ── */
     if (sock_readline(fd, line, sizeof(line)) < 0) goto done;
+
+    /* HTTP request? Serve files and close. */
+    if (strncmp(line, "GET ", 4) == 0) {
+        char req_path[256] = "/";
+        sscanf(line, "GET %255s", req_path);
+        fprintf(stderr, "[%s] HTTP %s\n", ip_str, req_path);
+        handle_http_request(fd, line);
+        close(fd);
+        return NULL;
+    }
 
     int ncores = 0, proto_ver = 0;
     char uuid[UUID_LEN + 1] = {0};
@@ -1213,6 +1338,19 @@ int main(int argc, char *argv[])
 {
     signal(SIGPIPE, SIG_IGN);
 
+    /* Determine server binary directory (for HTTP file serving) */
+    {
+        char *dir = dirname(strdup(argv[0]));
+        if (dir[0] == '/') {
+            strncpy(g_server_dir, dir, PATH_MAX - 1);
+        } else {
+            char cwd[PATH_MAX];
+            if (getcwd(cwd, sizeof(cwd))) {
+                snprintf(g_server_dir, sizeof(g_server_dir), "%s/%s", cwd, dir);
+            }
+        }
+    }
+
     const char *pdf_path      = NULL;
     const char *dict_path     = NULL;
     const char *charset       = DEFAULT_CHARSET;
@@ -1307,7 +1445,8 @@ int main(int argc, char *argv[])
     }
     if (listen(g_listenfd, 16) < 0) { perror("listen"); return 1; }
 
-    fprintf(stderr, "\nListening on port %d — waiting for clients...\n\n", port);
+    fprintf(stderr, "\nListening on port %d\n", port);
+    fprintf(stderr, "Other Macs can join:  curl http://<this-ip>:%d/join.sh | bash\n\n", port);
 
     /* ── Spawn local client (cracks on this machine too) ──────── */
     pid_t local_client_pid = -1;
