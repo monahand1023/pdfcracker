@@ -1,0 +1,15 @@
+# Build artifacts
+*.o
+*.air
+*.metallib
+pdfcrack
+server
+client
+test_all
+test_crypto
+
+# Test PDFs
+*.pdf
+
+# macOS
+.DS_Store
