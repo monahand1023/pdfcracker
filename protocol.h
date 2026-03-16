@@ -3,8 +3,8 @@
  *
  * Protocol is text-line-based over TCP, with one binary transfer (the PDF).
  *
- * Session flow:
- *   C→S: HELLO <ncores>
+ * Session flow (v2):
+ *   C→S: HELLO <ncores> <uuid> <proto_version>
  *   S→C: CONFIG BRUTE <maxlen>      or   CONFIG DICT
  *         CHARSET <charset>               PDF <nbytes>
  *         PDF <nbytes>                    <raw bytes>
@@ -12,41 +12,81 @@
  *   C→S: READY
  *
  *   [work loop]
- *   C→S: GETWORK <tested_in_prev_chunk>
- *   S→C: BRUTE <length> <start> <end>
- *     or DICT <count>            ← followed by <count> word lines
- *            <word1>
- *            …
+ *   C→S: GETWORK <tested> <elapsed_secs>
+ *   S→C: BRUTE <length> <start> <end> <lease_id>
+ *     or DICT <count> <lease_id>     ← followed by <count> word lines
  *     or FOUND <password>
  *     or DONE
+ *     or ABORT
  *
- *   C→S: FOUND <password>         ← password discovered
- *     or EXHAUSTED                ← chunk done, not found
+ *   C→S: HEARTBEAT <lease_id> <tested_so_far>
+ *   S→C: OK  or  ABORT
+ *
+ *   C→S: COMPLETE <lease_id> <tested>
+ *   C→S: PARTIAL <lease_id> <high_water_mark>
+ *   C→S: FOUND <password> <lease_id>
  */
 
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 
+_Static_assert(sizeof(long) >= 8, "64-bit long required");
+
 #define DEFAULT_PORT      9999
 #define CHUNK_BRUTE       500000L
 #define CHUNK_DICT        5000
 #define MAX_PASS_LEN      32
-#define MAX_LINE          512
+#define MAX_LINE          1024
 #define MAX_CLIENTS       64
 #define DEFAULT_CHARSET   \
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+/* ── Protocol version ────────────────────────────────────────── */
+#define PROTO_VERSION       2
+
+/* ── Adaptive chunk sizing ───────────────────────────────────── */
+#define MIN_CHUNK_BRUTE     10000L
+#define MAX_CHUNK_BRUTE     5000000L
+#define MIN_CHUNK_DICT      500L
+#define MAX_CHUNK_DICT      50000L
+#define DEFAULT_CHUNK_BRUTE 500000L
+#define DEFAULT_CHUNK_DICT  5000L
+#define TARGET_SECS         30.0
+
+/* ── Lease deadlines ─────────────────────────────────────────── */
+#define MIN_LEASE_SECS      120
+#define MAX_LEASE_SECS      300
+#define LEASE_MULTIPLIER    3
+
+/* ── Heartbeat / reaper ──────────────────────────────────────── */
+#define HEARTBEAT_TIMEOUT   60
+#define REAPER_INTERVAL     5
+
+/* ── Checkpoint ──────────────────────────────────────────────── */
+#define CHECKPOINT_INTERVAL 30
+
+/* ── Client reconnection ─────────────────────────────────────── */
+#define RECONNECT_BASE_SEC  3
+#define RECONNECT_MAX_SEC   60
+#define RECONNECT_MAX_TRIES 20
+
+/* ── Identity ────────────────────────────────────────────────── */
+#define UUID_LEN            36
+#define SHA256_HEX_LEN      64
 
 /* ── Read exactly n bytes ─────────────────────────────────────── */
 static inline ssize_t read_exact(int fd, void *buf, size_t n)
@@ -131,6 +171,25 @@ static inline void index_to_password(long idx, int length,
         idx /= cs_len;
     }
     out[length] = '\0';
+}
+
+/* ── SHA-256 hex string ──────────────────────────────────────── */
+#include <CommonCrypto/CommonDigest.h>
+
+static inline void sha256_hex(const void *data, size_t len, char out[SHA256_HEX_LEN + 1])
+{
+    uint8_t hash[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data, (CC_LONG)len, hash);
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+        snprintf(out + i * 2, 3, "%02x", hash[i]);
+}
+
+/* ── Monotonic clock (seconds, NTP-safe) ─────────────────────── */
+static inline double mono_time(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
 #endif /* PROTOCOL_H */

@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/qos.h>
+#include <signal.h>
 #include <mach/mach_time.h>
 #include "pdf_encrypt.h"
 #include "metal_keygen.h"
@@ -42,6 +43,7 @@
 #define MAX_PASS_LEN 32
 #define MAX_THREADS  64
 #define BAR_WIDTH    35
+#define CKPT_INTERVAL 5  /* seconds between checkpoint saves */
 
 /* ── shared state ─────────────────────────────────────────────── */
 static atomic_int  g_found   = 0;
@@ -74,6 +76,16 @@ static atomic_long         g_next_idx  = 0; /* shared work counter for GPU+CPU *
 /* ── dictionary word list ─────────────────────────────────────── */
 static char **g_words  = NULL;
 static long   g_nwords = 0;
+
+/* ── checkpoint/resume ────────────────────────────────────────── */
+static char g_ckpt_path[1024] = {0};
+static int  g_is_brute = 0;  /* 1 = brute-force, 0 = dictionary (for checkpoint) */
+
+/* ── prefix/suffix for guided brute-force ─────────────────────── */
+static char g_prefix[MAX_PASS_LEN + 1] = {0};
+static char g_suffix[MAX_PASS_LEN + 1] = {0};
+static int  g_prefix_len = 0;
+static int  g_suffix_len = 0;
 
 /* ================================================================
  * PDF helpers
@@ -128,6 +140,105 @@ static void fmt_time(long secs, char *buf, size_t sz)
 }
 
 /* ================================================================
+ * Checkpoint save/load/delete
+ * ================================================================ */
+static void ckpt_make_path(const char *pdf_path)
+{
+    /* Place checkpoint file next to the PDF: <name>.ckpt */
+    const char *dot = strrchr(pdf_path, '.');
+    if (dot) {
+        size_t base = (size_t)(dot - pdf_path);
+        if (base >= sizeof(g_ckpt_path) - 6) base = sizeof(g_ckpt_path) - 6;
+        memcpy(g_ckpt_path, pdf_path, base);
+        strcpy(g_ckpt_path + base, ".ckpt");
+    } else {
+        snprintf(g_ckpt_path, sizeof(g_ckpt_path), "%s.ckpt", pdf_path);
+    }
+}
+
+static void ckpt_save(void)
+{
+    if (!g_ckpt_path[0]) return;
+
+    char tmp[1040];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", g_ckpt_path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+
+    if (g_is_brute) {
+        int cur_len = atomic_load(&g_current_len);
+        long cur_idx = atomic_load(&g_next_idx);
+        fprintf(f, "mode=brute\n");
+        fprintf(f, "charset=%s\n", g_charset);
+        fprintf(f, "current_len=%d\n", cur_len);
+        fprintf(f, "current_idx=%ld\n", cur_idx);
+        fprintf(f, "completed_prior=%ld\n", g_completed_prior);
+    } else {
+        long cur_idx = atomic_load(&g_next_idx);
+        fprintf(f, "mode=dict\n");
+        fprintf(f, "current_idx=%ld\n", cur_idx);
+    }
+    fclose(f);
+    rename(tmp, g_ckpt_path);  /* atomic replace */
+}
+
+typedef struct {
+    int  valid;
+    int  is_brute;
+    char charset[256];
+    int  resume_len;
+    long resume_idx;
+    long completed_prior;
+    long dict_idx;
+} Checkpoint;
+
+static Checkpoint ckpt_load(void)
+{
+    Checkpoint ck = {0};
+    if (!g_ckpt_path[0]) return ck;
+
+    FILE *f = fopen(g_ckpt_path, "r");
+    if (!f) return ck;
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (strncmp(line, "mode=brute", 10) == 0) {
+            ck.is_brute = 1;
+        } else if (strncmp(line, "mode=dict", 9) == 0) {
+            ck.is_brute = 0;
+        } else if (strncmp(line, "charset=", 8) == 0) {
+            strncpy(ck.charset, line + 8, sizeof(ck.charset) - 1);
+        } else if (strncmp(line, "current_len=", 12) == 0) {
+            ck.resume_len = atoi(line + 12);
+        } else if (strncmp(line, "current_idx=", 12) == 0) {
+            ck.resume_idx = atol(line + 12);
+            ck.dict_idx = ck.resume_idx;
+        } else if (strncmp(line, "completed_prior=", 16) == 0) {
+            ck.completed_prior = atol(line + 16);
+        }
+    }
+    fclose(f);
+    ck.valid = 1;
+    return ck;
+}
+
+static void ckpt_delete(void)
+{
+    if (g_ckpt_path[0])
+        unlink(g_ckpt_path);
+}
+
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    ckpt_save();
+    const char msg[] = "\nInterrupted — checkpoint saved.\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(1);
+}
+
+/* ================================================================
  * Progress thread
  * ================================================================ */
 static void print_bar(double pct)
@@ -144,6 +255,7 @@ static void *progress_thread(void *arg)
     (void)arg;
     long   prev    = 0;
     time_t t0      = time(NULL);
+    time_t last_ckpt = t0;
     long   avg_buf[8] = {0};
     int    avg_i   = 0;
 
@@ -243,6 +355,13 @@ static void *progress_thread(void *arg)
                     s_cur, s_rate, s_elapsed);
         }
         fflush(stderr);
+
+        /* Periodic checkpoint */
+        time_t now = time(NULL);
+        if (now - last_ckpt >= CKPT_INTERVAL) {
+            ckpt_save();
+            last_ckpt = now;
+        }
     }
     return NULL;
 }
@@ -327,11 +446,23 @@ static void *dict_worker(void *arg)
  * ================================================================ */
 static void index_to_pass(long idx, int length, char *out)
 {
+    /* If prefix/suffix set, build: prefix + brute_middle + suffix
+     * 'length' here is the length of the brute-force middle part */
+    int pos = 0;
+    if (g_prefix_len) {
+        memcpy(out, g_prefix, g_prefix_len);
+        pos = g_prefix_len;
+    }
     for (int i = length - 1; i >= 0; i--) {
-        out[i] = g_charset[idx % g_cs_len];
+        out[pos + i] = g_charset[idx % g_cs_len];
         idx /= g_cs_len;
     }
-    out[length] = '\0';
+    pos += length;
+    if (g_suffix_len) {
+        memcpy(out + pos, g_suffix, g_suffix_len);
+        pos += g_suffix_len;
+    }
+    out[pos] = '\0';
 }
 
 static long count_for_length(int len)
@@ -682,6 +813,110 @@ static int load_wordlist(const char *path)
 }
 
 /* ================================================================
+ * Interactive password interview
+ * ================================================================ */
+typedef struct {
+    char charset[256];
+    int  min_len;
+    int  max_len;
+    char prefix[MAX_PASS_LEN + 1];
+    char suffix[MAX_PASS_LEN + 1];
+    int  configured;
+} PasswordHints;
+
+static void read_line(char *buf, size_t sz)
+{
+    if (!fgets(buf, (int)sz, stdin)) buf[0] = '\0';
+    buf[strcspn(buf, "\n")] = '\0';
+}
+
+static PasswordHints interactive_interview(void)
+{
+    PasswordHints h = {0};
+    h.min_len = 1;
+    h.max_len = 8;
+    strcpy(h.charset, DEFAULT_CHARSET);
+
+    char buf[256];
+
+    fprintf(stderr, "\n── Password Interview ──────────────────────────────\n");
+    fprintf(stderr, "Answer what you can. Press Enter to skip any question.\n");
+    fprintf(stderr, "These hints guide the search order but won't prevent\n");
+    fprintf(stderr, "trying other possibilities if they don't work.\n\n");
+
+    /* Character types */
+    fprintf(stderr, "What characters might the password contain?\n");
+    fprintf(stderr, "  1) Digits only (0-9)\n");
+    fprintf(stderr, "  2) Lowercase letters + digits\n");
+    fprintf(stderr, "  3) Letters + digits (mixed case)\n");
+    fprintf(stderr, "  4) Letters + digits + symbols\n");
+    fprintf(stderr, "  5) Custom charset\n");
+    fprintf(stderr, "  [Enter = try all, starting with digits]\n");
+    fprintf(stderr, "> ");
+    read_line(buf, sizeof(buf));
+
+    if (buf[0] == '1') {
+        strcpy(h.charset, "0123456789");
+    } else if (buf[0] == '2') {
+        strcpy(h.charset, "abcdefghijklmnopqrstuvwxyz0123456789");
+    } else if (buf[0] == '3') {
+        strcpy(h.charset, DEFAULT_CHARSET);
+    } else if (buf[0] == '4') {
+        strcpy(h.charset, DEFAULT_CHARSET "!@#$%^&*()-_=+[]{}|;:',.<>?/`~");
+    } else if (buf[0] == '5') {
+        fprintf(stderr, "Enter charset: ");
+        read_line(buf, sizeof(buf));
+        if (buf[0]) strncpy(h.charset, buf, sizeof(h.charset) - 1);
+    }
+
+    /* Length */
+    fprintf(stderr, "\nApproximate password length? (e.g. \"4\", \"6-8\")\n");
+    fprintf(stderr, "  [Enter = try 1 to 8]\n");
+    fprintf(stderr, "> ");
+    read_line(buf, sizeof(buf));
+
+    if (buf[0]) {
+        char *dash = strchr(buf, '-');
+        if (dash) {
+            h.min_len = atoi(buf);
+            h.max_len = atoi(dash + 1);
+        } else {
+            int n = atoi(buf);
+            if (n > 0) { h.min_len = n; h.max_len = n; }
+        }
+        if (h.min_len < 1) h.min_len = 1;
+        if (h.max_len < h.min_len) h.max_len = h.min_len;
+        if (h.max_len > MAX_PASS_LEN) h.max_len = MAX_PASS_LEN;
+    }
+
+    /* Known prefix/suffix */
+    fprintf(stderr, "\nDoes the password start with anything known? (e.g. \"pass\")\n");
+    fprintf(stderr, "  [Enter = unknown]\n");
+    fprintf(stderr, "> ");
+    read_line(buf, sizeof(buf));
+    if (buf[0]) strncpy(h.prefix, buf, MAX_PASS_LEN);
+
+    fprintf(stderr, "\nDoes the password end with anything known? (e.g. \"2024\")\n");
+    fprintf(stderr, "  [Enter = unknown]\n");
+    fprintf(stderr, "> ");
+    read_line(buf, sizeof(buf));
+    if (buf[0]) strncpy(h.suffix, buf, MAX_PASS_LEN);
+
+    /* Summary */
+    fprintf(stderr, "\n── Plan ────────────────────────────────────────────\n");
+    fprintf(stderr, "  Charset: \"%s\" (%d chars)\n", h.charset, (int)strlen(h.charset));
+    fprintf(stderr, "  Length : %d", h.min_len);
+    if (h.max_len != h.min_len) fprintf(stderr, "-%d", h.max_len);
+    fprintf(stderr, "\n");
+    if (h.prefix[0]) fprintf(stderr, "  Prefix : \"%s\"\n", h.prefix);
+    if (h.suffix[0]) fprintf(stderr, "  Suffix : \"%s\"\n", h.suffix);
+    fprintf(stderr, "────────────────────────────────────────────────────\n\n");
+
+    h.configured = 1;
+    return h;
+}
+
+/* ================================================================
  * Usage
  * ================================================================ */
 static void usage(const char *p)
@@ -697,7 +932,9 @@ static void usage(const char *p)
         "  -l  max password length (default: 4)\n"
         "  -c  charset (default: a-zA-Z0-9)\n"
         "  -t  threads (default: CPU core count)\n"
-        "  -G  disable GPU acceleration\n",
+        "  -G  disable GPU acceleration\n"
+        "  -r  resume from checkpoint\n"
+        "  -i  interactive mode (ask about password)\n",
         p, p);
     exit(1);
 }
@@ -713,24 +950,53 @@ int main(int argc, char *argv[])
     int         brute     = 0;
     int         max_len   = 4;
     int         no_gpu    = 0;
+    int         resume    = 0;
+    int         interactive = 0;
+    int         min_len   = 1;
     int         nthreads  = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 1) nthreads = 4;
 
     int opt;
-    while ((opt = getopt(argc, argv, "f:d:bl:c:t:G")) != -1) {
+    while ((opt = getopt(argc, argv, "f:d:bl:c:t:Gri")) != -1) {
         switch (opt) {
-            case 'f': pdf_path  = optarg;       break;
-            case 'd': dict_path = optarg;       break;
-            case 'b': brute     = 1;            break;
-            case 'l': max_len   = atoi(optarg); break;
-            case 'c': charset   = optarg;       break;
-            case 't': nthreads  = atoi(optarg); break;
-            case 'G': no_gpu    = 1;            break;
+            case 'f': pdf_path    = optarg;       break;
+            case 'd': dict_path   = optarg;       break;
+            case 'b': brute       = 1;            break;
+            case 'l': max_len     = atoi(optarg); break;
+            case 'c': charset     = optarg;       break;
+            case 't': nthreads    = atoi(optarg); break;
+            case 'G': no_gpu      = 1;            break;
+            case 'r': resume      = 1;            break;
+            case 'i': interactive = 1;            break;
             default:  usage(argv[0]);
         }
     }
 
-    if (!pdf_path)            { fprintf(stderr, "-f required\n");       usage(argv[0]); }
+    if (!pdf_path) { fprintf(stderr, "-f required\n"); usage(argv[0]); }
+
+    /* ── Interactive interview ─────────────────────────────────── */
+    PasswordHints hints = {0};
+    if (interactive) {
+        hints = interactive_interview();
+        charset = hints.charset;
+        min_len = hints.min_len;
+        max_len = hints.max_len;
+        brute   = 1;
+        if (hints.prefix[0]) {
+            strncpy(g_prefix, hints.prefix, MAX_PASS_LEN);
+            g_prefix_len = (int)strlen(g_prefix);
+        }
+        if (hints.suffix[0]) {
+            strncpy(g_suffix, hints.suffix, MAX_PASS_LEN);
+            g_suffix_len = (int)strlen(g_suffix);
+        }
+        /* Adjust lengths: user specifies total, we brute-force the middle */
+        min_len = min_len - g_prefix_len - g_suffix_len;
+        max_len = max_len - g_prefix_len - g_suffix_len;
+        if (min_len < 0) min_len = 0;
+        if (max_len < 0) max_len = 0;
+    }
+
     if (!brute && !dict_path) { fprintf(stderr, "-d or -b required\n"); usage(argv[0]); }
     if (nthreads > MAX_THREADS) nthreads = MAX_THREADS;
 
@@ -786,6 +1052,26 @@ int main(int argc, char *argv[])
     fprintf(stderr, "Threads: %d%s\n", nthreads,
             g_use_gpu ? " + GPU" : "");
 
+    /* ── Checkpoint setup ─────────────────────────────────────── */
+    ckpt_make_path(pdf_path);
+    Checkpoint ck = {0};
+    if (resume) {
+        ck = ckpt_load();
+        if (ck.valid) {
+            fprintf(stderr, "Resume : checkpoint found — ");
+            if (ck.is_brute)
+                fprintf(stderr, "brute-force len %d idx %ld\n", ck.resume_len, ck.resume_idx);
+            else
+                fprintf(stderr, "dictionary idx %ld\n", ck.dict_idx);
+        } else {
+            fprintf(stderr, "Resume : no checkpoint found, starting fresh\n");
+        }
+    }
+
+    /* ── Register signal handler for graceful shutdown ────────── */
+    signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
     /* ── Start progress thread ─────────────────────────────────── */
     pthread_t prog;
     pthread_create(&prog, NULL, progress_thread, NULL);
@@ -795,14 +1081,17 @@ int main(int argc, char *argv[])
 
     /* ── Dictionary attack ─────────────────────────────────────── */
     if (dict_path) {
+        g_is_brute = 0;
         if (!load_wordlist(dict_path)) {
             atomic_store(&g_found, 1); /* stop progress thread */
             pthread_join(prog, NULL);
             return 1;
         }
-        fprintf(stderr, "Mode   : dictionary (%ld words)\n\n", g_nwords);
+        long dict_start = (resume && ck.valid && !ck.is_brute) ? ck.dict_idx : 0;
+        fprintf(stderr, "Mode   : dictionary (%ld words%s)\n\n", g_nwords,
+                dict_start > 0 ? ", resuming" : "");
         atomic_store(&g_total, g_nwords);
-        atomic_store(&g_next_idx, 0);
+        atomic_store(&g_next_idx, dict_start);
 
         /* Spawn GPU worker if available */
         if (g_use_gpu) {
@@ -824,23 +1113,45 @@ int main(int argc, char *argv[])
 
     /* ── Brute-force attack ────────────────────────────────────── */
     else {
+        g_is_brute = 1;
+
+        /* Resume: determine start length and index */
+        int  start_len = min_len > 0 ? min_len : 1;
+        long start_idx = 0;
+        long resume_completed = 0;
+        if (resume && ck.valid && ck.is_brute) {
+            start_len = ck.resume_len;
+            start_idx = ck.resume_idx;
+            resume_completed = ck.completed_prior;
+        }
+
         /* Precompute overall total across all lengths */
         long ov_sum = 0;
-        for (int l = 1; l <= max_len; l++)
+        for (int l = (min_len > 0 ? min_len : 1); l <= max_len; l++)
             ov_sum += count_for_length(l);
         g_overall_total = ov_sum;
-        g_completed_prior = 0;
+        g_completed_prior = resume_completed;
 
-        fprintf(stderr, "Mode   : brute-force (len 1..%d, charset \"%s\")\n\n",
-                max_len, charset);
+        if (g_prefix_len || g_suffix_len) {
+            fprintf(stderr, "Mode   : brute-force (\"%s\" + %d..%d chars + \"%s\", charset \"%s\")%s\n\n",
+                    g_prefix, start_len, max_len, g_suffix, charset,
+                    start_idx > 0 ? " [resuming]" : "");
+        } else {
+            fprintf(stderr, "Mode   : brute-force (len %d..%d, charset \"%s\")%s\n\n",
+                    start_len, max_len, charset,
+                    start_idx > 0 ? " [resuming]" : "");
+        }
 
-        for (int len = 1; len <= max_len && !atomic_load(&g_found); len++) {
+        for (int len = start_len; len <= max_len && !atomic_load(&g_found); len++) {
             long total = count_for_length(len);
             atomic_store(&g_current_len, len);
 
-            atomic_store(&g_tested, 0);
+            /* If resuming into this length, start from saved index */
+            long idx0 = (len == start_len && start_idx > 0) ? start_idx : 0;
+
+            atomic_store(&g_tested, idx0);
             atomic_store(&g_total, total);
-            atomic_store(&g_next_idx, 0);
+            atomic_store(&g_next_idx, idx0);
             spawned = 0;
 
             if (g_use_gpu) {
@@ -882,12 +1193,16 @@ int main(int argc, char *argv[])
 
     if (g_gpu_ctx) metal_keygen_free(g_gpu_ctx);
 
-    if (g_password[0] || atomic_load(&g_found)) {
-        if (g_password[0]) {
-            printf("Password found: %s\n", g_password);
-            return 0;
-        }
+    if (g_password[0]) {
+        printf("Password found: %s\n", g_password);
+        ckpt_delete();  /* success — remove checkpoint */
+        return 0;
     }
+
+    /* Save final checkpoint before exiting (exhausted or interrupted) */
+    ckpt_save();
+    fprintf(stderr, "Checkpoint saved to %s (use -r to resume)\n", g_ckpt_path);
+
     printf("Password not found.\n");
     return 1;
 }

@@ -1,8 +1,11 @@
 /*
- * client.c — Distributed PDF cracker worker node
+ * client.c — Distributed PDF cracker worker node (v2, lease-aware)
  *
  * Connects to a server, receives the PDF and work config, then cracks
  * locally using all CPU cores + optional Metal GPU via pthreads.
+ *
+ * v2 changes: UUID persistence, auto-reconnect with exponential backoff,
+ * lease-aware work loop, graceful shutdown with PARTIAL.
  *
  * Build:
  *   make client
@@ -23,6 +26,8 @@
 #include <time.h>
 #include <sys/qos.h>
 #include <mach/mach_time.h>
+#include <signal.h>
+#include <pwd.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <CommonCrypto/CommonDigest.h>
@@ -33,6 +38,7 @@
 
 /* ── Local state ──────────────────────────────────────────────── */
 static int   g_nthreads = 0;
+static int   g_no_gpu   = 0;
 static char  g_pdf_path[256] = {0};  /* temp file */
 static int   g_server_fd = -1;
 
@@ -57,6 +63,82 @@ static int   g_cs_len   = 0;
 static atomic_int  g_chunk_found  = 0;
 static char        g_chunk_pass[MAX_PASS_LEN + 1] = {0};
 static atomic_long g_chunk_tested = 0;
+
+/* ── Session / reconnect state ────────────────────────────────── */
+static char          g_client_uuid[UUID_LEN + 1] = {0};
+static uint64_t      g_current_lease_id = 0;
+static volatile int  g_shutdown_requested = 0;
+
+/* ================================================================
+ * UUID persistence — ~/.pdfcracker_id
+ * ================================================================ */
+static void ensure_uuid(void)
+{
+    /* Build path: ~/.pdfcracker_id */
+    const char *home = getenv("HOME");
+    if (!home) {
+        struct passwd *pw = getpwuid(getuid());
+        if (pw) home = pw->pw_dir;
+    }
+    if (!home) home = "/tmp";
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.pdfcracker_id", home);
+
+    /* Try to read existing UUID */
+    FILE *f = fopen(path, "r");
+    if (f) {
+        if (fgets(g_client_uuid, sizeof(g_client_uuid), f)) {
+            /* Strip trailing whitespace */
+            size_t len = strlen(g_client_uuid);
+            while (len > 0 && (g_client_uuid[len-1] == '\n' ||
+                               g_client_uuid[len-1] == '\r' ||
+                               g_client_uuid[len-1] == ' '))
+                g_client_uuid[--len] = '\0';
+            if (len == UUID_LEN) {
+                fclose(f);
+                return;
+            }
+        }
+        fclose(f);
+    }
+
+    /* Generate UUID v4 from /dev/urandom */
+    uint8_t bytes[16];
+    f = fopen("/dev/urandom", "rb");
+    if (!f) {
+        perror("/dev/urandom");
+        /* Fallback: use time + pid */
+        srand((unsigned)(time(NULL) ^ getpid()));
+        for (int i = 0; i < 16; i++) bytes[i] = (uint8_t)(rand() & 0xFF);
+    } else {
+        if (fread(bytes, 1, 16, f) != 16) {
+            perror("fread urandom");
+            fclose(f);
+            return;
+        }
+        fclose(f);
+    }
+
+    /* Set version (4) and variant (0b10xx) bits */
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;  /* version 4 */
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;  /* variant 1 */
+
+    snprintf(g_client_uuid, sizeof(g_client_uuid),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             bytes[0], bytes[1], bytes[2], bytes[3],
+             bytes[4], bytes[5],
+             bytes[6], bytes[7],
+             bytes[8], bytes[9],
+             bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+
+    /* Write to file */
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "%s\n", g_client_uuid);
+        fclose(f);
+    }
+}
 
 /* ================================================================
  * PDF helpers
@@ -389,10 +471,10 @@ static void *gpu_brute_local_worker(void *arg)
             index_to_password(start + i, a->length, g_charset, g_cs_len, pw);
             pw_ptrs[i] = pw;
         }
-        int n = metal_keygen_batch(g_gpu_ctx, pw_ptrs, count, keys);
-        if (n <= 0) break;
-        verify_keys_rc4(keys, pw_ptrs, n, key_bytes);
-        atomic_fetch_add_explicit(&g_chunk_tested, (long)n, memory_order_relaxed);
+        int nn = metal_keygen_batch(g_gpu_ctx, pw_ptrs, count, keys);
+        if (nn <= 0) break;
+        verify_keys_rc4(keys, pw_ptrs, nn, key_bytes);
+        atomic_fetch_add_explicit(&g_chunk_tested, (long)nn, memory_order_relaxed);
     }
 done:
     free(pw_ptrs); free(pw_storage); free(keys); free(arg);
@@ -420,10 +502,10 @@ static void *gpu_dict_local_worker(void *arg)
         int count = (int)(end - start);
         for (int i = 0; i < count; i++)
             pw_ptrs[i] = a->words[start + i];
-        int n = metal_keygen_batch(g_gpu_ctx, (const char **)pw_ptrs, count, keys);
-        if (n <= 0) break;
-        verify_keys_rc4(keys, pw_ptrs, n, key_bytes);
-        atomic_fetch_add_explicit(&g_chunk_tested, (long)n, memory_order_relaxed);
+        int nn = metal_keygen_batch(g_gpu_ctx, (const char **)pw_ptrs, count, keys);
+        if (nn <= 0) break;
+        verify_keys_rc4(keys, pw_ptrs, nn, key_bytes);
+        atomic_fetch_add_explicit(&g_chunk_tested, (long)nn, memory_order_relaxed);
     }
 done:
     free(pw_ptrs); free(keys); free(arg);
@@ -522,7 +604,7 @@ static int crack_dict_chunk(char **words, long count)
 static void cleanup(void)
 {
     if (g_pdf_path[0]) unlink(g_pdf_path);
-    if (g_server_fd >= 0) close(g_server_fd);
+    if (g_server_fd >= 0) { close(g_server_fd); g_server_fd = -1; }
 }
 
 /* ================================================================
@@ -555,69 +637,69 @@ static int connect_to_server(const char *host, int port)
 }
 
 /* ================================================================
- * Usage
+ * SIGINT handler — graceful shutdown
  * ================================================================ */
-static void usage(const char *p)
+static void sigint_handler(int sig)
 {
-    fprintf(stderr,
-        "Usage:\n"
-        "  %s -s <server_host> [-p <port>] [-t <threads>] [-G]\n"
-        "\nConnects to a pdfcrack server and cracks locally.\n"
-        "  -G  disable GPU acceleration\n", p);
-    exit(1);
+    (void)sig;
+    g_shutdown_requested = 1;
+    /* Stop worker threads immediately */
+    atomic_store(&g_chunk_found, 1);
 }
 
 /* ================================================================
- * main
+ * Reset session-specific state for a new connection
  * ================================================================ */
-int main(int argc, char *argv[])
+static void reset_session_state(void)
 {
-    const char *host = NULL;
-    int port     = DEFAULT_PORT;
-    int no_gpu   = 0;
-    int nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (nthreads < 1) nthreads = 4;
+    g_brute = 0;
+    g_max_len = 0;
+    g_charset[0] = '\0';
+    g_cs_len = 0;
+    g_fast_crypto = 0;
+    g_use_gpu = 0;
+    if (g_gpu_ctx) { metal_keygen_free(g_gpu_ctx); g_gpu_ctx = NULL; }
+    g_current_lease_id = 0;
+    memset(&g_enc_params, 0, sizeof(g_enc_params));
+    if (g_pdf_path[0]) { unlink(g_pdf_path); g_pdf_path[0] = '\0'; }
+}
 
-    int opt;
-    while ((opt = getopt(argc, argv, "s:p:t:G")) != -1) {
-        switch (opt) {
-            case 's': host     = optarg;       break;
-            case 'p': port     = atoi(optarg); break;
-            case 't': nthreads = atoi(optarg); break;
-            case 'G': no_gpu   = 1;            break;
-            default:  usage(argv[0]);
-        }
-    }
-
-    if (!host) { fprintf(stderr, "-s required\n"); usage(argv[0]); }
-    g_nthreads = nthreads;
-    atexit(cleanup);
-
-    fprintf(stderr, "Connecting to %s:%d ...\n", host, port);
+/* ================================================================
+ * run_session — single connection lifecycle
+ * Returns: 0 = done/found, 1 = disconnected (retry), 2 = shutdown
+ * ================================================================ */
+static int run_session(const char *host, int port)
+{
+    reset_session_state();
 
     /* ── Connect ───────────────────────────────────────────────── */
+    fprintf(stderr, "Connecting to %s:%d ...\n", host, port);
     int fd = connect_to_server(host, port);
     if (fd < 0) return 1;
     g_server_fd = fd;
     fprintf(stderr, "Connected.\n");
 
-    /* ── Handshake ─────────────────────────────────────────────── */
-    sock_printf(fd, "HELLO %d", nthreads);
-
     char line[MAX_LINE];
+
+    /* ── Handshake ─────────────────────────────────────────────── */
+    sock_printf(fd, "HELLO %d %s %d", g_nthreads, g_client_uuid, PROTO_VERSION);
 
     /* ── Receive CONFIG ────────────────────────────────────────── */
     if (sock_readline(fd, line, sizeof(line)) < 0) {
-        fprintf(stderr, "Lost connection during config\n"); return 1;
+        fprintf(stderr, "Lost connection during config\n");
+        close(fd); g_server_fd = -1;
+        return 1;
     }
 
     if (sscanf(line, "CONFIG BRUTE %d", &g_max_len) == 1) {
         g_brute = 1;
         /* Read CHARSET line */
-        if (sock_readline(fd, line, sizeof(line)) < 0) return 1;
+        if (sock_readline(fd, line, sizeof(line)) < 0) {
+            close(fd); g_server_fd = -1; return 1;
+        }
         if (strncmp(line, "CHARSET ", 8) != 0) {
             fprintf(stderr, "Expected CHARSET, got: %s\n", line);
-            return 1;
+            close(fd); g_server_fd = -1; return 1;
         }
         strncpy(g_charset, line + 8, sizeof(g_charset) - 1);
         g_cs_len = (int)strlen(g_charset);
@@ -628,28 +710,33 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Mode: dictionary\n");
     } else {
         fprintf(stderr, "Unknown config: %s\n", line);
-        return 1;
+        close(fd); g_server_fd = -1; return 1;
     }
 
     /* ── Receive PDF ───────────────────────────────────────────── */
-    if (sock_readline(fd, line, sizeof(line)) < 0) return 1;
+    if (sock_readline(fd, line, sizeof(line)) < 0) {
+        close(fd); g_server_fd = -1; return 1;
+    }
     long pdf_size = 0;
     if (sscanf(line, "PDF %ld", &pdf_size) != 1 || pdf_size <= 0) {
         fprintf(stderr, "Bad PDF header: %s\n", line);
-        return 1;
+        close(fd); g_server_fd = -1; return 1;
     }
 
     unsigned char *pdf_buf = malloc((size_t)pdf_size);
-    if (!pdf_buf) { perror("malloc"); return 1; }
+    if (!pdf_buf) { perror("malloc"); close(fd); g_server_fd = -1; return 1; }
     if (read_exact(fd, pdf_buf, (size_t)pdf_size) < 0) {
         fprintf(stderr, "Failed to receive PDF (%ld bytes)\n", pdf_size);
-        return 1;
+        free(pdf_buf); close(fd); g_server_fd = -1; return 1;
     }
 
     /* Save to temp file */
     snprintf(g_pdf_path, sizeof(g_pdf_path), "/tmp/pdfcrack_%d.pdf", getpid());
     FILE *pf = fopen(g_pdf_path, "wb");
-    if (!pf) { perror(g_pdf_path); return 1; }
+    if (!pf) {
+        perror(g_pdf_path);
+        free(pdf_buf); close(fd); g_server_fd = -1; return 1;
+    }
     fwrite(pdf_buf, 1, (size_t)pdf_size, pf);
     fclose(pf);
 
@@ -669,7 +756,7 @@ int main(int argc, char *argv[])
     free(pdf_buf);
 
     /* Try GPU acceleration (only for R2-R4, Metal shader does MD5) */
-    if (g_fast_crypto && !no_gpu && g_enc_params.revision <= 4) {
+    if (g_fast_crypto && !g_no_gpu && g_enc_params.revision <= 4) {
         g_gpu_ctx = metal_keygen_init(&g_enc_params, NULL);
         if (g_gpu_ctx) {
             if (benchmark_gpu()) {
@@ -681,66 +768,107 @@ int main(int argc, char *argv[])
         }
     }
 
-    fprintf(stderr, "PDF received (%ld bytes) → %s\n", pdf_size, g_pdf_path);
+    fprintf(stderr, "PDF received (%ld bytes) -> %s\n", pdf_size, g_pdf_path);
 
     /* Verify we can open it */
     CGPDFDocumentRef probe = open_pdf();
     if (!probe) {
         fprintf(stderr, "Cannot open received PDF\n");
-        return 1;
+        close(fd); g_server_fd = -1; return 1;
     }
     CGPDFDocumentRelease(probe);
 
     /* ── Signal ready ──────────────────────────────────────────── */
     sock_printf(fd, "READY");
-    fprintf(stderr, "Using %d threads. Requesting work...\n\n", nthreads);
+    fprintf(stderr, "Using %d threads. Requesting work...\n\n", g_nthreads);
 
     /* ── Work loop ─────────────────────────────────────────────── */
-    long prev_tested = 0;
-    int  chunks_done = 0;
-    time_t t0 = time(NULL);
+    long   prev_tested  = 0;
+    double prev_elapsed = 0.0;
+    int    chunks_done  = 0;
 
     for (;;) {
-        /* Request next chunk, reporting tested count from previous */
-        sock_printf(fd, "GETWORK %ld", prev_tested);
+        if (g_shutdown_requested) {
+            /* If we have an active lease, send PARTIAL with high-water mark */
+            if (g_current_lease_id > 0) {
+                long hwm = atomic_load(&g_next_idx);
+                sock_printf(fd, "PARTIAL %lu %ld", (unsigned long)g_current_lease_id, hwm);
+            }
+            close(fd); g_server_fd = -1;
+            return 2;
+        }
+
+        /* Request next chunk, reporting stats from previous */
+        sock_printf(fd, "GETWORK %ld %.2f", prev_tested, prev_elapsed);
 
         if (sock_readline(fd, line, sizeof(line)) < 0) {
             fprintf(stderr, "\nLost connection to server\n");
-            break;
+            close(fd); g_server_fd = -1;
+            return 1;
         }
 
-        /* ── BRUTE <length> <start> <end> ─────────────────────── */
-        int  blen = 0;
-        long bstart = 0, bend = 0;
-        if (sscanf(line, "BRUTE %d %ld %ld", &blen, &bstart, &bend) == 3) {
-            fprintf(stderr, "\r  chunk %d: brute len=%d [%ld..%ld) (%ld passwords)   \n",
-                    ++chunks_done, blen, bstart, bend, bend - bstart);
+        /* ── BRUTE <length> <start> <end> <lease_id> ──────────── */
+        int      blen = 0;
+        long     bstart = 0, bend = 0;
+        uint64_t lease_id = 0;
+
+        if (sscanf(line, "BRUTE %d %ld %ld %lu", &blen, &bstart, &bend,
+                   (unsigned long *)&lease_id) == 4) {
+            g_current_lease_id = lease_id;
+            fprintf(stderr, "\r  chunk %d: brute len=%d [%ld..%ld) (%ld passwords) lease=%lu   \n",
+                    ++chunks_done, blen, bstart, bend, bend - bstart,
+                    (unsigned long)lease_id);
             fflush(stderr);
 
-            if (crack_brute_chunk(blen, bstart, bend)) {
-                sock_printf(fd, "FOUND %s", g_chunk_pass);
+            double t0 = mono_time();
+            int found = crack_brute_chunk(blen, bstart, bend);
+            double elapsed = mono_time() - t0;
+
+            if (found) {
+                sock_printf(fd, "FOUND %s %lu", g_chunk_pass,
+                            (unsigned long)lease_id);
                 /* Wait for OK */
                 sock_readline(fd, line, sizeof(line));
                 fprintf(stderr,
                     "\n\n  *** PASSWORD FOUND: %s ***\n\n", g_chunk_pass);
-                break;
+                close(fd); g_server_fd = -1;
+                return 0;
+            }
+
+            if (g_shutdown_requested) {
+                long hwm = atomic_load(&g_next_idx);
+                sock_printf(fd, "PARTIAL %lu %ld",
+                            (unsigned long)lease_id, hwm);
+                close(fd); g_server_fd = -1;
+                return 2;
             }
 
             prev_tested = atomic_load(&g_chunk_tested);
+            prev_elapsed = elapsed;
 
-            long elapsed = (long)(time(NULL) - t0);
-            if (elapsed > 0)
-                fprintf(stderr, "\r  chunk %d done. avg rate: ~%ld/s   ",
-                        chunks_done, prev_tested);
+            /* Send COMPLETE for this lease */
+            sock_printf(fd, "COMPLETE %lu %ld",
+                        (unsigned long)lease_id, prev_tested);
+            g_current_lease_id = 0;
+
+            fprintf(stderr, "\r  chunk %d done (%.1fs, %ld tested)   ",
+                    chunks_done, elapsed, prev_tested);
             fflush(stderr);
         }
 
-        /* ── DICT <count> followed by words ───────────────────── */
+        /* ── DICT <count> <lease_id> followed by words ─────────── */
         else if (strncmp(line, "DICT ", 5) == 0) {
             long count = 0;
-            sscanf(line, "DICT %ld", &count);
+            if (sscanf(line, "DICT %ld %lu", &count,
+                       (unsigned long *)&lease_id) != 2) {
+                fprintf(stderr, "Bad DICT line: %s\n", line);
+                close(fd); g_server_fd = -1;
+                return 1;
+            }
+            g_current_lease_id = lease_id;
 
             char **words = malloc((size_t)count * sizeof(char *));
+            if (!words) { perror("malloc"); close(fd); g_server_fd = -1; return 1; }
             long loaded = 0;
             for (long i = 0; i < count; i++) {
                 char word[MAX_PASS_LEN + 4];
@@ -749,21 +877,48 @@ int main(int argc, char *argv[])
                 if (words[loaded]) loaded++;
             }
 
-            fprintf(stderr, "\r  chunk %d: dict (%ld words)   \n",
-                    ++chunks_done, loaded);
+            fprintf(stderr, "\r  chunk %d: dict (%ld words) lease=%lu   \n",
+                    ++chunks_done, loaded, (unsigned long)lease_id);
             fflush(stderr);
 
-            if (crack_dict_chunk(words, loaded)) {
-                sock_printf(fd, "FOUND %s", g_chunk_pass);
+            double t0 = mono_time();
+            int found = crack_dict_chunk(words, loaded);
+            double elapsed = mono_time() - t0;
+
+            if (found) {
+                sock_printf(fd, "FOUND %s %lu", g_chunk_pass,
+                            (unsigned long)lease_id);
                 sock_readline(fd, line, sizeof(line));
                 fprintf(stderr,
                     "\n\n  *** PASSWORD FOUND: %s ***\n\n", g_chunk_pass);
                 for (long i = 0; i < loaded; i++) free(words[i]);
                 free(words);
-                break;
+                close(fd); g_server_fd = -1;
+                return 0;
+            }
+
+            if (g_shutdown_requested) {
+                long hwm = atomic_load(&g_next_idx);
+                sock_printf(fd, "PARTIAL %lu %ld",
+                            (unsigned long)lease_id, hwm);
+                for (long i = 0; i < loaded; i++) free(words[i]);
+                free(words);
+                close(fd); g_server_fd = -1;
+                return 2;
             }
 
             prev_tested = atomic_load(&g_chunk_tested);
+            prev_elapsed = elapsed;
+
+            /* Send COMPLETE for this lease */
+            sock_printf(fd, "COMPLETE %lu %ld",
+                        (unsigned long)lease_id, prev_tested);
+            g_current_lease_id = 0;
+
+            fprintf(stderr, "\r  chunk %d done (%.1fs, %ld tested)   ",
+                    chunks_done, elapsed, prev_tested);
+            fflush(stderr);
+
             for (long i = 0; i < loaded; i++) free(words[i]);
             free(words);
         }
@@ -773,22 +928,115 @@ int main(int argc, char *argv[])
             fprintf(stderr,
                 "\n\n  *** PASSWORD FOUND (by another client): %s ***\n\n",
                 line + 6);
-            break;
+            close(fd); g_server_fd = -1;
+            return 0;
         }
 
         /* ── DONE ─────────────────────────────────────────────── */
         else if (strcmp(line, "DONE") == 0) {
             fprintf(stderr,
                 "\n  All work exhausted. %d chunks tested.\n", chunks_done);
-            break;
+            close(fd); g_server_fd = -1;
+            return 0;
+        }
+
+        /* ── ABORT ────────────────────────────────────────────── */
+        else if (strcmp(line, "ABORT") == 0) {
+            fprintf(stderr, "\n  Server sent ABORT (password found elsewhere).\n");
+            close(fd); g_server_fd = -1;
+            return 0;
         }
 
         else {
             fprintf(stderr, "\nUnexpected response: %s\n", line);
-            break;
+            close(fd); g_server_fd = -1;
+            return 1;
+        }
+    }
+}
+
+/* ================================================================
+ * reconnect_loop — retry with exponential backoff
+ * Returns: 0 = done, 1 = gave up
+ * ================================================================ */
+static int reconnect_loop(const char *host, int port)
+{
+    int delay = RECONNECT_BASE_SEC;
+
+    for (int attempt = 1; attempt <= RECONNECT_MAX_TRIES; attempt++) {
+        int result = run_session(host, port);
+        if (result == 0) return 0;  /* done/found */
+        if (result == 2) return 0;  /* shutdown requested */
+
+        /* result == 1: disconnected, retry */
+        if (attempt < RECONNECT_MAX_TRIES) {
+            fprintf(stderr, "Reconnecting in %ds (attempt %d/%d)...\n",
+                    delay, attempt, RECONNECT_MAX_TRIES);
+            sleep((unsigned)delay);
+            delay *= 2;
+            if (delay > RECONNECT_MAX_SEC) delay = RECONNECT_MAX_SEC;
+        }
+    }
+    fprintf(stderr, "Max reconnection attempts (%d) reached. Giving up.\n",
+            RECONNECT_MAX_TRIES);
+    return 1;
+}
+
+/* ================================================================
+ * Usage
+ * ================================================================ */
+static void usage(const char *p)
+{
+    fprintf(stderr,
+        "Usage:\n"
+        "  %s -s <server_host> [-p <port>] [-t <threads>] [-G]\n"
+        "\nConnects to a pdfcrack server and cracks locally.\n"
+        "  -G  disable GPU acceleration\n", p);
+    exit(1);
+}
+
+/* ================================================================
+ * main
+ * ================================================================ */
+int main(int argc, char *argv[])
+{
+    const char *host = NULL;
+    int port     = DEFAULT_PORT;
+    int nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (nthreads < 1) nthreads = 4;
+
+    int opt;
+    while ((opt = getopt(argc, argv, "s:p:t:G")) != -1) {
+        switch (opt) {
+            case 's': host     = optarg;       break;
+            case 'p': port     = atoi(optarg); break;
+            case 't': nthreads = atoi(optarg); break;
+            case 'G': g_no_gpu = 1;            break;
+            default:  usage(argv[0]);
         }
     }
 
-    if (g_gpu_ctx) metal_keygen_free(g_gpu_ctx);
-    return 0;
+    if (!host) { fprintf(stderr, "-s required\n"); usage(argv[0]); }
+    g_nthreads = nthreads;
+    atexit(cleanup);
+
+    /* Install SIGINT handler for graceful shutdown */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+
+    /* Ensure we have a persistent UUID */
+    ensure_uuid();
+    fprintf(stderr, "Client UUID: %s\n", g_client_uuid);
+    fprintf(stderr, "Threads: %d, GPU: %s\n", nthreads,
+            g_no_gpu ? "disabled" : "auto");
+
+    /* Run with auto-reconnect */
+    int rc = reconnect_loop(host, port);
+
+    if (g_gpu_ctx) { metal_keygen_free(g_gpu_ctx); g_gpu_ctx = NULL; }
+    return rc;
 }

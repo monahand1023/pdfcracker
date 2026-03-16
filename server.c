@@ -1,17 +1,18 @@
 /*
- * server.c — Distributed PDF cracker coordinator
+ * server.c — Distributed PDF cracker coordinator (v2, lease-based)
  *
- * Loads the PDF (and optional wordlist), listens for clients, distributes
- * work chunks, aggregates progress, and announces when the password is found.
+ * BOINC-style lease system: work chunks are assigned with deadlines,
+ * expired leases are re-queued, clients can reconnect via UUID.
  *
  * Build:
- *   clang -O3 -lpthread -o server server.c
+ *   clang -O3 -Wall -lpthread -o server server.c
  *
  * Usage:
- *   ./server -f file.pdf -b -l 6                    # brute-force
- *   ./server -f file.pdf -b -l 6 -c 0123456789      # digits only
- *   ./server -f file.pdf -d wordlist.txt             # dictionary
- *   ./server -f file.pdf -b -l 6 -p 8888            # custom port
+ *   ./server -f file.pdf -b -l 6                         # brute-force
+ *   ./server -f file.pdf -b -l 6 -c 0123456789           # digits only
+ *   ./server -f file.pdf -d wordlist.txt                  # dictionary
+ *   ./server -f file.pdf -b -l 6 -p 8888                 # custom port
+ *   ./server -f file.pdf -b -l 6 -R file.server.ckpt     # restore
  */
 
 #include "protocol.h"
@@ -21,46 +22,106 @@
 #include <sys/stat.h>
 #include <signal.h>
 
-/* ── PDF bytes (read-only, sent to each client) ───────────────── */
+/* ================================================================
+ * Data Structures
+ * ================================================================ */
+
+typedef struct {
+    uint64_t  lease_id;
+    int       is_brute;
+    int       brute_len;
+    long      brute_start, brute_end;
+    long      dict_start, dict_count;
+    double    deadline;          /* monotonic time */
+    int       client_idx;
+    long      tested_so_far;
+    double    last_heartbeat;    /* monotonic time */
+    int       active;            /* 1=assigned, 0=completed/expired */
+} LeaseEntry;
+
+typedef struct RequeueNode {
+    int       is_brute;
+    int       brute_len;
+    long      brute_start, brute_end;
+    long      dict_start, dict_count;
+    struct RequeueNode *next;
+} RequeueNode;
+
+typedef struct {
+    int       fd;
+    int       id;
+    int       cores;
+    int       active;            /* 1=connected, 0=disconnected */
+    int       slot_free;         /* 1=slot can be reused by new client */
+    long      tested;            /* cumulative across reconnections */
+    char      uuid[UUID_LEN + 1];
+    char      ip_str[INET_ADDRSTRLEN];
+    double    speed;             /* passwords/sec */
+    long      chunk_size;        /* adaptive next chunk size */
+    uint64_t  current_lease_id;
+    double    last_seen;         /* monotonic time of last message */
+} ClientInfo;
+
+/* ================================================================
+ * Globals
+ * ================================================================ */
+
+/* PDF bytes (read-only, sent to each client) */
 static unsigned char *g_pdf_data = NULL;
 static long           g_pdf_size = 0;
 
-/* ── Wordlist (dict mode) ─────────────────────────────────────── */
-static char **g_words  = NULL;
-static long   g_nwords = 0;
+/* Wordlist (dict mode) */
+static char **g_words     = NULL;
+static long   g_nwords    = 0;
+static char  *g_dict_path = NULL;  /* kept for hashing */
 
-/* ── Mode config ──────────────────────────────────────────────── */
+/* Mode config */
 static int   g_brute   = 0;
 static int   g_max_len = 4;
 static char *g_charset = NULL;
 static int   g_cs_len  = 0;
 
-/* ── Work queue (mutex-protected) ─────────────────────────────── */
+/* Work cursor (protected by g_work_lock) */
 static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
-static int  g_brute_len = 1;   /* current length being distributed */
-static long g_brute_idx = 0;   /* next index within current length */
-static long g_dict_idx  = 0;   /* next word index */
+static int  g_brute_len = 1;
+static long g_brute_idx = 0;
+static long g_dict_idx  = 0;
 
-/* ── Found state ──────────────────────────────────────────────── */
+/* Requeue list (protected by g_work_lock) */
+static RequeueNode *g_requeue_head = NULL;
+
+/* Lease ring buffer (protected by g_lease_lock) */
+#define MAX_LEASES 4096
+static pthread_mutex_t g_lease_lock = PTHREAD_MUTEX_INITIALIZER;
+static LeaseEntry      g_leases[MAX_LEASES];
+static int             g_lease_count    = 0;
+static uint64_t        g_next_lease_id  = 1;
+
+/* Found state */
 static atomic_int g_found = 0;
 static char       g_password[MAX_PASS_LEN + 1] = {0};
 
-/* ── Progress tracking ────────────────────────────────────────── */
+/* Progress tracking */
 static atomic_long g_total_tested = 0;
-static long        g_keyspace     = 0;  /* total passwords to test */
+static long        g_keyspace     = 0;
 
-/* ── Client tracking ──────────────────────────────────────────── */
-typedef struct {
-    int  fd;
-    int  id;
-    int  cores;
-    int  active;
-    long tested;
-} ClientInfo;
+/* SHA-256 hashes */
+static char g_pdf_sha256[SHA256_HEX_LEN + 1]      = {0};
+static char g_wordlist_sha256[SHA256_HEX_LEN + 1]  = {0};
 
+/* Client tracking */
 static ClientInfo       g_clients[MAX_CLIENTS];
 static int              g_nclient_ids = 0;
 static pthread_mutex_t  g_clients_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Shutdown */
+static volatile int g_shutdown = 0;
+
+/* PDF path (for checkpoint naming) */
+static const char *g_pdf_path = NULL;
+
+/* Listen fd (for shutdown) */
+static int g_listenfd = -1;
 
 /* ================================================================
  * Load PDF file into memory
@@ -105,6 +166,11 @@ static int load_wordlist(const char *path)
         while (len && (line[len-1] == '\n' || line[len-1] == '\r'))
             line[--len] = '\0';
         if (!len) continue;
+        if (len > MAX_PASS_LEN) {
+            fprintf(stderr, "warning: skipping word longer than %d chars\n",
+                    MAX_PASS_LEN);
+            continue;
+        }
         if ((g_words[idx] = malloc(len + 1)))
             memcpy(g_words[idx++], line, len + 1);
     }
@@ -114,20 +180,196 @@ static int load_wordlist(const char *path)
 }
 
 /* ================================================================
- * Get next work chunk (caller holds g_work_lock)
- * Returns: 1 = got chunk, 0 = no more work
- *
- * For brute: sets *out_len, *out_start, *out_end
- * For dict:  sets *out_start (word offset), *out_count
+ * Hashing
  * ================================================================ */
-static int next_brute_chunk(int *out_len, long *out_start, long *out_end)
+static void compute_pdf_hash(void)
 {
+    sha256_hex(g_pdf_data, (size_t)g_pdf_size, g_pdf_sha256);
+}
+
+static void compute_wordlist_hash(void)
+{
+    if (!g_dict_path) { g_wordlist_sha256[0] = '\0'; return; }
+
+    struct stat st;
+    if (stat(g_dict_path, &st) != 0) { g_wordlist_sha256[0] = '\0'; return; }
+
+    size_t sz = (size_t)st.st_size;
+    unsigned char *buf = malloc(sz);
+    if (!buf) { g_wordlist_sha256[0] = '\0'; return; }
+
+    FILE *f = fopen(g_dict_path, "rb");
+    if (!f) { free(buf); g_wordlist_sha256[0] = '\0'; return; }
+    if (fread(buf, 1, sz, f) != sz) {
+        fclose(f); free(buf); g_wordlist_sha256[0] = '\0'; return;
+    }
+    fclose(f);
+
+    sha256_hex(buf, sz, g_wordlist_sha256);
+    free(buf);
+}
+
+/* ================================================================
+ * Requeue management (caller holds g_work_lock)
+ * ================================================================ */
+static void push_requeue_brute(int len, long start, long end)
+{
+    RequeueNode *n = malloc(sizeof(RequeueNode));
+    if (!n) return;
+    n->is_brute    = 1;
+    n->brute_len   = len;
+    n->brute_start = start;
+    n->brute_end   = end;
+    n->dict_start  = 0;
+    n->dict_count  = 0;
+    n->next        = g_requeue_head;
+    g_requeue_head = n;
+}
+
+static void push_requeue_dict(long start, long count)
+{
+    RequeueNode *n = malloc(sizeof(RequeueNode));
+    if (!n) return;
+    n->is_brute    = 0;
+    n->brute_len   = 0;
+    n->brute_start = 0;
+    n->brute_end   = 0;
+    n->dict_start  = start;
+    n->dict_count  = count;
+    n->next        = g_requeue_head;
+    g_requeue_head = n;
+}
+
+static int pop_requeue(int *is_brute, int *brute_len,
+                       long *start, long *end, long *dict_count)
+{
+    if (!g_requeue_head) return 0;
+    RequeueNode *n = g_requeue_head;
+    g_requeue_head = n->next;
+    *is_brute  = n->is_brute;
+    *brute_len = n->brute_len;
+    if (n->is_brute) {
+        *start      = n->brute_start;
+        *end        = n->brute_end;
+        *dict_count = 0;
+    } else {
+        *start      = n->dict_start;
+        *end        = 0;
+        *dict_count = n->dict_count;
+    }
+    free(n);
+    return 1;
+}
+
+/* ================================================================
+ * Lease management (caller holds g_lease_lock)
+ * ================================================================ */
+static uint64_t create_lease(int client_idx, int is_brute,
+                             int brute_len, long start, long end,
+                             long dict_start, long dict_count,
+                             int deadline_secs)
+{
+    int slot = g_lease_count % MAX_LEASES;
+    uint64_t lid = g_next_lease_id++;
+
+    g_leases[slot] = (LeaseEntry){
+        .lease_id       = lid,
+        .is_brute       = is_brute,
+        .brute_len      = brute_len,
+        .brute_start    = start,
+        .brute_end      = end,
+        .dict_start     = dict_start,
+        .dict_count     = dict_count,
+        .deadline       = mono_time() + deadline_secs,
+        .client_idx     = client_idx,
+        .tested_so_far  = 0,
+        .last_heartbeat = mono_time(),
+        .active         = 1,
+    };
+    g_lease_count++;
+    return lid;
+}
+
+/* Find lease slot by ID. Returns index or -1. Caller holds g_lease_lock. */
+static int find_lease(uint64_t lease_id)
+{
+    /* Search backwards from newest — most likely to find recent leases */
+    int count = g_lease_count < MAX_LEASES ? g_lease_count : MAX_LEASES;
+    for (int i = 0; i < count; i++) {
+        int slot = ((g_lease_count - 1 - i) % MAX_LEASES + MAX_LEASES) % MAX_LEASES;
+        if (g_leases[slot].lease_id == lease_id)
+            return slot;
+    }
+    return -1;
+}
+
+static void complete_lease(uint64_t lease_id, long final_tested)
+{
+    int slot = find_lease(lease_id);
+    if (slot < 0) return;
+
+    LeaseEntry *le = &g_leases[slot];
+    le->active = 0;
+    le->tested_so_far = final_tested;
+
+    /* Remove matching chunk from requeue list (race: reaper may have expired it) */
+    pthread_mutex_lock(&g_work_lock);
+    RequeueNode **pp = &g_requeue_head;
+    while (*pp) {
+        RequeueNode *n = *pp;
+        int match = 0;
+        if (le->is_brute && n->is_brute &&
+            n->brute_len == le->brute_len &&
+            n->brute_start == le->brute_start &&
+            n->brute_end == le->brute_end) {
+            match = 1;
+        } else if (!le->is_brute && !n->is_brute &&
+                   n->dict_start == le->dict_start &&
+                   n->dict_count == le->dict_count) {
+            match = 1;
+        }
+        if (match) {
+            *pp = n->next;
+            free(n);
+            break;
+        }
+        pp = &n->next;
+    }
+    pthread_mutex_unlock(&g_work_lock);
+}
+
+static void expire_lease(uint64_t lease_id)
+{
+    int slot = find_lease(lease_id);
+    if (slot < 0) return;
+
+    LeaseEntry *le = &g_leases[slot];
+    if (!le->active) return;
+    le->active = 0;
+
+    /* Push chunk back to requeue */
+    pthread_mutex_lock(&g_work_lock);
+    if (le->is_brute) {
+        push_requeue_brute(le->brute_len, le->brute_start, le->brute_end);
+    } else {
+        push_requeue_dict(le->dict_start, le->dict_count);
+    }
+    pthread_mutex_unlock(&g_work_lock);
+}
+
+/* ================================================================
+ * Work chunk generation (caller holds g_work_lock)
+ * ================================================================ */
+static int next_brute_chunk(long chunk_size, int *out_len,
+                            long *out_start, long *out_end)
+{
+    if (chunk_size <= 0) chunk_size = DEFAULT_CHUNK_BRUTE;
     while (g_brute_len <= g_max_len) {
         long ks = keyspace_for_length(g_brute_len, g_cs_len);
         if (g_brute_idx < ks) {
             *out_len   = g_brute_len;
             *out_start = g_brute_idx;
-            *out_end   = g_brute_idx + CHUNK_BRUTE;
+            *out_end   = g_brute_idx + chunk_size;
             if (*out_end > ks) *out_end = ks;
             g_brute_idx = *out_end;
             return 1;
@@ -138,11 +380,12 @@ static int next_brute_chunk(int *out_len, long *out_start, long *out_end)
     return 0;
 }
 
-static int next_dict_chunk(long *out_start, long *out_count)
+static int next_dict_chunk(long chunk_size, long *out_start, long *out_count)
 {
+    if (chunk_size <= 0) chunk_size = DEFAULT_CHUNK_DICT;
     if (g_dict_idx >= g_nwords) return 0;
     *out_start = g_dict_idx;
-    *out_count = CHUNK_DICT;
+    *out_count = chunk_size;
     if (*out_start + *out_count > g_nwords)
         *out_count = g_nwords - *out_start;
     g_dict_idx += *out_count;
@@ -150,24 +393,199 @@ static int next_dict_chunk(long *out_start, long *out_count)
 }
 
 /* ================================================================
+ * Work assignment
+ * ================================================================ */
+static uint64_t assign_work(ClientInfo *ci, int *is_brute,
+                            int *out_len, long *out_start, long *out_end,
+                            long *out_dict_start, long *out_dict_count,
+                            int deadline_secs)
+{
+    int got = 0;
+    int rq_brute = 0, rq_len = 0;
+    long rq_start = 0, rq_end = 0, rq_dict_count = 0;
+
+    pthread_mutex_lock(&g_work_lock);
+
+    /* Try requeue first */
+    if (pop_requeue(&rq_brute, &rq_len, &rq_start, &rq_end, &rq_dict_count)) {
+        *is_brute = rq_brute;
+        if (rq_brute) {
+            *out_len   = rq_len;
+            *out_start = rq_start;
+            *out_end   = rq_end;
+            *out_dict_start = 0;
+            *out_dict_count = 0;
+        } else {
+            *out_len        = 0;
+            *out_start      = 0;
+            *out_end        = 0;
+            *out_dict_start = rq_start;
+            *out_dict_count = rq_dict_count;
+        }
+        got = 1;
+    } else {
+        /* Generate new chunk from cursor */
+        long csz = ci->chunk_size;
+        if (g_brute) {
+            if (csz <= 0) csz = DEFAULT_CHUNK_BRUTE;
+            if (csz < MIN_CHUNK_BRUTE) csz = MIN_CHUNK_BRUTE;
+            if (csz > MAX_CHUNK_BRUTE) csz = MAX_CHUNK_BRUTE;
+            int len;
+            long start, end;
+            if (next_brute_chunk(csz, &len, &start, &end)) {
+                *is_brute       = 1;
+                *out_len        = len;
+                *out_start      = start;
+                *out_end        = end;
+                *out_dict_start = 0;
+                *out_dict_count = 0;
+                got = 1;
+            }
+        } else {
+            if (csz <= 0) csz = DEFAULT_CHUNK_DICT;
+            if (csz < MIN_CHUNK_DICT) csz = MIN_CHUNK_DICT;
+            if (csz > MAX_CHUNK_DICT) csz = MAX_CHUNK_DICT;
+            long start, count;
+            if (next_dict_chunk(csz, &start, &count)) {
+                *is_brute       = 0;
+                *out_len        = 0;
+                *out_start      = 0;
+                *out_end        = 0;
+                *out_dict_start = start;
+                *out_dict_count = count;
+                got = 1;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_work_lock);
+
+    if (!got) return 0;
+
+    /* Create lease */
+    pthread_mutex_lock(&g_lease_lock);
+    uint64_t lid;
+    if (*is_brute) {
+        lid = create_lease(ci->id, 1, *out_len, *out_start, *out_end,
+                           0, 0, deadline_secs);
+    } else {
+        lid = create_lease(ci->id, 0, 0, 0, 0,
+                           *out_dict_start, *out_dict_count, deadline_secs);
+    }
+    pthread_mutex_unlock(&g_lease_lock);
+
+    ci->current_lease_id = lid;
+    return lid;
+}
+
+/* ================================================================
+ * Client management
+ * ================================================================ */
+static int alloc_client_slot(void)
+{
+    /* Scan for free slot */
+    for (int i = 0; i < g_nclient_ids; i++) {
+        if (g_clients[i].slot_free) {
+            g_clients[i].slot_free = 0;
+            return i;
+        }
+    }
+    /* Append if room */
+    if (g_nclient_ids >= MAX_CLIENTS) return -1;
+    int idx = g_nclient_ids++;
+    memset(&g_clients[idx], 0, sizeof(ClientInfo));
+    g_clients[idx].id = idx;
+    return idx;
+}
+
+static int find_client_by_uuid(const char *uuid)
+{
+    for (int i = 0; i < g_nclient_ids; i++) {
+        if (!g_clients[i].slot_free && strcmp(g_clients[i].uuid, uuid) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* ================================================================
  * Client handler thread
  * ================================================================ */
 static void *client_handler(void *arg)
 {
-    ClientInfo *ci = (ClientInfo *)arg;
-    int fd = ci->fd;
-    int id = ci->id;
-    char line[MAX_LINE];
+    int fd = *(int *)arg;
+    free(arg);
 
-    /* ── Handshake: expect HELLO <ncores> ──────────────────────── */
+    char line[MAX_LINE];
+    int ci_idx = -1;
+
+    /* Get client IP */
+    struct sockaddr_in peer_addr;
+    socklen_t peer_len = sizeof(peer_addr);
+    char ip_str[INET_ADDRSTRLEN] = "unknown";
+    if (getpeername(fd, (struct sockaddr *)&peer_addr, &peer_len) == 0) {
+        inet_ntop(AF_INET, &peer_addr.sin_addr, ip_str, sizeof(ip_str));
+    }
+
+    /* ── Handshake: expect HELLO <ncores> <uuid> <proto_version> ── */
     if (sock_readline(fd, line, sizeof(line)) < 0) goto done;
-    int ncores = 0;
-    if (sscanf(line, "HELLO %d", &ncores) != 1 || ncores < 1) {
-        fprintf(stderr, "[client %d] bad handshake: %s\n", id, line);
+
+    int ncores = 0, proto_ver = 0;
+    char uuid[UUID_LEN + 1] = {0};
+    if (sscanf(line, "HELLO %d %36s %d", &ncores, uuid, &proto_ver) != 3 ||
+        ncores < 1) {
+        fprintf(stderr, "[%s] bad handshake: %s\n", ip_str, line);
+        sock_printf(fd, "ERROR bad handshake");
         goto done;
     }
-    ci->cores = ncores;
-    fprintf(stderr, "[client %d] connected, %d cores\n", id, ncores);
+
+    if (proto_ver != PROTO_VERSION) {
+        fprintf(stderr, "[%s] protocol version mismatch: got %d, want %d\n",
+                ip_str, proto_ver, PROTO_VERSION);
+        sock_printf(fd, "ERROR protocol version mismatch");
+        goto done;
+    }
+
+    /* Find or allocate client slot */
+    pthread_mutex_lock(&g_clients_lock);
+    ci_idx = find_client_by_uuid(uuid);
+    if (ci_idx >= 0) {
+        if (g_clients[ci_idx].active) {
+            /* Duplicate UUID, reject */
+            pthread_mutex_unlock(&g_clients_lock);
+            fprintf(stderr, "[%s] duplicate UUID %s, rejecting\n", ip_str, uuid);
+            sock_printf(fd, "ERROR duplicate UUID");
+            ci_idx = -1;
+            goto done;
+        }
+        /* Reconnecting client — reuse slot */
+        fprintf(stderr, "[%s] client %d reconnected (uuid %s)\n",
+                ip_str, ci_idx, uuid);
+    } else {
+        ci_idx = alloc_client_slot();
+        if (ci_idx < 0) {
+            pthread_mutex_unlock(&g_clients_lock);
+            fprintf(stderr, "[%s] max clients reached, rejecting\n", ip_str);
+            sock_printf(fd, "ERROR max clients");
+            goto done;
+        }
+        strncpy(g_clients[ci_idx].uuid, uuid, UUID_LEN);
+        g_clients[ci_idx].uuid[UUID_LEN] = '\0';
+        g_clients[ci_idx].tested = 0;
+        g_clients[ci_idx].speed = 0;
+        g_clients[ci_idx].chunk_size = 0;
+        fprintf(stderr, "[%s] new client %d (uuid %s, %d cores)\n",
+                ip_str, ci_idx, uuid, ncores);
+    }
+
+    ClientInfo *ci = &g_clients[ci_idx];
+    ci->fd       = fd;
+    ci->cores    = ncores;
+    ci->active   = 1;
+    ci->slot_free = 0;
+    strncpy(ci->ip_str, ip_str, INET_ADDRSTRLEN);
+    ci->last_seen = mono_time();
+    ci->current_lease_id = 0;
+    pthread_mutex_unlock(&g_clients_lock);
 
     /* ── Send config ───────────────────────────────────────────── */
     if (g_brute) {
@@ -180,94 +598,458 @@ static void *client_handler(void *arg)
     /* ── Send PDF ──────────────────────────────────────────────── */
     sock_printf(fd, "PDF %ld", g_pdf_size);
     if (write_exact(fd, g_pdf_data, (size_t)g_pdf_size) < 0) {
-        fprintf(stderr, "[client %d] failed sending PDF\n", id);
+        fprintf(stderr, "[client %d] failed sending PDF\n", ci_idx);
         goto done;
     }
 
     /* ── Wait for READY ────────────────────────────────────────── */
     if (sock_readline(fd, line, sizeof(line)) < 0) goto done;
     if (strcmp(line, "READY") != 0) {
-        fprintf(stderr, "[client %d] expected READY, got: %s\n", id, line);
+        fprintf(stderr, "[client %d] expected READY, got: %s\n", ci_idx, line);
         goto done;
     }
-    fprintf(stderr, "[client %d] ready for work\n", id);
+    fprintf(stderr, "[client %d] ready for work\n", ci_idx);
 
     /* ── Work loop ─────────────────────────────────────────────── */
-    while (sock_readline(fd, line, sizeof(line)) >= 0) {
-        if (atomic_load(&g_found)) {
-            sock_printf(fd, "FOUND %s", g_password);
-            break;
-        }
+    while (!g_shutdown && sock_readline(fd, line, sizeof(line)) >= 0) {
 
-        /* ── GETWORK <tested> ─────────────────────────────────── */
+        ci->last_seen = mono_time();
+
+        /* ── GETWORK <tested> <elapsed> ─────────────────────────── */
         if (strncmp(line, "GETWORK", 7) == 0) {
             long tested = 0;
-            sscanf(line, "GETWORK %ld", &tested);
+            double elapsed = 0.0;
+            sscanf(line, "GETWORK %ld %lf", &tested, &elapsed);
+
             if (tested > 0) {
                 atomic_fetch_add(&g_total_tested, tested);
                 ci->tested += tested;
             }
 
+            /* Compute speed and adaptive chunk size */
+            if (elapsed > 0.1 && tested > 0) {
+                ci->speed = (double)tested / elapsed;
+                long new_size = (long)(ci->speed * TARGET_SECS);
+                if (g_brute) {
+                    if (new_size < MIN_CHUNK_BRUTE) new_size = MIN_CHUNK_BRUTE;
+                    if (new_size > MAX_CHUNK_BRUTE) new_size = MAX_CHUNK_BRUTE;
+                } else {
+                    if (new_size < MIN_CHUNK_DICT) new_size = MIN_CHUNK_DICT;
+                    if (new_size > MAX_CHUNK_DICT) new_size = MAX_CHUNK_DICT;
+                }
+                ci->chunk_size = new_size;
+            }
+
+            /* Check if found */
             if (atomic_load(&g_found)) {
                 sock_printf(fd, "FOUND %s", g_password);
                 break;
             }
 
-            pthread_mutex_lock(&g_work_lock);
-            if (g_brute) {
-                int len; long start, end;
-                if (next_brute_chunk(&len, &start, &end)) {
-                    pthread_mutex_unlock(&g_work_lock);
-                    sock_printf(fd, "BRUTE %d %ld %ld", len, start, end);
-                } else {
-                    pthread_mutex_unlock(&g_work_lock);
-                    sock_printf(fd, "DONE");
-                    break;
-                }
+            /* Compute deadline */
+            int deadline = MIN_LEASE_SECS;
+            if (elapsed > 0.1) {
+                deadline = (int)(elapsed * LEASE_MULTIPLIER);
+                if (deadline < MIN_LEASE_SECS) deadline = MIN_LEASE_SECS;
+                if (deadline > MAX_LEASE_SECS) deadline = MAX_LEASE_SECS;
+            }
+
+            /* Assign work */
+            int is_brute = 0, out_len = 0;
+            long out_start = 0, out_end = 0, out_dict_start = 0, out_dict_count = 0;
+            uint64_t lid = assign_work(ci, &is_brute, &out_len,
+                                       &out_start, &out_end,
+                                       &out_dict_start, &out_dict_count,
+                                       deadline);
+            if (lid == 0) {
+                /* Check requeue — maybe all work is in-flight but not done */
+                /* No more work from cursor and no requeue */
+                sock_printf(fd, "DONE");
+                break;
+            }
+
+            if (is_brute) {
+                sock_printf(fd, "BRUTE %d %ld %ld %llu",
+                           out_len, out_start, out_end,
+                           (unsigned long long)lid);
             } else {
-                long start, count;
-                if (next_dict_chunk(&start, &count)) {
-                    pthread_mutex_unlock(&g_work_lock);
-                    /* Send DICT header + words */
-                    sock_printf(fd, "DICT %ld", count);
-                    for (long i = start; i < start + count; i++)
-                        sock_printf(fd, "%s", g_words[i]);
-                } else {
-                    pthread_mutex_unlock(&g_work_lock);
-                    sock_printf(fd, "DONE");
-                    break;
-                }
+                sock_printf(fd, "DICT %ld %llu",
+                           out_dict_count, (unsigned long long)lid);
+                for (long i = out_dict_start;
+                     i < out_dict_start + out_dict_count; i++)
+                    sock_printf(fd, "%s", g_words[i]);
             }
         }
 
-        /* ── FOUND <password> ─────────────────────────────────── */
+        /* ── HEARTBEAT <lease_id> <tested> ──────────────────────── */
+        else if (strncmp(line, "HEARTBEAT", 9) == 0) {
+            unsigned long long lid = 0;
+            long tested = 0;
+            sscanf(line, "HEARTBEAT %llu %ld", &lid, &tested);
+
+            pthread_mutex_lock(&g_lease_lock);
+            int slot = find_lease((uint64_t)lid);
+            if (slot >= 0 && g_leases[slot].active) {
+                g_leases[slot].tested_so_far = tested;
+                g_leases[slot].last_heartbeat = mono_time();
+            }
+            pthread_mutex_unlock(&g_lease_lock);
+
+            if (atomic_load(&g_found)) {
+                sock_printf(fd, "ABORT");
+            } else {
+                sock_printf(fd, "OK");
+            }
+        }
+
+        /* ── COMPLETE <lease_id> <tested> ───────────────────────── */
+        else if (strncmp(line, "COMPLETE", 8) == 0) {
+            unsigned long long lid = 0;
+            long tested = 0;
+            sscanf(line, "COMPLETE %llu %ld", &lid, &tested);
+
+            if (tested > 0) {
+                atomic_fetch_add(&g_total_tested, tested);
+                ci->tested += tested;
+            }
+
+            pthread_mutex_lock(&g_lease_lock);
+            complete_lease((uint64_t)lid, tested);
+            pthread_mutex_unlock(&g_lease_lock);
+
+            ci->current_lease_id = 0;
+        }
+
+        /* ── PARTIAL <lease_id> <hwm> ───────────────────────────── */
+        else if (strncmp(line, "PARTIAL", 7) == 0) {
+            unsigned long long lid = 0;
+            long hwm = 0;
+            sscanf(line, "PARTIAL %llu %ld", &lid, &hwm);
+
+            pthread_mutex_lock(&g_lease_lock);
+            int slot = find_lease((uint64_t)lid);
+            if (slot >= 0 && g_leases[slot].active) {
+                LeaseEntry *le = &g_leases[slot];
+                le->active = 0;
+
+                pthread_mutex_lock(&g_work_lock);
+                if (le->is_brute) {
+                    /* Re-queue the remaining range */
+                    long new_start = le->brute_start + hwm;
+                    long credited = hwm;
+                    if (credited > 0) {
+                        atomic_fetch_add(&g_total_tested, credited);
+                        ci->tested += credited;
+                    }
+                    if (new_start < le->brute_end) {
+                        push_requeue_brute(le->brute_len, new_start, le->brute_end);
+                    }
+                } else {
+                    /* Dict: re-queue entire chunk (can't split precisely) */
+                    long credited = hwm;
+                    if (credited > 0) {
+                        atomic_fetch_add(&g_total_tested, credited);
+                        ci->tested += credited;
+                    }
+                    push_requeue_dict(le->dict_start, le->dict_count);
+                }
+                pthread_mutex_unlock(&g_work_lock);
+            }
+            pthread_mutex_unlock(&g_lease_lock);
+
+            ci->current_lease_id = 0;
+        }
+
+        /* ── FOUND <password> <lease_id> ────────────────────────── */
         else if (strncmp(line, "FOUND ", 6) == 0) {
+            char pw[MAX_PASS_LEN + 1] = {0};
+            unsigned long long lid = 0;
+            sscanf(line, "FOUND %s %llu", pw, &lid);
+
             if (!atomic_exchange(&g_found, 1)) {
-                strncpy(g_password, line + 6, MAX_PASS_LEN);
+                strncpy(g_password, pw, MAX_PASS_LEN);
                 fprintf(stderr,
                     "\n\n  *** PASSWORD FOUND by client %d: %s ***\n\n",
-                    id, g_password);
+                    ci_idx, g_password);
             }
+
+            if (lid > 0) {
+                pthread_mutex_lock(&g_lease_lock);
+                complete_lease((uint64_t)lid, 0);
+                pthread_mutex_unlock(&g_lease_lock);
+            }
+
             sock_printf(fd, "OK");
             break;
-        }
-
-        /* ── EXHAUSTED ────────────────────────────────────────── */
-        else if (strcmp(line, "EXHAUSTED") == 0) {
-            /* chunk done, client will send GETWORK next */
         }
     }
 
 done:
-    fprintf(stderr, "[client %d] disconnected (tested %ld passwords)\n",
-            id, ci->tested);
+    if (ci_idx >= 0) {
+        fprintf(stderr, "[client %d] disconnected (tested %ld passwords)\n",
+                ci_idx, g_clients[ci_idx].tested);
 
-    pthread_mutex_lock(&g_clients_lock);
-    ci->active = 0;
-    pthread_mutex_unlock(&g_clients_lock);
+        pthread_mutex_lock(&g_clients_lock);
+        g_clients[ci_idx].active = 0;
+        /* Do NOT set slot_free — they might reconnect */
+        g_clients[ci_idx].fd = -1;
+        pthread_mutex_unlock(&g_clients_lock);
+    }
 
     close(fd);
     return NULL;
+}
+
+/* ================================================================
+ * Reaper thread — expire stale leases
+ * ================================================================ */
+static void *reaper_thread(void *arg)
+{
+    (void)arg;
+    while (!g_shutdown && !atomic_load(&g_found)) {
+        struct timespec ts = {REAPER_INTERVAL, 0};
+        nanosleep(&ts, NULL);
+
+        double now = mono_time();
+
+        pthread_mutex_lock(&g_lease_lock);
+        int count = g_lease_count < MAX_LEASES ? g_lease_count : MAX_LEASES;
+        for (int i = 0; i < count; i++) {
+            int slot = ((g_lease_count - 1 - i) % MAX_LEASES + MAX_LEASES) % MAX_LEASES;
+            LeaseEntry *le = &g_leases[slot];
+            if (!le->active) continue;
+
+            int expired = 0;
+
+            /* Check deadline */
+            if (now > le->deadline) {
+                expired = 1;
+            }
+
+            /* Check client last_seen */
+            if (!expired && le->client_idx >= 0 && le->client_idx < g_nclient_ids) {
+                pthread_mutex_lock(&g_clients_lock);
+                double last_seen = g_clients[le->client_idx].last_seen;
+                pthread_mutex_unlock(&g_clients_lock);
+                if (now - last_seen > HEARTBEAT_TIMEOUT) {
+                    expired = 1;
+                }
+            }
+
+            if (expired) {
+                fprintf(stderr, "[reaper] expiring lease %llu (client %d)\n",
+                        (unsigned long long)le->lease_id, le->client_idx);
+                expire_lease(le->lease_id);
+            }
+        }
+        pthread_mutex_unlock(&g_lease_lock);
+    }
+    return NULL;
+}
+
+/* ================================================================
+ * Checkpoint
+ * ================================================================ */
+static void save_checkpoint(void)
+{
+    if (!g_pdf_path) return;
+
+    /* Build checkpoint filename from PDF basename */
+    const char *base = strrchr(g_pdf_path, '/');
+    base = base ? base + 1 : g_pdf_path;
+
+    char ckpt_path[512], tmp_path[520];
+    snprintf(ckpt_path, sizeof(ckpt_path), "%s.server.ckpt", base);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", ckpt_path);
+
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) { perror("save_checkpoint"); return; }
+
+    fprintf(f, "PDFCRACKER_CHECKPOINT v1\n");
+    fprintf(f, "pdf_sha256 %s\n", g_pdf_sha256);
+    fprintf(f, "wordlist_sha256 %s\n", g_wordlist_sha256[0] ? g_wordlist_sha256 : "none");
+    fprintf(f, "mode %s\n", g_brute ? "brute" : "dict");
+    fprintf(f, "charset %s\n", g_charset ? g_charset : "none");
+    fprintf(f, "max_len %d\n", g_max_len);
+
+    pthread_mutex_lock(&g_work_lock);
+    fprintf(f, "brute_cursor %d %ld\n", g_brute_len, g_brute_idx);
+    fprintf(f, "dict_cursor %ld\n", g_dict_idx);
+    pthread_mutex_unlock(&g_work_lock);
+
+    fprintf(f, "total_tested %ld\n", atomic_load(&g_total_tested));
+    fprintf(f, "keyspace %ld\n", g_keyspace);
+
+    /* Save active leases */
+    pthread_mutex_lock(&g_lease_lock);
+    int count = g_lease_count < MAX_LEASES ? g_lease_count : MAX_LEASES;
+    for (int i = 0; i < count; i++) {
+        int slot = ((g_lease_count - 1 - i) % MAX_LEASES + MAX_LEASES) % MAX_LEASES;
+        LeaseEntry *le = &g_leases[slot];
+        if (!le->active) continue;
+        if (le->is_brute) {
+            fprintf(f, "lease %llu brute %d %ld %ld\n",
+                    (unsigned long long)le->lease_id,
+                    le->brute_len, le->brute_start, le->brute_end);
+        } else {
+            fprintf(f, "lease %llu dict %ld %ld\n",
+                    (unsigned long long)le->lease_id,
+                    le->dict_start, le->dict_count);
+        }
+    }
+    pthread_mutex_unlock(&g_lease_lock);
+
+    fprintf(f, "END\n");
+    fclose(f);
+
+    rename(tmp_path, ckpt_path);
+}
+
+static int restore_checkpoint(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); return 0; }
+
+    char line[MAX_LINE];
+
+    /* Header */
+    if (!fgets(line, sizeof(line), f) ||
+        strncmp(line, "PDFCRACKER_CHECKPOINT v1", 23) != 0) {
+        fprintf(stderr, "Bad checkpoint header\n");
+        fclose(f); return 0;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        /* Strip newline */
+        size_t len = strlen(line);
+        while (len && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+
+        if (strcmp(line, "END") == 0) break;
+
+        char key[64] = {0}, val[256] = {0};
+        if (sscanf(line, "%63s %255[^\n]", key, val) < 1) continue;
+
+        if (strcmp(key, "pdf_sha256") == 0) {
+            if (strcmp(val, g_pdf_sha256) != 0) {
+                fprintf(stderr, "PDF hash mismatch in checkpoint\n"
+                        "  checkpoint: %s\n  current:    %s\n",
+                        val, g_pdf_sha256);
+                fclose(f); return 0;
+            }
+        } else if (strcmp(key, "wordlist_sha256") == 0) {
+            if (strcmp(val, "none") != 0 && g_wordlist_sha256[0] &&
+                strcmp(val, g_wordlist_sha256) != 0) {
+                fprintf(stderr, "Wordlist hash mismatch in checkpoint\n"
+                        "  checkpoint: %s\n  current:    %s\n",
+                        val, g_wordlist_sha256);
+                fclose(f); return 0;
+            }
+        } else if (strcmp(key, "brute_cursor") == 0) {
+            sscanf(val, "%d %ld", &g_brute_len, &g_brute_idx);
+        } else if (strcmp(key, "dict_cursor") == 0) {
+            sscanf(val, "%ld", &g_dict_idx);
+        } else if (strcmp(key, "total_tested") == 0) {
+            long t = 0;
+            sscanf(val, "%ld", &t);
+            atomic_store(&g_total_tested, t);
+        } else if (strcmp(key, "keyspace") == 0) {
+            sscanf(val, "%ld", &g_keyspace);
+        } else if (strcmp(key, "lease") == 0) {
+            /* Push all saved leases into requeue */
+            unsigned long long lid = 0;
+            char type[16] = {0};
+            sscanf(val, "%llu %15s", &lid, type);
+            (void)lid;  /* lease IDs from checkpoint are just re-queued */
+
+            pthread_mutex_lock(&g_work_lock);
+            if (strcmp(type, "brute") == 0) {
+                int blen = 0;
+                long bstart = 0, bend = 0;
+                sscanf(val, "%*llu %*s %d %ld %ld", &blen, &bstart, &bend);
+                push_requeue_brute(blen, bstart, bend);
+            } else if (strcmp(type, "dict") == 0) {
+                long dstart = 0, dcount = 0;
+                sscanf(val, "%*llu %*s %ld %ld", &dstart, &dcount);
+                push_requeue_dict(dstart, dcount);
+            }
+            pthread_mutex_unlock(&g_work_lock);
+        }
+        /* Ignore mode, charset, max_len — those come from command line */
+    }
+
+    fclose(f);
+    fprintf(stderr, "Checkpoint restored from %s\n", path);
+    fprintf(stderr, "  brute cursor: len=%d idx=%ld\n", g_brute_len, g_brute_idx);
+    fprintf(stderr, "  dict cursor:  idx=%ld\n", g_dict_idx);
+    fprintf(stderr, "  total tested: %ld\n", atomic_load(&g_total_tested));
+    return 1;
+}
+
+/* ================================================================
+ * Checkpoint thread
+ * ================================================================ */
+static void *checkpoint_thread(void *arg)
+{
+    (void)arg;
+    while (!g_shutdown && !atomic_load(&g_found)) {
+        struct timespec ts = {CHECKPOINT_INTERVAL, 0};
+        nanosleep(&ts, NULL);
+        save_checkpoint();
+    }
+    return NULL;
+}
+
+/* ================================================================
+ * Shutdown
+ * ================================================================ */
+static void broadcast_abort(void)
+{
+    pthread_mutex_lock(&g_clients_lock);
+    for (int i = 0; i < g_nclient_ids; i++) {
+        if (g_clients[i].active && g_clients[i].fd >= 0) {
+            sock_printf(g_clients[i].fd, "ABORT");
+        }
+    }
+    pthread_mutex_unlock(&g_clients_lock);
+}
+
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    g_shutdown = 1;
+    /* Interrupt accept() */
+    if (g_listenfd >= 0) {
+        shutdown(g_listenfd, SHUT_RDWR);
+    }
+}
+
+/* ================================================================
+ * Formatting helpers
+ * ================================================================ */
+static void fmt_num(long n, char *buf, size_t sz)
+{
+    if (n >= 1000000000L)
+        snprintf(buf, sz, "%.1fG", (double)n / 1e9);
+    else if (n >= 1000000L)
+        snprintf(buf, sz, "%.1fM", (double)n / 1e6);
+    else if (n >= 1000L)
+        snprintf(buf, sz, "%.1fK", (double)n / 1e3);
+    else
+        snprintf(buf, sz, "%ld", n);
+}
+
+static void fmt_time(long secs, char *buf, size_t sz)
+{
+    if (secs < 0) {
+        snprintf(buf, sz, "---");
+    } else if (secs >= 3600) {
+        snprintf(buf, sz, "%ldh%02ldm", secs / 3600, (secs % 3600) / 60);
+    } else if (secs >= 60) {
+        snprintf(buf, sz, "%ldm%02lds", secs / 60, secs % 60);
+    } else {
+        snprintf(buf, sz, "%lds", secs);
+    }
 }
 
 /* ================================================================
@@ -286,16 +1068,17 @@ static void *progress_thread(void *arg)
 {
     (void)arg;
     long   prev = 0;
-    time_t t0   = time(NULL);
+    double t0   = mono_time();
 
-    while (!atomic_load(&g_found)) {
+    while (!g_shutdown && !atomic_load(&g_found)) {
         struct timespec ts = {1, 0};
         nanosleep(&ts, NULL);
 
         long cur     = atomic_load(&g_total_tested);
         long rate    = cur - prev;
         prev         = cur;
-        long elapsed = (long)(time(NULL) - t0);
+        double now   = mono_time();
+        long elapsed = (long)(now - t0);
 
         /* Count active clients */
         int nactive = 0;
@@ -304,34 +1087,71 @@ static void *progress_thread(void *arg)
             if (g_clients[i].active) nactive++;
         pthread_mutex_unlock(&g_clients_lock);
 
-        fputs("\r  ", stderr);
+        /* Clear line */
+        fputs("\r\033[K", stderr);
+
+        char rate_s[32], tested_s[32], elapsed_s[32], eta_s[32];
+        fmt_num(rate, rate_s, sizeof(rate_s));
+        fmt_num(cur, tested_s, sizeof(tested_s));
+        fmt_time(elapsed, elapsed_s, sizeof(elapsed_s));
 
         if (g_keyspace > 0) {
             double pct = (double)cur / (double)g_keyspace * 100.0;
             if (pct > 100.0) pct = 100.0;
-            print_bar(pct);
 
             long eta = -1;
             if (rate > 0 && g_keyspace > cur)
                 eta = (g_keyspace - cur) / rate;
+            fmt_time(eta, eta_s, sizeof(eta_s));
 
-            fprintf(stderr,
-                " %5.1f%%  clients: %d  tested: %ld  %ld/s  elapsed: %lds",
-                pct, nactive, cur, rate, elapsed);
-            if (eta >= 0) {
-                if (eta > 3600)
-                    fprintf(stderr, "  ETA: %ldh%02ldm", eta/3600, (eta%3600)/60);
-                else if (eta > 60)
-                    fprintf(stderr, "  ETA: %ldm%02lds", eta/60, eta%60);
-                else
-                    fprintf(stderr, "  ETA: %lds", eta);
-            }
-            fputs("   ", stderr);
+            fputs("  ", stderr);
+            print_bar(pct);
+            fprintf(stderr, " %5.1f%%  [%d clients]  %s tested  %s/s  %s  ETA %s",
+                    pct, nactive, tested_s, rate_s, elapsed_s, eta_s);
         } else {
-            fprintf(stderr,
-                "clients: %d  tested: %ld  %ld/s  elapsed: %lds   ",
-                nactive, cur, rate, elapsed);
+            fprintf(stderr, "  [%d clients]  %s tested  %s/s  %s",
+                    nactive, tested_s, rate_s, elapsed_s);
         }
+
+        /* Per-client stats */
+        fprintf(stderr, "\n");
+        pthread_mutex_lock(&g_clients_lock);
+        for (int i = 0; i < g_nclient_ids; i++) {
+            ClientInfo *ci = &g_clients[i];
+            if (ci->slot_free) continue;
+
+            char sp[32], te[32];
+            fmt_num((long)ci->speed, sp, sizeof(sp));
+            fmt_num(ci->tested, te, sizeof(te));
+
+            int ago = ci->active ? (int)(now - ci->last_seen) : -1;
+
+            fprintf(stderr, "    #%-2d %-15s %2d cores  %6s/s  lease %-4llu  %8s tested",
+                    i, ci->ip_str, ci->cores, sp,
+                    (unsigned long long)ci->current_lease_id, te);
+            if (ci->active) {
+                fprintf(stderr, "  %ds ago", ago);
+            } else {
+                fprintf(stderr, "  [offline]");
+            }
+            fprintf(stderr, "\n");
+        }
+        pthread_mutex_unlock(&g_clients_lock);
+
+        /* Move cursor up for overwrite on next iteration */
+        int lines_to_clear = 1;  /* main line */
+        pthread_mutex_lock(&g_clients_lock);
+        for (int i = 0; i < g_nclient_ids; i++) {
+            if (!g_clients[i].slot_free) lines_to_clear++;
+        }
+        pthread_mutex_unlock(&g_clients_lock);
+
+        /* Move cursor up N lines */
+        for (int i = 0; i < lines_to_clear; i++) {
+            fputs("\033[A", stderr);
+        }
+        /* Move to beginning */
+        fputc('\r', stderr);
         fflush(stderr);
     }
     return NULL;
@@ -344,10 +1164,11 @@ static void usage(const char *p)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  %s -f <pdf> -d <wordlist> [-p <port>]             dictionary\n"
+        "  %s -f <pdf> -d <wordlist> [-p <port>]                dictionary\n"
         "  %s -f <pdf> -b [-l <maxlen>] [-c <charset>] [-p <port>]  brute-force\n"
+        "  %s -f <pdf> ... -R <ckpt_file>                       restore\n"
         "\nClients connect and receive work chunks automatically.\n",
-        p, p);
+        p, p, p);
     exit(1);
 }
 
@@ -358,22 +1179,24 @@ int main(int argc, char *argv[])
 {
     signal(SIGPIPE, SIG_IGN);
 
-    const char *pdf_path  = NULL;
-    const char *dict_path = NULL;
-    const char *charset   = DEFAULT_CHARSET;
-    int         brute     = 0;
-    int         max_len   = 4;
-    int         port      = DEFAULT_PORT;
+    const char *pdf_path      = NULL;
+    const char *dict_path     = NULL;
+    const char *charset       = DEFAULT_CHARSET;
+    const char *restore_path  = NULL;
+    int         brute         = 0;
+    int         max_len       = 4;
+    int         port          = DEFAULT_PORT;
 
     int opt;
-    while ((opt = getopt(argc, argv, "f:d:bl:c:p:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:d:bl:c:p:R:")) != -1) {
         switch (opt) {
-            case 'f': pdf_path  = optarg;       break;
-            case 'd': dict_path = optarg;       break;
-            case 'b': brute     = 1;            break;
-            case 'l': max_len   = atoi(optarg); break;
-            case 'c': charset   = optarg;       break;
-            case 'p': port      = atoi(optarg); break;
+            case 'f': pdf_path     = optarg;       break;
+            case 'd': dict_path    = optarg;       break;
+            case 'b': brute        = 1;            break;
+            case 'l': max_len      = atoi(optarg); break;
+            case 'c': charset      = optarg;       break;
+            case 'p': port         = atoi(optarg); break;
+            case 'R': restore_path = optarg;       break;
             default:  usage(argv[0]);
         }
     }
@@ -382,8 +1205,10 @@ int main(int argc, char *argv[])
     if (!brute && !dict_path) { fprintf(stderr, "-d or -b required\n"); usage(argv[0]); }
 
     /* ── Load PDF ──────────────────────────────────────────────── */
+    g_pdf_path = pdf_path;
     if (!load_pdf(pdf_path)) return 1;
     fprintf(stderr, "PDF loaded: %s (%ld bytes)\n", pdf_path, g_pdf_size);
+    compute_pdf_hash();
 
     /* ── Setup mode ────────────────────────────────────────────── */
     g_brute   = brute;
@@ -395,89 +1220,108 @@ int main(int argc, char *argv[])
         g_keyspace = total_keyspace(max_len, g_cs_len);
         fprintf(stderr, "Mode   : brute-force (len 1..%d, charset \"%s\")\n",
                 max_len, charset);
-        fprintf(stderr, "Keyspace: %ld passwords\n", g_keyspace);
+
+        char ks_str[32];
+        fmt_num(g_keyspace, ks_str, sizeof(ks_str));
+        fprintf(stderr, "Keyspace: %s passwords (%ld)\n", ks_str, g_keyspace);
     } else {
+        g_dict_path = dict_path ? strdup(dict_path) : NULL;
         if (!load_wordlist(dict_path)) return 1;
         g_keyspace = g_nwords;
         fprintf(stderr, "Mode   : dictionary (%ld words from %s)\n",
                 g_nwords, dict_path);
+        compute_wordlist_hash();
     }
 
-    /* ── Start progress thread ─────────────────────────────────── */
-    pthread_t prog;
-    pthread_create(&prog, NULL, progress_thread, NULL);
+    /* ── Restore checkpoint if requested ──────────────────────── */
+    if (restore_path) {
+        if (!restore_checkpoint(restore_path)) {
+            fprintf(stderr, "Failed to restore checkpoint\n");
+            return 1;
+        }
+    }
 
-    /* ── Create listening socket ───────────────────────────────── */
-    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenfd < 0) { perror("socket"); return 1; }
+    /* ── Register signal handler ──────────────────────────────── */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    /* ── Launch background threads ────────────────────────────── */
+    pthread_t prog_th, reaper_th, ckpt_th;
+    pthread_create(&prog_th,   NULL, progress_thread,   NULL);
+    pthread_create(&reaper_th, NULL, reaper_thread,     NULL);
+    pthread_create(&ckpt_th,   NULL, checkpoint_thread, NULL);
+
+    /* ── Create listening socket ──────────────────────────────── */
+    g_listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_listenfd < 0) { perror("socket"); return 1; }
 
     int yes = 1;
-    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(g_listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port   = htons((uint16_t)port),
         .sin_addr.s_addr = INADDR_ANY,
     };
-    if (bind(listenfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (bind(g_listenfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind"); return 1;
     }
-    if (listen(listenfd, 16) < 0) { perror("listen"); return 1; }
+    if (listen(g_listenfd, 16) < 0) { perror("listen"); return 1; }
 
     fprintf(stderr, "\nListening on port %d — waiting for clients...\n\n", port);
 
-    /* ── Accept loop ───────────────────────────────────────────── */
-    while (!atomic_load(&g_found)) {
+    /* ── Accept loop ──────────────────────────────────────────── */
+    while (!g_shutdown && !atomic_load(&g_found)) {
         struct sockaddr_in cli_addr;
         socklen_t cli_len = sizeof(cli_addr);
-        int fd = accept(listenfd, (struct sockaddr *)&cli_addr, &cli_len);
+        int fd = accept(g_listenfd, (struct sockaddr *)&cli_addr, &cli_len);
         if (fd < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || g_shutdown) break;
             perror("accept");
             continue;
         }
 
-        /* Disable Nagle for snappy protocol exchange */
+        /* Disable Nagle */
         int flag = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
-        pthread_mutex_lock(&g_clients_lock);
-        if (g_nclient_ids >= MAX_CLIENTS) {
-            pthread_mutex_unlock(&g_clients_lock);
-            fprintf(stderr, "Max clients reached, rejecting\n");
-            close(fd);
-            continue;
-        }
-        int cid = g_nclient_ids++;
-        g_clients[cid] = (ClientInfo){
-            .fd     = fd,
-            .id     = cid,
-            .cores  = 0,
-            .active = 1,
-            .tested = 0,
-        };
-        pthread_mutex_unlock(&g_clients_lock);
+        /* Pass fd to handler thread */
+        int *fdp = malloc(sizeof(int));
+        if (!fdp) { close(fd); continue; }
+        *fdp = fd;
 
         pthread_t th;
-        pthread_create(&th, NULL, client_handler, &g_clients[cid]);
+        pthread_create(&th, NULL, client_handler, fdp);
         pthread_detach(th);
     }
 
-    /* ── Done ──────────────────────────────────────────────────── */
-    /* Give progress thread a moment to print final state */
+    /* ── Shutdown ─────────────────────────────────────────────── */
+    fprintf(stderr, "\nShutting down...\n");
+    g_shutdown = 1;
+    broadcast_abort();
+    save_checkpoint();
+
+    /* Give threads a moment to finish */
     struct timespec ts = {1, 0};
     nanosleep(&ts, NULL);
+
+    /* Signal found to stop progress/reaper threads */
     atomic_store(&g_found, 1);
-    pthread_join(prog, NULL);
 
     fputs("\n\n", stderr);
     if (g_password[0]) {
         printf("Password found: %s\n", g_password);
         printf("Total tested:   %ld\n", atomic_load(&g_total_tested));
     } else {
-        printf("Password not found.\n");
+        printf("Password not found (tested %ld).\n", atomic_load(&g_total_tested));
+        printf("Checkpoint saved. Restart with -R to resume.\n");
     }
 
-    close(listenfd);
+    close(g_listenfd);
     return g_password[0] ? 0 : 1;
 }
