@@ -21,6 +21,8 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <sys/wait.h>
+#include <libgen.h>
 
 /* ================================================================
  * Data Structures
@@ -1197,7 +1199,9 @@ static void usage(const char *p)
         "  %s -f <pdf> -d <wordlist> [-p <port>]                dictionary\n"
         "  %s -f <pdf> -b [-l <maxlen>] [-c <charset>] [-p <port>]  brute-force\n"
         "  %s -f <pdf> ... -R <ckpt_file>                       restore\n"
-        "\nClients connect and receive work chunks automatically.\n",
+        "\nStarts cracking locally and listens for remote workers.\n"
+        "Other Macs can join with:\n"
+        "  bash /tmp/join.sh user@<this-ip> [port]\n",
         p, p, p);
     exit(1);
 }
@@ -1305,6 +1309,33 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "\nListening on port %d — waiting for clients...\n\n", port);
 
+    /* ── Spawn local client (cracks on this machine too) ──────── */
+    pid_t local_client_pid = -1;
+    {
+        /* Find client binary next to server binary */
+        char client_path[PATH_MAX];
+        char *dir = dirname(strdup(argv[0]));
+        snprintf(client_path, sizeof(client_path), "%s/client", dir);
+
+        /* Check client binary exists */
+        if (access(client_path, X_OK) == 0) {
+            local_client_pid = fork();
+            if (local_client_pid == 0) {
+                /* Child: exec client */
+                char port_str[16];
+                snprintf(port_str, sizeof(port_str), "%d", port);
+                execl(client_path, "client", "-s", "127.0.0.1", "-p", port_str, NULL);
+                _exit(1);  /* exec failed */
+            } else if (local_client_pid > 0) {
+                fprintf(stderr, "Local worker started (PID %d)\n\n", local_client_pid);
+            } else {
+                perror("fork");
+            }
+        } else {
+            fprintf(stderr, "Warning: client binary not found at %s — running as coordinator only\n", client_path);
+        }
+    }
+
     /* ── Accept loop ──────────────────────────────────────────── */
     while (!g_shutdown && !atomic_load(&g_found)) {
         struct sockaddr_in cli_addr;
@@ -1335,6 +1366,12 @@ int main(int argc, char *argv[])
     g_shutdown = 1;
     broadcast_abort();
     save_checkpoint();
+
+    /* Stop local client */
+    if (local_client_pid > 0) {
+        kill(local_client_pid, SIGTERM);
+        waitpid(local_client_pid, NULL, 0);
+    }
 
     /* Give threads a moment to finish */
     struct timespec ts = {1, 0};
