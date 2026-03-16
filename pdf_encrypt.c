@@ -387,13 +387,38 @@ PDFEncryptParams pdf_parse_encrypt(const uint8_t *data, size_t len)
     val = find_dict_value(enc_dict, end, "P");
     if (val) params.permissions = (int32_t)parse_int(val, end, NULL);
 
-    /* /O (owner password hash) */
+    /* /O (owner password hash — 32 bytes for R2-4, 48 for R5-6) */
     val = find_dict_value(enc_dict, end, "O");
-    if (val) parse_pdf_string(val, end, params.o_value, 32, NULL);
+    if (val) {
+        int max_o = (params.revision >= 5) ? 48 : 32;
+        params.o_value_len = parse_pdf_string(val, end, params.o_value, max_o, NULL);
+    }
 
-    /* /U (user password hash) */
+    /* /U (user password hash — 32 bytes for R2-4, 48 for R5-6) */
     val = find_dict_value(enc_dict, end, "U");
-    if (val) parse_pdf_string(val, end, params.u_value, 32, NULL);
+    if (val) {
+        int max_u = (params.revision >= 5) ? 48 : 32;
+        params.u_value_len = parse_pdf_string(val, end, params.u_value, max_u, NULL);
+    }
+
+    /* R5/R6 additional values */
+    if (params.revision >= 5) {
+        val = find_dict_value(enc_dict, end, "OE");
+        if (val) {
+            int n = parse_pdf_string(val, end, params.oe_value, 32, NULL);
+            params.has_oe = (n == 32);
+        }
+        val = find_dict_value(enc_dict, end, "UE");
+        if (val) {
+            int n = parse_pdf_string(val, end, params.ue_value, 32, NULL);
+            params.has_ue = (n == 32);
+        }
+        val = find_dict_value(enc_dict, end, "Perms");
+        if (val) {
+            int n = parse_pdf_string(val, end, params.perms_value, 16, NULL);
+            params.has_perms = (n == 16);
+        }
+    }
 
     /* /EncryptMetadata */
     val = find_dict_value(enc_dict, end, "EncryptMetadata");
@@ -421,12 +446,17 @@ PDFEncryptParams pdf_parse_encrypt(const uint8_t *data, size_t len)
     /* ── Validate ──────────────────────────────────────────────── */
     /* Check that O and U were actually parsed (not all zeros) */
     int o_ok = 0, u_ok = 0;
-    for (int i = 0; i < 32; i++) {
+    int check_len = (params.revision >= 5) ? 48 : 32;
+    for (int i = 0; i < check_len; i++) {
         if (params.o_value[i]) o_ok = 1;
         if (params.u_value[i]) u_ok = 1;
     }
-    if (params.revision >= 2 && params.revision <= 4 &&
-        params.file_id_len > 0 && o_ok && u_ok) {
+
+    if (params.revision >= 5 && params.revision <= 6 && o_ok && u_ok) {
+        /* R5/R6 don't need file_id for password verification */
+        params.valid = 1;
+    } else if (params.revision >= 2 && params.revision <= 4 &&
+               params.file_id_len > 0 && o_ok && u_ok) {
         params.valid = 1;
     }
 
@@ -578,11 +608,180 @@ static void compute_u_r3(const PDFEncryptParams *params,
 }
 
 /* ================================================================
+ * Algorithm 2.B: R6 iterative hash (ISO 32000-2 section 7.6.4.3.4)
+ *
+ * This is the deliberately slow KDF used by R6.
+ * Input: password, salt (8 bytes), extra data (0 or 48 bytes for U)
+ * Output: 32-byte hash
+ * ================================================================ */
+static void algorithm_2b(const uint8_t *password, size_t pw_len,
+                          const uint8_t *salt, const uint8_t *extra,
+                          int extra_len, uint8_t *out)
+{
+    /* Step a: SHA-256(password + salt + extra) */
+    uint8_t hash[64]; /* large enough for SHA-512 */
+    CC_SHA256_CTX sha256;
+    CC_SHA256_Init(&sha256);
+    CC_SHA256_Update(&sha256, password, (CC_LONG)pw_len);
+    CC_SHA256_Update(&sha256, salt, 8);
+    if (extra_len > 0)
+        CC_SHA256_Update(&sha256, extra, (CC_LONG)extra_len);
+    CC_SHA256_Final(hash, &sha256);
+
+    int hash_len = 32; /* starts as SHA-256 */
+
+    /* Step b-e: iterate until round >= 64 and last byte condition met */
+    unsigned round = 0;
+    uint8_t K1[64 * (127 + 64 + 48)]; /* max iteration block */
+
+    for (;;) {
+        /* Step b: Build K1 = password + hash + extra, repeated 64 times */
+        size_t seq_len = pw_len + (size_t)hash_len + (size_t)extra_len;
+        uint8_t seq[127 + 64 + 48]; /* max: 127 pw + 64 hash + 48 extra */
+        memcpy(seq, password, pw_len);
+        memcpy(seq + pw_len, hash, (size_t)hash_len);
+        if (extra_len > 0)
+            memcpy(seq + pw_len + hash_len, extra, (size_t)extra_len);
+
+        size_t K1_len = seq_len * 64;
+        for (int i = 0; i < 64; i++)
+            memcpy(K1 + i * seq_len, seq, seq_len);
+
+        /* Step c: AES-CBC encrypt K1 with key=hash[0:16], iv=hash[16:32] */
+        uint8_t *aes_out = malloc(K1_len + 16); /* CBC may need padding room */
+        if (!aes_out) { memcpy(out, hash, 32); return; }
+        size_t aes_len = 0;
+        CCCrypt(kCCEncrypt, kCCAlgorithmAES, 0, /* no padding */
+                hash, 16, hash + 16,
+                K1, K1_len,
+                aes_out, K1_len + 16, &aes_len);
+
+        /* Step d: Choose hash based on first byte of encrypted result */
+        /* Sum of first 16 bytes mod 3 determines hash algorithm */
+        unsigned sum = 0;
+        for (int i = 0; i < 16; i++) sum += aes_out[i];
+
+        switch (sum % 3) {
+            case 0:
+                CC_SHA256(aes_out, (CC_LONG)aes_len, hash);
+                hash_len = 32;
+                break;
+            case 1:
+                CC_SHA384(aes_out, (CC_LONG)aes_len, hash);
+                hash_len = 48;
+                break;
+            case 2:
+                CC_SHA512(aes_out, (CC_LONG)aes_len, hash);
+                hash_len = 64;
+                break;
+        }
+
+        /* Step e: Check termination */
+        uint8_t last_byte = aes_out[aes_len - 1];
+        free(aes_out);
+        round++;
+
+        if (round >= 64 && last_byte <= (round - 32))
+            break;
+    }
+
+    memcpy(out, hash, 32);
+}
+
+/* ================================================================
+ * R5 user password verification (Algorithm 2.A simplified)
+ * SHA-256(password + validation_salt) == U[0:32]
+ * validation_salt = U[32:40]
+ * ================================================================ */
+static int verify_user_r5(const PDFEncryptParams *params, const char *password)
+{
+    if (params->u_value_len < 40) return 0;
+
+    size_t pw_len = password ? strlen(password) : 0;
+    if (pw_len > 127) pw_len = 127;
+
+    uint8_t hash[32];
+    CC_SHA256_CTX sha256;
+    CC_SHA256_Init(&sha256);
+    if (pw_len > 0) CC_SHA256_Update(&sha256, (const uint8_t *)password, (CC_LONG)pw_len);
+    CC_SHA256_Update(&sha256, params->u_value + 32, 8); /* validation salt */
+    CC_SHA256_Final(hash, &sha256);
+
+    return memcmp(hash, params->u_value, 32) == 0;
+}
+
+/* ================================================================
+ * R5 owner password verification
+ * SHA-256(password + validation_salt + U[0:48]) == O[0:32]
+ * validation_salt = O[32:40]
+ * ================================================================ */
+static int verify_owner_r5(const PDFEncryptParams *params, const char *password)
+{
+    if (params->o_value_len < 40 || params->u_value_len < 48) return 0;
+
+    size_t pw_len = password ? strlen(password) : 0;
+    if (pw_len > 127) pw_len = 127;
+
+    uint8_t hash[32];
+    CC_SHA256_CTX sha256;
+    CC_SHA256_Init(&sha256);
+    if (pw_len > 0) CC_SHA256_Update(&sha256, (const uint8_t *)password, (CC_LONG)pw_len);
+    CC_SHA256_Update(&sha256, params->o_value + 32, 8); /* validation salt */
+    CC_SHA256_Update(&sha256, params->u_value, 48);       /* full U value */
+    CC_SHA256_Final(hash, &sha256);
+
+    return memcmp(hash, params->o_value, 32) == 0;
+}
+
+/* ================================================================
+ * R6 user password verification (Algorithm 2.A with 2.B hash)
+ * Algorithm2B(password, U_validation_salt, "") == U[0:32]
+ * ================================================================ */
+static int verify_user_r6(const PDFEncryptParams *params, const char *password)
+{
+    if (params->u_value_len < 40) return 0;
+
+    size_t pw_len = password ? strlen(password) : 0;
+    if (pw_len > 127) pw_len = 127;
+
+    uint8_t hash[32];
+    algorithm_2b((const uint8_t *)password, pw_len,
+                 params->u_value + 32, /* validation salt */
+                 NULL, 0,              /* no extra data for user */
+                 hash);
+
+    return memcmp(hash, params->u_value, 32) == 0;
+}
+
+/* ================================================================
+ * R6 owner password verification
+ * Algorithm2B(password, O_validation_salt, U[0:48]) == O[0:32]
+ * ================================================================ */
+static int verify_owner_r6(const PDFEncryptParams *params, const char *password)
+{
+    if (params->o_value_len < 40 || params->u_value_len < 48) return 0;
+
+    size_t pw_len = password ? strlen(password) : 0;
+    if (pw_len > 127) pw_len = 127;
+
+    uint8_t hash[32];
+    algorithm_2b((const uint8_t *)password, pw_len,
+                 params->o_value + 32, /* validation salt */
+                 params->u_value, 48,  /* full U as extra data */
+                 hash);
+
+    return memcmp(hash, params->o_value, 32) == 0;
+}
+
+/* ================================================================
  * Algorithm 6: Verify user password
  * ================================================================ */
 int pdf_verify_user_password(const PDFEncryptParams *params, const char *password)
 {
     if (!params->valid) return 0;
+
+    if (params->revision == 5) return verify_user_r5(params, password);
+    if (params->revision == 6) return verify_user_r6(params, password);
 
     uint8_t key[16];
     int key_len = pdf_compute_encryption_key(params, password, key);
@@ -612,6 +811,9 @@ int pdf_verify_user_password(const PDFEncryptParams *params, const char *passwor
 int pdf_verify_owner_password(const PDFEncryptParams *params, const char *password)
 {
     if (!params->valid) return 0;
+
+    if (params->revision == 5) return verify_owner_r5(params, password);
+    if (params->revision == 6) return verify_owner_r6(params, password);
 
     int key_bytes = params->key_length / 8;
     if (key_bytes < 5)  key_bytes = 5;

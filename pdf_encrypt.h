@@ -4,10 +4,11 @@
  * Provides:
  *   1. PDFEncryptParams struct with all values needed for password verification
  *   2. Parser to extract these from raw PDF bytes
- *   3. CPU-side password verification (MD5+RC4 via CommonCrypto)
+ *   3. CPU-side password verification
  *
- * Supports encryption revisions R2, R3, R4 (user password verification).
- * Owner password verification is also supported.
+ * Supports encryption revisions R2, R3, R4 (MD5+RC4 via CommonCrypto)
+ * and R5, R6 (SHA-256 + AES-256 via CommonCrypto).
+ * Both user and owner password verification are supported.
  */
 
 #ifndef PDF_ENCRYPT_H
@@ -25,15 +26,23 @@ static const uint8_t PDF_PASSWORD_PADDING[32] = {
 };
 
 typedef struct {
-    int      version;           /* /V value (1, 2, 3, 4)              */
-    int      revision;          /* /R value (2, 3, 4)                 */
-    int      key_length;        /* in bits (40, 56, 64, 80, 96, 128) */
+    int      version;           /* /V value (1, 2, 3, 4, 5)           */
+    int      revision;          /* /R value (2, 3, 4, 5, 6)           */
+    int      key_length;        /* in bits (40..256)                  */
     int32_t  permissions;       /* /P value (signed 32-bit)           */
-    uint8_t  o_value[32];       /* /O value (owner password hash)     */
-    uint8_t  u_value[32];       /* /U value (user password hash)      */
+    uint8_t  o_value[48];       /* /O value (R2-4: 32 bytes, R5-6: 48) */
+    uint8_t  u_value[48];       /* /U value (R2-4: 32 bytes, R5-6: 48) */
+    int      o_value_len;       /* actual length of O (32 or 48)      */
+    int      u_value_len;       /* actual length of U (32 or 48)      */
+    uint8_t  oe_value[32];      /* /OE value (R5/R6 only)             */
+    uint8_t  ue_value[32];      /* /UE value (R5/R6 only)             */
+    uint8_t  perms_value[16];   /* /Perms value (R5/R6 only)          */
+    int      has_oe;            /* 1 if /OE was parsed                */
+    int      has_ue;            /* 1 if /UE was parsed                */
+    int      has_perms;         /* 1 if /Perms was parsed             */
     uint8_t  file_id[48];       /* first element of /ID array         */
     int      file_id_len;       /* actual length (usually 16 or 32+) */
-    int      encrypt_metadata;  /* 1 = encrypt metadata (default), 0 = don't */
+    int      encrypt_metadata;  /* 1 = encrypt metadata (default)     */
     int      valid;             /* 1 if parsing succeeded             */
 } PDFEncryptParams;
 
@@ -51,14 +60,14 @@ PDFEncryptParams pdf_parse_encrypt_file(const char *path);
 /*
  * Verify a user password against the encryption parameters.
  * Returns 1 if the password is correct, 0 otherwise.
- * Supports R2, R3, R4.
+ * Supports R2, R3, R4, R5, R6.
  */
 int pdf_verify_user_password(const PDFEncryptParams *params, const char *password);
 
 /*
  * Verify an owner password against the encryption parameters.
  * Returns 1 if the password is correct, 0 otherwise.
- * Supports R2, R3, R4.
+ * Supports R2, R3, R4, R5, R6.
  */
 int pdf_verify_owner_password(const PDFEncryptParams *params, const char *password);
 

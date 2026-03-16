@@ -674,14 +674,18 @@ int main(int argc, char *argv[])
     g_enc_params = pdf_parse_encrypt_file(pdf_path);
     if (g_enc_params.valid) {
         g_fast_crypto = 1;
-        fprintf(stderr, "Crypto : direct MD5+RC4 (R%d, %d-bit key) — ~10x faster\n",
-                g_enc_params.revision, g_enc_params.key_length);
+        if (g_enc_params.revision >= 5)
+            fprintf(stderr, "Crypto : direct SHA-256+AES (R%d, %d-bit key)\n",
+                    g_enc_params.revision, g_enc_params.key_length);
+        else
+            fprintf(stderr, "Crypto : direct MD5+RC4 (R%d, %d-bit key)\n",
+                    g_enc_params.revision, g_enc_params.key_length);
     } else {
         fprintf(stderr, "Crypto : CGPDFDocument fallback (unsupported encryption)\n");
     }
 
-    /* ── Try GPU acceleration ─────────────────────────────────────── */
-    if (g_fast_crypto && !no_gpu) {
+    /* ── Try GPU acceleration (only for R2-R4, Metal shader does MD5) ── */
+    if (g_fast_crypto && !no_gpu && g_enc_params.revision <= 4) {
         g_gpu_ctx = metal_keygen_init(&g_enc_params, NULL);
         if (g_gpu_ctx) {
             if (benchmark_gpu()) {

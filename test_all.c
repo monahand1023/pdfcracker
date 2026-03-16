@@ -43,11 +43,11 @@ int main(void)
         {"test_encrypted.pdf",   "test123",    "owner456",   "pypdf R3 128-bit",   0},
         {"test_r4_aes128.pdf",   "passaes",    "owneraes",   "pypdf R4 AES-128",   0},
         {"test_multipage.pdf",   "multipage",  "owner_mp",   "pypdf R3 multipage", 0},
-        {"test_r5_aes256.pdf",   "pass256",    "owner256",   "pypdf R5 AES-256",   1},
+        {"test_r5_aes256.pdf",   "pass256",    "owner256",   "pypdf R5 AES-256",   0},
         /* pikepdf outputs (nested /CF dicts) */
         {"test_xrefstream.pdf",  "user_xref",  "owner_xref", "pikepdf R4 AES",     0},
         {"test_pikepdf_trad.pdf","user_trad",  "owner_trad", "pikepdf R4 trad",    0},
-        {"test_pikepdf_r6.pdf",  "user_r6",    "owner_r6",   "pikepdf R6 AES-256", 1},
+        {"test_pikepdf_r6.pdf",  "user_r6",    "owner_r6",   "pikepdf R6 AES-256", 0},
         {NULL, NULL, NULL, NULL, 0}
     };
 
