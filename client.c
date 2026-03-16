@@ -36,6 +36,9 @@
 /* Batch size for atomic counter updates — avoids cache-line thrashing */
 #define TESTED_BATCH 256
 
+/* Maximum local threads (MAX_CLIENTS + 1 for GPU thread) */
+#define MAX_LOCAL_THREADS 65
+
 /* ── Local state ──────────────────────────────────────────────── */
 static int   g_nthreads = 0;
 static int   g_no_gpu   = 0;
@@ -67,7 +70,7 @@ static atomic_long g_chunk_tested = 0;
 /* ── Session / reconnect state ────────────────────────────────── */
 static char          g_client_uuid[UUID_LEN + 1] = {0};
 static uint64_t      g_current_lease_id = 0;
-static volatile int  g_shutdown_requested = 0;
+static volatile sig_atomic_t g_shutdown_requested = 0;
 
 /* ================================================================
  * UUID persistence — ~/.pdfcracker_id
@@ -209,6 +212,8 @@ static void *brute_local_worker(void *arg)
                 if (hit) {
                     if (!atomic_exchange(&g_chunk_found, 1))
                         strncpy(g_chunk_pass, pass, MAX_PASS_LEN);
+                    g_chunk_pass[MAX_PASS_LEN] = '\0';
+                        g_chunk_pass[MAX_PASS_LEN] = '\0';
                 }
             }
         }
@@ -228,6 +233,7 @@ static void *brute_local_worker(void *arg)
             if (hit) {
                 if (!atomic_exchange(&g_chunk_found, 1))
                     strncpy(g_chunk_pass, pass, MAX_PASS_LEN);
+                    g_chunk_pass[MAX_PASS_LEN] = '\0';
             }
         }
     }
@@ -288,6 +294,8 @@ static void *dict_local_worker(void *arg)
                 if (hit) {
                     if (!atomic_exchange(&g_chunk_found, 1))
                         strncpy(g_chunk_pass, a->words[i], MAX_PASS_LEN);
+                    g_chunk_pass[MAX_PASS_LEN] = '\0';
+                        g_chunk_pass[MAX_PASS_LEN] = '\0';
                 }
             }
         }
@@ -306,6 +314,7 @@ static void *dict_local_worker(void *arg)
             if (hit) {
                 if (!atomic_exchange(&g_chunk_found, 1))
                     strncpy(g_chunk_pass, a->words[i], MAX_PASS_LEN);
+                    g_chunk_pass[MAX_PASS_LEN] = '\0';
             }
         }
     }
@@ -410,6 +419,7 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
             if (memcmp(computed_u, g_enc_params.u_value, 32) == 0) {
                 if (!atomic_exchange(&g_chunk_found, 1))
                     strncpy(g_chunk_pass, passwords[i], MAX_PASS_LEN);
+                    g_chunk_pass[MAX_PASS_LEN] = '\0';
                 return 1;
             }
         } else {
@@ -439,6 +449,7 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
             if (memcmp(encrypted, g_enc_params.u_value, 16) == 0) {
                 if (!atomic_exchange(&g_chunk_found, 1))
                     strncpy(g_chunk_pass, passwords[i], MAX_PASS_LEN);
+                    g_chunk_pass[MAX_PASS_LEN] = '\0';
                 return 1;
             }
         }
@@ -527,7 +538,7 @@ static int crack_brute_chunk(int length, long start, long end)
     int  nt    = g_nthreads;
     if (nt > total) nt = (int)total;
 
-    pthread_t threads[MAX_CLIENTS + 1];
+    pthread_t threads[MAX_LOCAL_THREADS];
     int spawned = 0;
 
     if (g_use_gpu) {
@@ -574,7 +585,7 @@ static int crack_dict_chunk(char **words, long count)
     int nt = g_nthreads;
     if (nt > count) nt = (int)count;
 
-    pthread_t threads[MAX_CLIENTS + 1];
+    pthread_t threads[MAX_LOCAL_THREADS];
     int spawned = 0;
 
     if (g_use_gpu) {
@@ -643,8 +654,8 @@ static void sigint_handler(int sig)
 {
     (void)sig;
     g_shutdown_requested = 1;
-    /* Stop worker threads immediately */
-    atomic_store(&g_chunk_found, 1);
+    /* Note: atomic_store is not async-signal-safe; the main thread
+       will set g_chunk_found after checking g_shutdown_requested. */
 }
 
 /* ================================================================
@@ -789,6 +800,8 @@ static int run_session(const char *host, int port)
 
     for (;;) {
         if (g_shutdown_requested) {
+            /* Stop worker threads from main thread (async-signal-safe) */
+            atomic_store(&g_chunk_found, 1);
             /* If we have an active lease, send PARTIAL with high-water mark */
             if (g_current_lease_id > 0) {
                 long hwm = atomic_load(&g_next_idx);
@@ -1000,6 +1013,8 @@ static void usage(const char *p)
  * ================================================================ */
 int main(int argc, char *argv[])
 {
+    signal(SIGPIPE, SIG_IGN);
+
     const char *host = NULL;
     int port     = DEFAULT_PORT;
     int nthreads = (int)sysconf(_SC_NPROCESSORS_ONLN);
@@ -1017,6 +1032,7 @@ int main(int argc, char *argv[])
     }
 
     if (!host) { fprintf(stderr, "-s required\n"); usage(argv[0]); }
+    if (nthreads > 64) nthreads = 64;
     g_nthreads = nthreads;
     atexit(cleanup);
 

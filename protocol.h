@@ -138,6 +138,7 @@ static inline int sock_printf(int fd, const char *fmt, ...)
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
     va_end(ap);
+    if (n >= (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
     buf[n++] = '\n';
     buf[n]   = '\0';
     return (write_exact(fd, buf, (size_t)n) > 0) ? n : -1;

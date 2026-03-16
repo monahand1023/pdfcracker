@@ -261,6 +261,9 @@ static int pop_requeue(int *is_brute, int *brute_len,
     return 1;
 }
 
+/* Forward declaration (needed because create_lease may call expire_lease) */
+static void expire_lease(uint64_t lease_id);
+
 /* ================================================================
  * Lease management (caller holds g_lease_lock)
  * ================================================================ */
@@ -271,6 +274,11 @@ static uint64_t create_lease(int client_idx, int is_brute,
 {
     int slot = g_lease_count % MAX_LEASES;
     uint64_t lid = g_next_lease_id++;
+
+    /* If slot holds an active lease, expire it first to requeue its work */
+    if (g_lease_count >= MAX_LEASES && g_leases[slot].active) {
+        expire_lease(g_leases[slot].lease_id);
+    }
 
     g_leases[slot] = (LeaseEntry){
         .lease_id       = lid,
@@ -621,10 +629,8 @@ static void *client_handler(void *arg)
             double elapsed = 0.0;
             sscanf(line, "GETWORK %ld %lf", &tested, &elapsed);
 
-            if (tested > 0) {
-                atomic_fetch_add(&g_total_tested, tested);
-                ci->tested += tested;
-            }
+            /* Note: tested count credited only in COMPLETE/PARTIAL handlers
+             * to avoid double-counting. Here we only use it for speed. */
 
             /* Compute speed and adaptive chunk size */
             if (elapsed > 0.1 && tested > 0) {
@@ -642,6 +648,7 @@ static void *client_handler(void *arg)
 
             /* Check if found */
             if (atomic_load(&g_found)) {
+                atomic_thread_fence(memory_order_acquire);
                 sock_printf(fd, "FOUND %s", g_password);
                 break;
             }
@@ -657,13 +664,34 @@ static void *client_handler(void *arg)
             /* Assign work */
             int is_brute = 0, out_len = 0;
             long out_start = 0, out_end = 0, out_dict_start = 0, out_dict_count = 0;
-            uint64_t lid = assign_work(ci, &is_brute, &out_len,
-                                       &out_start, &out_end,
-                                       &out_dict_start, &out_dict_count,
-                                       deadline);
+            uint64_t lid = 0;
+            int retries = 0;
+            while (retries < 3) {
+                lid = assign_work(ci, &is_brute, &out_len,
+                                  &out_start, &out_end,
+                                  &out_dict_start, &out_dict_count,
+                                  deadline);
+                if (lid != 0) break;
+
+                /* No work available — check if leases are still in-flight */
+                int any_active = 0;
+                pthread_mutex_lock(&g_lease_lock);
+                int lcount = g_lease_count < MAX_LEASES ? g_lease_count : MAX_LEASES;
+                for (int li = 0; li < lcount; li++) {
+                    int lslot = ((g_lease_count - 1 - li) % MAX_LEASES + MAX_LEASES) % MAX_LEASES;
+                    if (g_leases[lslot].active) { any_active = 1; break; }
+                }
+                pthread_mutex_unlock(&g_lease_lock);
+
+                if (!any_active) break;  /* truly done */
+
+                /* Active leases exist — wait for possible requeue */
+                retries++;
+                struct timespec wait_ts = {2, 0};
+                nanosleep(&wait_ts, NULL);
+            }
+
             if (lid == 0) {
-                /* Check requeue — maybe all work is in-flight but not done */
-                /* No more work from cursor and no requeue */
                 sock_printf(fd, "DONE");
                 break;
             }
@@ -764,10 +792,11 @@ static void *client_handler(void *arg)
         else if (strncmp(line, "FOUND ", 6) == 0) {
             char pw[MAX_PASS_LEN + 1] = {0};
             unsigned long long lid = 0;
-            sscanf(line, "FOUND %s %llu", pw, &lid);
+            sscanf(line, "FOUND %32s %llu", pw, &lid);
 
             if (!atomic_exchange(&g_found, 1)) {
                 strncpy(g_password, pw, MAX_PASS_LEN);
+                atomic_thread_fence(memory_order_release);
                 fprintf(stderr,
                     "\n\n  *** PASSWORD FOUND by client %d: %s ***\n\n",
                     ci_idx, g_password);
@@ -872,6 +901,8 @@ static void save_checkpoint(void)
     fprintf(f, "charset %s\n", g_charset ? g_charset : "none");
     fprintf(f, "max_len %d\n", g_max_len);
 
+    /* Lock order: g_lease_lock first, then g_work_lock (matches reaper) */
+    pthread_mutex_lock(&g_lease_lock);
     pthread_mutex_lock(&g_work_lock);
     fprintf(f, "brute_cursor %d %ld\n", g_brute_len, g_brute_idx);
     fprintf(f, "dict_cursor %ld\n", g_dict_idx);
@@ -880,8 +911,7 @@ static void save_checkpoint(void)
     fprintf(f, "total_tested %ld\n", atomic_load(&g_total_tested));
     fprintf(f, "keyspace %ld\n", g_keyspace);
 
-    /* Save active leases */
-    pthread_mutex_lock(&g_lease_lock);
+    /* Save active leases (g_lease_lock already held) */
     int count = g_lease_count < MAX_LEASES ? g_lease_count : MAX_LEASES;
     for (int i = 0; i < count; i++) {
         int slot = ((g_lease_count - 1 - i) % MAX_LEASES + MAX_LEASES) % MAX_LEASES;
@@ -1314,6 +1344,7 @@ int main(int argc, char *argv[])
     atomic_store(&g_found, 1);
 
     fputs("\n\n", stderr);
+    atomic_thread_fence(memory_order_acquire);
     if (g_password[0]) {
         printf("Password found: %s\n", g_password);
         printf("Total tested:   %ld\n", atomic_load(&g_total_tested));

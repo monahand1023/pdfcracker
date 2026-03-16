@@ -45,6 +45,9 @@
 #define BAR_WIDTH    35
 #define CKPT_INTERVAL 5  /* seconds between checkpoint saves */
 
+/* ── async-safe interrupt flag ────────────────────────────────── */
+static volatile sig_atomic_t g_interrupted = 0;
+
 /* ── shared state ─────────────────────────────────────────────── */
 static atomic_int  g_found   = 0;
 static char        g_password[MAX_PASS_LEN + 1] = {0};
@@ -178,6 +181,8 @@ static void ckpt_save(void)
         fprintf(f, "mode=dict\n");
         fprintf(f, "current_idx=%ld\n", cur_idx);
     }
+    if (g_prefix_len) fprintf(f, "prefix=%s\n", g_prefix);
+    if (g_suffix_len) fprintf(f, "suffix=%s\n", g_suffix);
     fclose(f);
     rename(tmp, g_ckpt_path);  /* atomic replace */
 }
@@ -190,6 +195,8 @@ typedef struct {
     long resume_idx;
     long completed_prior;
     long dict_idx;
+    char prefix[MAX_PASS_LEN + 1];
+    char suffix[MAX_PASS_LEN + 1];
 } Checkpoint;
 
 static Checkpoint ckpt_load(void)
@@ -216,6 +223,10 @@ static Checkpoint ckpt_load(void)
             ck.dict_idx = ck.resume_idx;
         } else if (strncmp(line, "completed_prior=", 16) == 0) {
             ck.completed_prior = atol(line + 16);
+        } else if (strncmp(line, "prefix=", 7) == 0) {
+            strncpy(ck.prefix, line + 7, MAX_PASS_LEN);
+        } else if (strncmp(line, "suffix=", 7) == 0) {
+            strncpy(ck.suffix, line + 7, MAX_PASS_LEN);
         }
     }
     fclose(f);
@@ -232,10 +243,9 @@ static void ckpt_delete(void)
 static void sigint_handler(int sig)
 {
     (void)sig;
-    ckpt_save();
-    const char msg[] = "\nInterrupted — checkpoint saved.\n";
+    g_interrupted = 1;
+    const char msg[] = "\nInterrupted — saving checkpoint...\n";
     write(STDERR_FILENO, msg, sizeof(msg) - 1);
-    _exit(1);
 }
 
 /* ================================================================
@@ -361,6 +371,12 @@ static void *progress_thread(void *arg)
         if (now - last_ckpt >= CKPT_INTERVAL) {
             ckpt_save();
             last_ckpt = now;
+        }
+
+        /* Check async-safe interrupt flag */
+        if (g_interrupted) {
+            ckpt_save();
+            _exit(1);
         }
     }
     return NULL;
@@ -1063,6 +1079,15 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "brute-force len %d idx %ld\n", ck.resume_len, ck.resume_idx);
             else
                 fprintf(stderr, "dictionary idx %ld\n", ck.dict_idx);
+            /* Restore prefix/suffix from checkpoint */
+            if (ck.prefix[0]) {
+                strncpy(g_prefix, ck.prefix, MAX_PASS_LEN);
+                g_prefix_len = (int)strlen(g_prefix);
+            }
+            if (ck.suffix[0]) {
+                strncpy(g_suffix, ck.suffix, MAX_PASS_LEN);
+                g_suffix_len = (int)strlen(g_suffix);
+            }
         } else {
             fprintf(stderr, "Resume : no checkpoint found, starting fresh\n");
         }
@@ -1168,9 +1193,10 @@ int main(int argc, char *argv[])
                 }
             } else {
                 /* Pre-partitioned ranges (CPU-only) */
-                long chunk = (total + nthreads - 1) / nthreads;
+                long remaining = total - idx0;
+                long chunk = (remaining + nthreads - 1) / nthreads;
                 for (int t = 0; t < nthreads; t++) {
-                    long start = (long)t * chunk;
+                    long start = idx0 + (long)t * chunk;
                     long end   = start + chunk;
                     if (start >= total) break;
                     if (end   > total)  end = total;
@@ -1192,6 +1218,13 @@ int main(int argc, char *argv[])
     fputs("\n\n", stderr);
 
     if (g_gpu_ctx) metal_keygen_free(g_gpu_ctx);
+
+    /* If interrupted during work, save checkpoint and exit */
+    if (g_interrupted) {
+        ckpt_save();
+        fprintf(stderr, "Checkpoint saved to %s (use -r to resume)\n", g_ckpt_path);
+        return 1;
+    }
 
     if (g_password[0]) {
         printf("Password found: %s\n", g_password);
