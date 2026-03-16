@@ -11,28 +11,57 @@
 | Memory | 64 GB unified |
 | OS | macOS 26.3.1 |
 
-## Multi-Core + GPU Performance
+## Best Speeds (M4 Pro)
 
-Full system throughput using all 14 CPU cores and Metal GPU acceleration (where beneficial). These are the speeds you'll see in practice.
+Optimal configuration for each revision using all available acceleration:
 
-| Revision | Encryption | Speed | GPU | Notes |
-|----------|-----------|-------|-----|-------|
-| R2 | 40-bit RC4 | **3.8M/s** | Disabled (CPU faster) | Fastest. GPU overhead exceeds benefit for simple key derivation |
-| R3 | 128-bit RC4 | **298K/s** | Enabled (+75%) | Most common encryption in the wild |
-| R4 | AES-128 | **225K/s** | Enabled (+75%) | Same key derivation as R3, slightly slower verification |
-| R5 | AES-256 / SHA-256 | **76.8M/s** | N/A | Simple SHA-256 check, extremely fast |
-| R6 | AES-256 / SHA-256+KDF | **13.8K/s** | N/A | Deliberately slow (64+ rounds of SHA-256+AES). By design |
+| Revision | Encryption | Speed | Engine | Notes |
+|----------|-----------|-------|--------|-------|
+| R2 | 40-bit RC4 | **15.9M/s** | CPU + NEON SIMD | 4-way parallel MD5 per core |
+| R3 | 128-bit RC4 | **812K/s** | CPU + NEON SIMD | Use `-G` to disable GPU for best speed |
+| R4 | AES-128 | **812K/s** | CPU + NEON SIMD | Same crypto as R3 |
+| R5 | AES-256 / SHA-256 | **104M/s** | CPU + GPU | GPU does full SHA-256 verification |
+| R6 | AES-256 / SHA-256+KDF | **14.3K/s** | CPU only | Deliberately slow KDF, GPU impractical |
 
-## GPU Impact
+### Optimization History
 
-Comparison of CPU-only (14 cores) vs CPU+GPU for R3 128-bit, the most common revision:
+| Revision | Phase 1 (CommonCrypto) | Phase 2 (Metal GPU) | Phase 3 (NEON SIMD) | Total Improvement |
+|----------|----------------------|--------------------|--------------------|-------------------|
+| R2 | 3.5M/s | 3.8M/s (+9%) | **15.9M/s (+318%)** | **4.5x** |
+| R3 | 188K/s | 298K/s (+58%) | **812K/s (+173%)** | **4.3x** |
+| R5 | 20M/s | 20M/s (CPU only) | **104M/s (+420%)** | **5.2x** |
 
-| Mode | Speed | Improvement |
-|------|-------|-------------|
-| CPU only (14 cores) | 171K/s | baseline |
-| CPU + GPU (14 cores + 20-core Metal) | 298K/s | **+75%** |
+## Engine Comparison
 
-The GPU handles MD5 key derivation while CPU cores handle RC4 verification in parallel. For R2 (40-bit), the key derivation is too simple for GPU to help — CPU alone is faster.
+### R2 40-bit (per engine)
+
+| Engine | Speed |
+|--------|-------|
+| Single core | 412K/s |
+| 14 cores | 3.9M/s |
+| 14 cores + NEON SIMD | **15.9M/s** |
+| GPU (Metal MD5) | 443K/s (slower than NEON) |
+
+### R3 128-bit (per engine)
+
+| Engine | Speed |
+|--------|-------|
+| Single core | 17K/s |
+| 14 cores | 179K/s |
+| 14 cores + NEON SIMD | **812K/s** |
+| GPU (Metal MD5 + CPU RC4) | 116K/s (slower than NEON) |
+
+NEON processes 4 passwords per core simultaneously. The GPU MD5 path is slower because RC4 verification creates a CPU bottleneck. Use `-G` to disable GPU and get pure NEON speed for R2-R4.
+
+### R5 AES-256 (per engine)
+
+| Engine | Speed |
+|--------|-------|
+| Single core | 7.1M/s |
+| 14 cores | 4.8M/s* |
+| GPU (Metal SHA-256) | **104M/s** |
+
+*Multi-core is slower than single-core for R5 because the SHA-256 check is so fast that thread overhead dominates. GPU is the clear winner — it does the full verification (SHA-256 + compare) entirely on-chip with no CPU round-trip.
 
 ## Single-Core Performance vs CoreGraphics API
 
@@ -46,28 +75,40 @@ Our direct crypto implementation vs Apple's CGPDFDocument API (which pdfcracker 
 | R5 AES-256 | 20,161K/s | 20K/s | **1,014x** |
 | R6 AES-256 | 2.9K/s | 589/s | **5x** |
 
-The R5 speedup (1,014x) is because our implementation checks the password hash directly against the stored validation salt, while CoreGraphics does unnecessary decryption work.
-
 ## Time to Crack Estimates (Single M4 Pro)
 
-How long a brute-force attack takes at R3 speeds (298K/s), using the default charset (a-z, A-Z, 0-9 = 62 characters):
+### R3 128-bit (812K/s with NEON, most common revision)
+
+Full charset (a-z, A-Z, 0-9 = 62 characters):
 
 | Max Length | Keyspace | Time |
 |------------|----------|------|
-| 4 | 15M | 50 seconds |
-| 5 | 931M | 52 minutes |
-| 6 | 57.7B | 2.2 days |
-| 7 | 3.5T | 138 days |
-| 8 | 221T | 23 years |
+| 4 | 15M | 18 seconds |
+| 5 | 931M | 19 minutes |
+| 6 | 57.7B | 20 hours |
+| 7 | 3.5T | 50 days |
+| 8 | 221T | 8.6 years |
 
-With a reduced charset (digits only, 10 characters):
+Digits only (10 characters):
 
 | Max Length | Keyspace | Time |
 |------------|----------|------|
-| 6 | 1.1M | 4 seconds |
-| 8 | 111M | 6 minutes |
-| 10 | 11.1B | 10 hours |
-| 12 | 1.1T | 43 days |
+| 6 | 1.1M | 1.4 seconds |
+| 8 | 111M | 2.3 minutes |
+| 10 | 11.1B | 3.8 hours |
+| 12 | 1.1T | 16 days |
+
+### R5 AES-256 (104M/s with GPU)
+
+Full charset:
+
+| Max Length | Keyspace | Time |
+|------------|----------|------|
+| 4 | 15M | instant |
+| 5 | 931M | 9 seconds |
+| 6 | 57.7B | 9 minutes |
+| 7 | 3.5T | 9.4 hours |
+| 8 | 221T | 24 days |
 
 ### Distributed scaling
 
@@ -81,12 +122,23 @@ Adding more machines scales roughly linearly. Two M4 Pros cut all times in half.
 2. **Verification** (RC4): Encrypt a known plaintext with the derived key. For R2, one RC4 pass. For R3/R4, 20 RC4 passes with XOR-modified keys.
 3. **Compare**: Check against the stored /U value in the PDF.
 
-The GPU accelerates step 1 (MD5 is pure arithmetic, great for SIMD). The CPU handles step 2 (RC4 has data-dependent memory access, terrible for GPU).
+NEON SIMD accelerates step 1 by running 4 independent MD5 computations in parallel using 128-bit vector registers. RC4 (step 2) remains scalar since it has data-dependent memory access patterns.
 
 ### R5 (SHA-256)
 
-Simple: SHA-256(password + validation salt) compared against stored hash. No iteration, no RC4. Extremely fast.
+Simple: SHA-256(password + validation salt) compared against stored hash. No iteration, no RC4. The Metal GPU does the entire verification — SHA-256 + compare — with no CPU round-trip, enabling 104M/s throughput.
 
 ### R6 (SHA-256 + AES-CBC iterative KDF)
 
 Deliberately expensive: a loop of SHA-256/384/512 + AES-CBC that runs 64+ rounds, with the round count determined by the hash output. Designed to resist GPU attacks. Each verification takes ~70 microseconds — there's no shortcut.
+
+## Acceleration Techniques
+
+| Technique | Applicable To | Speedup | How It Works |
+|-----------|--------------|---------|-------------|
+| NEON SIMD | R2, R3, R4 | ~4x | 4 passwords per core using ARM vector registers |
+| Metal GPU (MD5) | R2, R3, R4 | ~1.3x* | MD5 key derivation on GPU, RC4 on CPU |
+| Metal GPU (SHA-256) | R5 | ~5x | Full verification on GPU, no CPU work |
+| Frequency ordering | All | varies | Try common characters first (`-F` flag) |
+
+*GPU MD5 is slower than NEON SIMD for R2-R4. Use `-G` to prefer NEON.
