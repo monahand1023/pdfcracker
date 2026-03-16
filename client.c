@@ -22,6 +22,7 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <sys/qos.h>
+#include <mach/mach_time.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <CommonCrypto/CommonDigest.h>
@@ -41,6 +42,7 @@ static int              g_fast_crypto = 0;
 
 /* ── GPU acceleration ──────────────────────────────────────────── */
 #define GPU_BATCH_SIZE  65536
+#define CPU_WORK_CHUNK  512
 static MetalKeygenContext *g_gpu_ctx = NULL;
 static int                 g_use_gpu = 0;
 static atomic_long         g_next_idx = 0;
@@ -101,21 +103,31 @@ static void *brute_local_worker(void *arg)
     long local_count = 0;
 
     if (g_use_gpu) {
-        /* Shared counter mode */
-        while (!atomic_load_explicit(&g_chunk_found, memory_order_relaxed)) {
-            long i = atomic_fetch_add(&g_next_idx, 1);
-            if (i >= a->end) break;
-            index_to_password(i, a->length, g_charset, g_cs_len, pass);
-            if (++local_count == TESTED_BATCH) {
-                atomic_fetch_add_explicit(&g_chunk_tested, local_count,
-                                          memory_order_relaxed);
-                local_count = 0;
-            }
-            int hit = g_fast_crypto ? pdf_verify_password(&g_enc_params, pass)
-                                    : test_password(doc, pass);
-            if (hit) {
-                if (!atomic_exchange(&g_chunk_found, 1))
-                    strncpy(g_chunk_pass, pass, MAX_PASS_LEN);
+        /* Shared counter mode — grab CPU_WORK_CHUNK at a time */
+        for (;;) {
+            if (__builtin_expect(atomic_load_explicit(&g_chunk_found,
+                                 memory_order_relaxed), 0))
+                break;
+            long cs = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+            if (cs >= a->end) break;
+            long ce = cs + CPU_WORK_CHUNK;
+            if (ce > a->end) ce = a->end;
+            for (long i = cs; i < ce; i++) {
+                if (__builtin_expect(atomic_load_explicit(&g_chunk_found,
+                                     memory_order_relaxed), 0))
+                    break;
+                index_to_password(i, a->length, g_charset, g_cs_len, pass);
+                if (++local_count == TESTED_BATCH) {
+                    atomic_fetch_add_explicit(&g_chunk_tested, local_count,
+                                              memory_order_relaxed);
+                    local_count = 0;
+                }
+                int hit = g_fast_crypto ? pdf_verify_password(&g_enc_params, pass)
+                                        : test_password(doc, pass);
+                if (hit) {
+                    if (!atomic_exchange(&g_chunk_found, 1))
+                        strncpy(g_chunk_pass, pass, MAX_PASS_LEN);
+                }
             }
         }
     } else {
@@ -171,20 +183,30 @@ static void *dict_local_worker(void *arg)
     long local_count = 0;
 
     if (g_use_gpu) {
-        /* Shared counter mode */
-        while (!atomic_load_explicit(&g_chunk_found, memory_order_relaxed)) {
-            long i = atomic_fetch_add(&g_next_idx, 1);
-            if (i >= a->count) break;
-            if (++local_count == TESTED_BATCH) {
-                atomic_fetch_add_explicit(&g_chunk_tested, local_count,
-                                          memory_order_relaxed);
-                local_count = 0;
-            }
-            int hit = g_fast_crypto ? pdf_verify_password(&g_enc_params, a->words[i])
-                                    : test_password(doc, a->words[i]);
-            if (hit) {
-                if (!atomic_exchange(&g_chunk_found, 1))
-                    strncpy(g_chunk_pass, a->words[i], MAX_PASS_LEN);
+        /* Shared counter mode — grab CPU_WORK_CHUNK at a time */
+        for (;;) {
+            if (__builtin_expect(atomic_load_explicit(&g_chunk_found,
+                                 memory_order_relaxed), 0))
+                break;
+            long cs = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+            if (cs >= a->count) break;
+            long ce = cs + CPU_WORK_CHUNK;
+            if (ce > a->count) ce = a->count;
+            for (long i = cs; i < ce; i++) {
+                if (__builtin_expect(atomic_load_explicit(&g_chunk_found,
+                                     memory_order_relaxed), 0))
+                    break;
+                if (++local_count == TESTED_BATCH) {
+                    atomic_fetch_add_explicit(&g_chunk_tested, local_count,
+                                              memory_order_relaxed);
+                    local_count = 0;
+                }
+                int hit = g_fast_crypto ? pdf_verify_password(&g_enc_params, a->words[i])
+                                        : test_password(doc, a->words[i]);
+                if (hit) {
+                    if (!atomic_exchange(&g_chunk_found, 1))
+                        strncpy(g_chunk_pass, a->words[i], MAX_PASS_LEN);
+                }
             }
         }
     } else {
@@ -211,6 +233,81 @@ static void *dict_local_worker(void *arg)
     if (doc) CGPDFDocumentRelease(doc);
     free(arg);
     return NULL;
+}
+
+/* ================================================================
+ * Benchmark gate: compare GPU+RC4 vs CPU-only
+ * ================================================================ */
+static int benchmark_gpu(void)
+{
+    const int N = 2000;
+    int key_bytes = metal_keygen_key_bytes(g_gpu_ctx);
+
+    const char **passwords = malloc(sizeof(char *) * N);
+    char *pw_storage = malloc(8 * N);
+    uint8_t *keys = malloc((size_t)N * key_bytes);
+    if (!passwords || !pw_storage || !keys) {
+        free(passwords); free(pw_storage); free(keys);
+        return 0;
+    }
+    for (int i = 0; i < N; i++) {
+        snprintf(pw_storage + i * 8, 8, "bench%d", i);
+        passwords[i] = pw_storage + i * 8;
+    }
+
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+
+    uint64_t t0 = mach_absolute_time();
+    int n = metal_keygen_batch(g_gpu_ctx, passwords, N, keys);
+    if (n > 0) {
+        for (int i = 0; i < n; i++) {
+            const uint8_t *key = keys + i * key_bytes;
+            if (g_enc_params.revision == 2) {
+                uint8_t u[32]; size_t ol = 32;
+                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0, key, key_bytes,
+                        NULL, PDF_PASSWORD_PADDING, 32, u, 32, &ol);
+            } else {
+                CC_MD5_CTX md5; CC_MD5_Init(&md5);
+                CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, 32);
+                CC_MD5_Update(&md5, g_enc_params.file_id,
+                              (CC_LONG)g_enc_params.file_id_len);
+                uint8_t h[16]; CC_MD5_Final(h, &md5);
+                uint8_t enc[16]; size_t ol = 16;
+                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0, key, key_bytes,
+                        NULL, h, 16, enc, 16, &ol);
+                for (int r = 1; r <= 19; r++) {
+                    uint8_t mk[16];
+                    for (int j = 0; j < key_bytes; j++) mk[j] = key[j] ^ (uint8_t)r;
+                    uint8_t tmp[16]; ol = 16;
+                    CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0, mk, key_bytes,
+                            NULL, enc, 16, tmp, 16, &ol);
+                    memcpy(enc, tmp, 16);
+                }
+            }
+        }
+    }
+    uint64_t t1 = mach_absolute_time();
+    double gpu_s = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+    double gpu_rate = gpu_s > 0 ? N / gpu_s : 0;
+
+    t0 = mach_absolute_time();
+    for (int i = 0; i < N; i++)
+        pdf_verify_user_password(&g_enc_params, passwords[i]);
+    t1 = mach_absolute_time();
+    double cpu_s = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+    double cpu_rate = cpu_s > 0 ? N / cpu_s : 0;
+
+    free(passwords); free(pw_storage); free(keys);
+
+    fprintf(stderr, "Bench  : GPU %.0f/s vs CPU %.0f/s (single-core)", gpu_rate, cpu_rate);
+    if (gpu_rate > cpu_rate * 0.5) {
+        fprintf(stderr, " — GPU enabled\n");
+        return 1;
+    } else {
+        fprintf(stderr, " — GPU disabled (too slow)\n");
+        return 0;
+    }
 }
 
 /* ================================================================
@@ -571,8 +668,12 @@ int main(int argc, char *argv[])
     if (g_fast_crypto && !no_gpu) {
         g_gpu_ctx = metal_keygen_init(&g_enc_params, NULL);
         if (g_gpu_ctx) {
-            g_use_gpu = 1;
-            fprintf(stderr, "GPU    : Metal accelerated (batch %d)\n", GPU_BATCH_SIZE);
+            if (benchmark_gpu()) {
+                g_use_gpu = 1;
+            } else {
+                metal_keygen_free(g_gpu_ctx);
+                g_gpu_ctx = NULL;
+            }
         }
     }
 
