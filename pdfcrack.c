@@ -17,6 +17,7 @@
  *   pdfcrack -f file.pdf -m "?u?u?u?d?d?d?d?d"     # mask attack
  *   pdfcrack -f file.pdf -d words.txt -R             # rules mutation
  *   pdfcrack -f file.pdf -d words.txt -H 3           # hybrid dict+suffix
+ *   pdfcrack -f file.pdf -d words.txt -H "?d?d?d?s"  # hybrid dict+mask
  *   pdfcrack -f file.pdf -B                          # benchmark mode
  *   pdfcrack -f file.pdf -b -l 6 -F                  # freq-ordered brute
  */
@@ -82,6 +83,7 @@ static int              g_fast_crypto = 0; /* 1 = use direct MD5+RC4 */
 #define CPU_WORK_CHUNK  512   /* CPU threads grab this many from shared counter */
 static MetalKeygenContext *g_gpu_ctx     = NULL;
 static MetalSHA256Context *g_sha256_ctx __attribute__((unused)) = NULL;  /* R5 SHA-256 GPU pipeline */
+static MetalR6Context     *g_r6_ctx    __attribute__((unused)) = NULL;  /* R6 GPU pipeline */
 static int                 g_use_gpu    = 0;
 static atomic_long         g_next_idx   = 0; /* shared work counter for GPU+CPU */
 
@@ -146,6 +148,10 @@ static int  g_rule_mode = 0;
 static int  g_hybrid_mode = 0;
 static int  g_hybrid_suffix_len = 0;
 static long g_hybrid_suffix_keyspace = 0;
+static int  g_hybrid_mask_mode = 0;          /* 1 = mask-based suffix */
+static MaskPos g_hybrid_mask[MAX_PASS_LEN];
+static int  g_hybrid_mask_len = 0;
+static char g_hybrid_mask_str[256] = {0};
 
 /* ── Benchmark mode ──────────────────────────────────────────── */
 static int  g_benchmark_mode = 0;
@@ -441,8 +447,11 @@ static void ckpt_save(void)
     /* Mode-specific data */
     if (g_attack_mode == ATTACK_MASK && g_mask_str[0])
         fprintf(f, "mask_pattern=%s\n", g_mask_str);
-    if (g_attack_mode == ATTACK_HYBRID)
+    if (g_attack_mode == ATTACK_HYBRID) {
         fprintf(f, "hybrid_suffix_len=%d\n", g_hybrid_suffix_len);
+        if (g_hybrid_mask_mode && g_hybrid_mask_str[0])
+            fprintf(f, "hybrid_mask=%s\n", g_hybrid_mask_str);
+    }
     if (g_attack_mode == ATTACK_AUTO)
         fprintf(f, "auto_phase=%d\n", g_auto_phase);
     if (g_freq_mode)
@@ -474,6 +483,7 @@ typedef struct {
     char suffix[MAX_PASS_LEN + 1];
     char mask_pattern[256];
     int  hybrid_suffix_len;
+    char hybrid_mask[256];
     int  auto_phase;
     int  freq_mode;
     int  password_mode;
@@ -529,6 +539,8 @@ static Checkpoint ckpt_load(void)
             strncpy(ck.mask_pattern, line + 13, sizeof(ck.mask_pattern) - 1);
         } else if (strncmp(line, "hybrid_suffix_len=", 18) == 0) {
             ck.hybrid_suffix_len = atoi(line + 18);
+        } else if (strncmp(line, "hybrid_mask=", 12) == 0) {
+            strncpy(ck.hybrid_mask, line + 12, sizeof(ck.hybrid_mask) - 1);
         } else if (strncmp(line, "auto_phase=", 11) == 0) {
             ck.auto_phase = atoi(line + 11);
         } else if (strncmp(line, "freq_mode=", 10) == 0) {
@@ -578,8 +590,10 @@ static void *progress_thread(void *arg)
     long   prev    = 0;
     time_t t0      = time(NULL);
     time_t last_ckpt = t0;
-    long   avg_buf[8] = {0};
-    int    avg_i   = 0;
+    long   avg_buf[16] = {0};
+    int    avg_i     = 0;
+    int    avg_fill  = 0;
+    double ema_rate  = 0.0;
 
     while (!atomic_load(&g_found)) {
         struct timespec ts = {0, 500000000L}; /* 0.5s */
@@ -591,11 +605,17 @@ static void *progress_thread(void *arg)
         prev         = cur;
         long elapsed = (long)(time(NULL) - t0);
 
-        /* rolling average for ETA */
-        avg_buf[avg_i++ % 8] = rate;
-        long avg_rate = 0;
-        for (int i = 0; i < 8; i++) avg_rate += avg_buf[i];
-        avg_rate /= 8;
+        /* rolling average + EMA for stable ETA */
+        avg_buf[avg_i % 16] = rate;
+        avg_i++;
+        if (avg_fill < 16) avg_fill++;
+        long avg_sum = 0;
+        for (int i = 0; i < avg_fill; i++) avg_sum += avg_buf[i];
+        long raw_avg = avg_fill > 0 ? avg_sum / avg_fill : 0;
+
+        double alpha = (avg_fill < 8) ? 0.4 : 0.15;
+        ema_rate = alpha * (double)raw_avg + (1.0 - alpha) * ema_rate;
+        long avg_rate = (avg_fill >= 4) ? (long)ema_rate : -1;
 
         char s_cur[16], s_total[16], s_rate[16], s_elapsed[16], s_eta[16];
         fmt_num(rate, s_rate, sizeof(s_rate));
@@ -808,12 +828,12 @@ static long count_for_length(int len)
  * ================================================================ */
 static const char SPECIAL_CHARS[] = "!@#$%^&*()_+-=[]{}|;:',.<>?/~`";
 
-static int parse_mask(const char *mask)
+static int parse_mask_into(const char *mask, MaskPos *target, int *out_len, long *out_keyspace)
 {
-    g_mask_len = 0;
+    *out_len = 0;
     const char *p = mask;
-    while (*p && g_mask_len < MAX_PASS_LEN) {
-        MaskPos *mp = &g_mask[g_mask_len];
+    while (*p && *out_len < MAX_PASS_LEN) {
+        MaskPos *mp = &target[*out_len];
         if (*p == '?' && *(p + 1)) {
             char code = *(p + 1);
             p += 2;
@@ -915,18 +935,23 @@ static int parse_mask(const char *mask)
             mp->chars[1] = '\0';
             p++;
         }
-        g_mask_len++;
+        (*out_len)++;
     }
     /* Compute keyspace */
-    g_mask_keyspace = 1;
-    for (int i = 0; i < g_mask_len; i++) {
-        if (g_mask_keyspace > (long)2e18 / g_mask[i].nchars) {
-            g_mask_keyspace = (long)2e18;
+    *out_keyspace = 1;
+    for (int i = 0; i < *out_len; i++) {
+        if (*out_keyspace > (long)2e18 / target[i].nchars) {
+            *out_keyspace = (long)2e18;
             break;
         }
-        g_mask_keyspace *= g_mask[i].nchars;
+        *out_keyspace *= target[i].nchars;
     }
     return 1;
+}
+
+static int parse_mask(const char *mask)
+{
+    return parse_mask_into(mask, g_mask, &g_mask_len, &g_mask_keyspace);
 }
 
 static void mask_index_to_pass(long idx, int length, char *out)
@@ -1056,26 +1081,35 @@ static void hybrid_gen_pass(long word_idx, long suffix_idx, char *out)
     size_t wlen = strlen(word);
     memcpy(out, word, wlen);
 
-    /* Map suffix_idx across lengths 1..g_hybrid_suffix_len */
-    long remaining = suffix_idx;
-    int slen = 0;
-    for (int sl = 1; sl <= g_hybrid_suffix_len; sl++) {
-        long ks = count_for_length(sl);
-        if (remaining < ks) {
-            slen = sl;
-            break;
+    if (g_hybrid_mask_mode) {
+        /* Fixed-length mask suffix */
+        long rem = suffix_idx;
+        for (int i = g_hybrid_mask_len - 1; i >= 0; i--) {
+            out[wlen + (size_t)i] = g_hybrid_mask[i].chars[rem % g_hybrid_mask[i].nchars];
+            rem /= g_hybrid_mask[i].nchars;
         }
-        remaining -= ks;
-    }
-    if (slen > 0) {
-        /* Generate suffix: index remaining into charset of length slen */
-        for (int i = slen - 1; i >= 0; i--) {
-            out[wlen + (size_t)i] = g_charset[remaining % g_cs_len];
-            remaining /= g_cs_len;
-        }
-        out[wlen + (size_t)slen] = '\0';
+        out[wlen + (size_t)g_hybrid_mask_len] = '\0';
     } else {
-        out[wlen] = '\0';
+        /* Map suffix_idx across lengths 1..g_hybrid_suffix_len */
+        long remaining = suffix_idx;
+        int slen = 0;
+        for (int sl = 1; sl <= g_hybrid_suffix_len; sl++) {
+            long ks = count_for_length(sl);
+            if (remaining < ks) {
+                slen = sl;
+                break;
+            }
+            remaining -= ks;
+        }
+        if (slen > 0) {
+            for (int i = slen - 1; i >= 0; i--) {
+                out[wlen + (size_t)i] = g_charset[remaining % g_cs_len];
+                remaining /= g_cs_len;
+            }
+            out[wlen + (size_t)slen] = '\0';
+        } else {
+            out[wlen] = '\0';
+        }
     }
 }
 
@@ -2018,6 +2052,169 @@ done:
 }
 
 /* ================================================================
+ * R6 GPU workers (Algorithm 2.B — SHA-256/384/512 + AES on GPU)
+ * ================================================================ */
+
+static void *gpu_r6_brute_worker(void *arg)
+{
+    GPUBruteArg *a = (GPUBruteArg *)arg;
+    int batch = metal_r6_max_batch(g_r6_ctx);
+
+    const char **pw_ptrs = malloc(sizeof(char *) * batch);
+    char *pw_storage = malloc((size_t)batch * (MAX_PASS_LEN + 1));
+
+    if (!pw_ptrs || !pw_storage) goto done;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= a->total) break;
+        long end = start + batch;
+        if (end > a->total) end = a->total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            char *pw = pw_storage + i * (MAX_PASS_LEN + 1);
+            g_idx_to_pass(start + i, a->length, pw);
+            pw_ptrs[i] = pw;
+        }
+
+        int match = metal_r6_verify_batch(g_r6_ctx, pw_ptrs, count);
+        if (match >= 0) {
+            if (!atomic_exchange(&g_found, 1))
+                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+        }
+
+        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+    }
+
+done:
+    free(pw_ptrs);
+    free(pw_storage);
+    free(arg);
+    return NULL;
+}
+
+static void *gpu_r6_dict_worker(void *arg)
+{
+    (void)arg;
+    int batch = metal_r6_max_batch(g_r6_ctx);
+
+    const char **pw_ptrs = malloc(sizeof(char *) * batch);
+    if (!pw_ptrs) goto done;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= g_nwords) break;
+        long end = start + batch;
+        if (end > g_nwords) end = g_nwords;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++)
+            pw_ptrs[i] = g_words[start + i];
+
+        int match = metal_r6_verify_batch(g_r6_ctx,
+                                           (const char **)pw_ptrs, count);
+        if (match >= 0) {
+            if (!atomic_exchange(&g_found, 1))
+                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+        }
+
+        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+    }
+
+done:
+    free(pw_ptrs);
+    free(arg);
+    return NULL;
+}
+
+static void *gpu_r6_rule_worker(void *arg)
+{
+    (void)arg;
+    long total = g_nwords * g_nrules;
+    int batch = metal_r6_max_batch(g_r6_ctx);
+
+    const char **pw_ptrs = malloc(sizeof(char *) * batch);
+    char *pw_storage = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
+
+    if (!pw_ptrs || !pw_storage) goto done;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= total) break;
+        long end = start + batch;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            long idx = start + i;
+            long word_idx = idx / g_nrules;
+            int  rule_idx = (int)(idx % g_nrules);
+            char *pw = pw_storage + i * (MAX_PASS_LEN * 2 + 2);
+            apply_rule(g_words[word_idx], rule_idx, pw);
+            pw_ptrs[i] = pw;
+        }
+
+        int match = metal_r6_verify_batch(g_r6_ctx, pw_ptrs, count);
+        if (match >= 0) {
+            if (!atomic_exchange(&g_found, 1))
+                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+        }
+
+        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+    }
+
+done:
+    free(pw_ptrs);
+    free(pw_storage);
+    free(arg);
+    return NULL;
+}
+
+static void *gpu_r6_hybrid_worker(void *arg)
+{
+    (void)arg;
+    long total = g_nwords * g_hybrid_suffix_keyspace;
+    int batch = metal_r6_max_batch(g_r6_ctx);
+
+    const char **pw_ptrs = malloc(sizeof(char *) * batch);
+    char *pw_storage = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
+
+    if (!pw_ptrs || !pw_storage) goto done;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= total) break;
+        long end = start + batch;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            long idx = start + i;
+            long word_idx = idx / g_hybrid_suffix_keyspace;
+            long suffix_idx = idx % g_hybrid_suffix_keyspace;
+            char *pw = pw_storage + i * (MAX_PASS_LEN * 2 + 2);
+            hybrid_gen_pass(word_idx, suffix_idx, pw);
+            pw_ptrs[i] = pw;
+        }
+
+        int match = metal_r6_verify_batch(g_r6_ctx, pw_ptrs, count);
+        if (match >= 0) {
+            if (!atomic_exchange(&g_found, 1))
+                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+        }
+
+        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+    }
+
+done:
+    free(pw_ptrs);
+    free(pw_storage);
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
  * Benchmark mode: measure passwords/second on all engines
  * ================================================================ */
 static void run_benchmark(int nthreads)
@@ -2094,7 +2291,7 @@ static void run_benchmark(int nthreads)
             multi_rate, nthreads);
 
     /* ── GPU benchmark ─────────────────────────────────────────── */
-    if (g_gpu_ctx || g_sha256_ctx) {
+    if (g_gpu_ctx || g_sha256_ctx || g_r6_ctx) {
         atomic_store(&g_found, 0);
         atomic_store(&g_tested, 0);
         atomic_store(&g_next_idx, 0);
@@ -2102,8 +2299,10 @@ static void run_benchmark(int nthreads)
 
         GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
         *ga = (GPUBruteArg){ .length = 7, .total = bench_total };
-        pthread_create(&thr[spawned++], NULL,
-                       g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
+        void *(*gpu_worker)(void *) = gpu_brute_worker;
+        if (g_r6_ctx)       gpu_worker = gpu_r6_brute_worker;
+        else if (g_sha256_ctx) gpu_worker = gpu_sha256_brute_worker;
+        pthread_create(&thr[spawned++], NULL, gpu_worker, ga);
 
         t0 = mach_absolute_time();
         for (;;) {
@@ -2333,7 +2532,7 @@ static void usage(const char *p)
         "  -3  custom charset 3\n"
         "  -4  custom charset 4\n"
         "  -R  rule-based mutations (use with -d, applies built-in rules)\n"
-        "  -H  hybrid attack (use with -d, appends brute-force suffix)\n"
+        "  -H  hybrid attack (use with -d, e.g. -H 3 or -H \"?d?d?d?s\")\n"
         "        argument is max suffix length\n"
         "  -A  auto mode: chains dict -> rules -> freq brute 1-6 -> brute 7-max\n"
         "  -B  benchmark mode (measure speed, no cracking)\n"
@@ -2406,7 +2605,13 @@ int main(int argc, char *argv[])
                       break;
             case 'R': g_rule_mode = 1;            break;
             case 'H': g_hybrid_mode = 1;
-                      g_hybrid_suffix_len = atoi(optarg); break;
+                      if (strchr(optarg, '?') || strchr(optarg, '[')) {
+                          g_hybrid_mask_mode = 1;
+                          strncpy(g_hybrid_mask_str, optarg, sizeof(g_hybrid_mask_str) - 1);
+                      } else {
+                          g_hybrid_suffix_len = atoi(optarg);
+                      }
+                      break;
             case 'B': g_benchmark_mode = 1;       break;
             case 'F': g_freq_mode = 1;            break;
             case 'A': g_auto_mode = 1;            break;
@@ -2640,8 +2845,15 @@ int main(int argc, char *argv[])
         fprintf(stderr, "-H requires -d <wordlist>\n");
         usage(argv[0]);
     }
-    if (g_hybrid_suffix_len < 1 && g_hybrid_mode) {
-        fprintf(stderr, "-H requires suffix length >= 1\n");
+    if (g_hybrid_mode && g_hybrid_mask_mode) {
+        if (!parse_mask_into(g_hybrid_mask_str, g_hybrid_mask,
+                             &g_hybrid_mask_len, &g_hybrid_suffix_keyspace)) {
+            fprintf(stderr, "Invalid hybrid mask: %s\n", g_hybrid_mask_str);
+            return 1;
+        }
+        g_hybrid_suffix_len = g_hybrid_mask_len;
+    } else if (g_hybrid_suffix_len < 1 && g_hybrid_mode) {
+        fprintf(stderr, "-H requires suffix length >= 1 or mask pattern\n");
         usage(argv[0]);
     }
 
@@ -2754,6 +2966,12 @@ int main(int argc, char *argv[])
         g_sha256_ctx = metal_sha256_init(&g_enc_params, check_owner, NULL);
         if (g_sha256_ctx)
             g_use_gpu = 1;
+    } else if (g_fast_crypto && !no_gpu && g_enc_params.revision == 6) {
+        /* R6: full Algorithm 2.B verification on GPU */
+        int check_owner = (g_password_mode == PW_MODE_OWNER) ? 1 : 0;
+        g_r6_ctx = metal_r6_init(&g_enc_params, check_owner, NULL);
+        if (g_r6_ctx)
+            g_use_gpu = 1;
     } else if (g_fast_crypto && no_gpu && g_enc_params.revision >= 2 &&
                g_enc_params.revision <= 4) {
         /* GPU explicitly disabled — use NEON if available */
@@ -2783,6 +3001,7 @@ int main(int argc, char *argv[])
         run_benchmark(nthreads);
         if (g_gpu_ctx) metal_keygen_free(g_gpu_ctx);
         if (g_sha256_ctx) metal_sha256_free(g_sha256_ctx);
+        if (g_r6_ctx) metal_r6_free(g_r6_ctx);
         return 0;
     }
 
@@ -2849,6 +3068,12 @@ int main(int argc, char *argv[])
                 if (!g_hybrid_mode) {
                     g_hybrid_mode = 1;
                     g_hybrid_suffix_len = ck.hybrid_suffix_len;
+                }
+                if (ck.hybrid_mask[0] && !g_hybrid_mask_mode) {
+                    g_hybrid_mask_mode = 1;
+                    strncpy(g_hybrid_mask_str, ck.hybrid_mask, sizeof(g_hybrid_mask_str) - 1);
+                    parse_mask_into(g_hybrid_mask_str, g_hybrid_mask,
+                                    &g_hybrid_mask_len, &g_hybrid_suffix_keyspace);
                 }
             }
 
@@ -2929,7 +3154,7 @@ int main(int argc, char *argv[])
 
                 if (g_use_gpu) {
                     pthread_create(&threads[spawned++], NULL,
-                                g_sha256_ctx ? gpu_sha256_dict_worker : gpu_dict_worker, NULL);
+                                g_r6_ctx ? gpu_r6_dict_worker : g_sha256_ctx ? gpu_sha256_dict_worker : gpu_dict_worker, NULL);
                 }
                 int limit = nthreads < (int)g_nwords ? nthreads : (int)g_nwords;
                 for (int t = 0; t < limit; t++) {
@@ -2965,7 +3190,7 @@ int main(int argc, char *argv[])
                 if (g_use_gpu) {
                     void *ga = malloc(1);
                     pthread_create(&threads[spawned++], NULL,
-                                g_sha256_ctx ? gpu_sha256_rule_worker : gpu_rule_worker, ga);
+                                g_r6_ctx ? gpu_r6_rule_worker : g_sha256_ctx ? gpu_sha256_rule_worker : gpu_rule_worker, ga);
                 }
                 for (int t = 0; t < nthreads; t++) {
                     void *a = malloc(1);
@@ -3034,7 +3259,7 @@ int main(int argc, char *argv[])
                     GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
                     *ga = (GPUBruteArg){ .length = len, .total = total };
                     pthread_create(&threads[spawned++], NULL,
-                            g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
+                            g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
                     for (int t = 0; t < nthreads; t++) {
                         BruteArg *a = malloc(sizeof(BruteArg));
                         *a = (BruteArg){ .id = t, .length = len,
@@ -3109,7 +3334,7 @@ int main(int argc, char *argv[])
                     GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
                     *ga = (GPUBruteArg){ .length = len, .total = total };
                     pthread_create(&threads[spawned++], NULL,
-                            g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
+                            g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
                     for (int t = 0; t < nthreads; t++) {
                         BruteArg *a = malloc(sizeof(BruteArg));
                         *a = (BruteArg){ .id = t, .length = len,
@@ -3160,7 +3385,7 @@ int main(int argc, char *argv[])
             GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
             *ga = (GPUBruteArg){ .length = g_mask_len, .total = total };
             pthread_create(&threads[spawned++], NULL,
-                            g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
+                            g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
 
             for (int t = 0; t < nthreads; t++) {
                 BruteArg *a = malloc(sizeof(BruteArg));
@@ -3209,7 +3434,7 @@ int main(int argc, char *argv[])
         if (g_use_gpu) {
             void *ga = malloc(1); /* dummy arg */
             pthread_create(&threads[spawned++], NULL,
-                            g_sha256_ctx ? gpu_sha256_rule_worker : gpu_rule_worker, ga);
+                            g_r6_ctx ? gpu_r6_rule_worker : g_sha256_ctx ? gpu_sha256_rule_worker : gpu_rule_worker, ga);
         }
         for (int t = 0; t < nthreads; t++) {
             void *a = malloc(1); /* dummy arg */
@@ -3230,7 +3455,9 @@ int main(int argc, char *argv[])
             pthread_join(prog, NULL);
             return 1;
         }
-        g_hybrid_suffix_keyspace = hybrid_total_suffix_keyspace(g_hybrid_suffix_len, g_cs_len);
+        if (!g_hybrid_mask_mode)
+            g_hybrid_suffix_keyspace = hybrid_total_suffix_keyspace(g_hybrid_suffix_len, g_cs_len);
+        /* mask mode: g_hybrid_suffix_keyspace already set by parse_mask_into */
         long total = g_nwords * g_hybrid_suffix_keyspace;
         long hybrid_start = 0;
         if (resume && ck.valid && ck.attack_mode == ATTACK_HYBRID)
@@ -3246,7 +3473,7 @@ int main(int argc, char *argv[])
         if (g_use_gpu) {
             void *ga = malloc(1);
             pthread_create(&threads[spawned++], NULL,
-                            g_sha256_ctx ? gpu_sha256_hybrid_worker : gpu_hybrid_worker, ga);
+                            g_r6_ctx ? gpu_r6_hybrid_worker : g_sha256_ctx ? gpu_sha256_hybrid_worker : gpu_hybrid_worker, ga);
         }
         for (int t = 0; t < nthreads; t++) {
             void *a = malloc(1);
@@ -3278,7 +3505,7 @@ int main(int argc, char *argv[])
         /* Spawn GPU worker if available */
         if (g_use_gpu) {
             pthread_create(&threads[spawned++], NULL,
-                            g_sha256_ctx ? gpu_sha256_dict_worker : gpu_dict_worker, NULL);
+                            g_r6_ctx ? gpu_r6_dict_worker : g_sha256_ctx ? gpu_sha256_dict_worker : gpu_dict_worker, NULL);
         }
 
         int limit = nthreads < (int)g_nwords ? nthreads : (int)g_nwords;
@@ -3344,7 +3571,7 @@ int main(int argc, char *argv[])
                 GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
                 *ga = (GPUBruteArg){ .length = len, .total = total };
                 pthread_create(&threads[spawned++], NULL,
-                            g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
+                            g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
 
                 for (int t = 0; t < nthreads; t++) {
                     BruteArg *a = malloc(sizeof(BruteArg));

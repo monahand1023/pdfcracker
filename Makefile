@@ -6,8 +6,12 @@ LIBS       = -lpthread
 
 all: pdfcrack server client
 
+# ── SASLprep Unicode normalization ─────────────────────────────
+saslprep.o: saslprep.c saslprep.h
+	$(CC) $(CFLAGS) -c saslprep.c
+
 # ── PDF encryption parser + crypto ────────────────────────────
-pdf_encrypt.o: pdf_encrypt.c pdf_encrypt.h
+pdf_encrypt.o: pdf_encrypt.c pdf_encrypt.h saslprep.h
 	$(CC) $(CFLAGS) -c pdf_encrypt.c
 
 # ── Metal GPU key derivation ─────────────────────────────────
@@ -21,18 +25,18 @@ metal_keygen.o: metal_keygen.m metal_keygen.h pdf_encrypt.h
 	$(CC) $(CFLAGS) -fobjc-arc -c metal_keygen.m
 
 # ── Targets ──────────────────────────────────────────────────
-pdfcrack: pdfcrack.c pdf_encrypt.o metal_keygen.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ pdfcrack.c pdf_encrypt.o metal_keygen.o
+pdfcrack: pdfcrack.c pdf_encrypt.o saslprep.o metal_keygen.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ pdfcrack.c pdf_encrypt.o saslprep.o metal_keygen.o
 
 server: server.c protocol.h
 	$(CC) $(CFLAGS) $(LIBS) -o $@ server.c
 
-client: client.c pdf_encrypt.o metal_keygen.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ client.c pdf_encrypt.o metal_keygen.o
+client: client.c pdf_encrypt.o saslprep.o metal_keygen.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ client.c pdf_encrypt.o saslprep.o metal_keygen.o
 
 # ── Test suite ───────────────────────────────────────────────
-test_all: test_all.c pdf_encrypt.o pdf_encrypt.h
-	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ test_all.c pdf_encrypt.o
+test_all: test_all.c pdf_encrypt.o saslprep.o pdf_encrypt.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ test_all.c pdf_encrypt.o saslprep.o
 
 clean:
 	rm -f pdfcrack server client test_all *.o *.air *.metallib

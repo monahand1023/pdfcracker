@@ -11,5 +11,13 @@ test_crypto
 # Test PDFs
 *.pdf
 
+# Checkpoint files
+*.ckpt
+*.ckpt.tmp
+
+# Generated data
+*.markov
+dan_dates.txt
+
 # macOS
 .DS_Store

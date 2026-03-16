@@ -13,6 +13,7 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 #include "pdf_encrypt.h"
+#include "saslprep.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -744,8 +745,19 @@ static int verify_user_r6(const PDFEncryptParams *params, const char *password)
     size_t pw_len = password ? strlen(password) : 0;
     if (pw_len > 127) pw_len = 127;
 
+    /* SASLprep normalization for R6 (ISO 32000-2 7.6.4.3.3) */
+    uint8_t norm_pw[128];
+    size_t norm_len = 0;
+    const uint8_t *pw_data;
+    if (pw_len > 0 && saslprep(password, pw_len, norm_pw, &norm_len) == 0 && norm_len > 0) {
+        pw_data = norm_pw;
+        pw_len = norm_len;
+    } else {
+        pw_data = (const uint8_t *)password;
+    }
+
     uint8_t hash[32];
-    algorithm_2b((const uint8_t *)password, pw_len,
+    algorithm_2b(pw_data, pw_len,
                  params->u_value + 32, /* validation salt */
                  NULL, 0,              /* no extra data for user */
                  hash);
@@ -764,8 +776,19 @@ static int verify_owner_r6(const PDFEncryptParams *params, const char *password)
     size_t pw_len = password ? strlen(password) : 0;
     if (pw_len > 127) pw_len = 127;
 
+    /* SASLprep normalization for R6 (ISO 32000-2 7.6.4.3.3) */
+    uint8_t norm_pw[128];
+    size_t norm_len = 0;
+    const uint8_t *pw_data;
+    if (pw_len > 0 && saslprep(password, pw_len, norm_pw, &norm_len) == 0 && norm_len > 0) {
+        pw_data = norm_pw;
+        pw_len = norm_len;
+    } else {
+        pw_data = (const uint8_t *)password;
+    }
+
     uint8_t hash[32];
-    algorithm_2b((const uint8_t *)password, pw_len,
+    algorithm_2b(pw_data, pw_len,
                  params->o_value + 32, /* validation salt */
                  params->u_value, 48,  /* full U as extra data */
                  hash);

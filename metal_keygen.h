@@ -88,4 +88,37 @@ int metal_sha256_verify_batch(MetalSHA256Context *ctx,
  */
 void metal_sha256_free(MetalSHA256Context *ctx);
 
+/* ── R6 GPU verification ────────────────────────────────────── */
+
+/* Opaque handle to R6 Metal pipeline */
+typedef struct MetalR6Context MetalR6Context;
+
+/*
+ * Initialize Metal pipeline for R6 password verification (Algorithm 2.B).
+ * check_owner: 0 = verify user password, 1 = verify owner password.
+ * Returns NULL if Metal is unavailable or setup fails.
+ */
+MetalR6Context *metal_r6_init(const PDFEncryptParams *params,
+                               int check_owner,
+                               const char *metallib_path);
+
+/*
+ * Verify a batch of passwords on the GPU using R6 Algorithm 2.B.
+ * Returns the index (0-based) of the first matching password,
+ * or -1 if no match was found in this batch.
+ */
+int metal_r6_verify_batch(MetalR6Context *ctx,
+                           const char **passwords,
+                           int count);
+
+/*
+ * Get max batch size for R6 context.
+ */
+int metal_r6_max_batch(MetalR6Context *ctx);
+
+/*
+ * Free all Metal resources for the R6 pipeline.
+ */
+void metal_r6_free(MetalR6Context *ctx);
+
 #endif /* METAL_KEYGEN_H */
