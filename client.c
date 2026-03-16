@@ -64,6 +64,7 @@ static int   g_brute    = 0;
 static int   g_max_len  = 0;
 static char  g_charset[256] = {0};
 static int   g_cs_len   = 0;
+static int   g_password_mode = PW_MODE_BOTH;
 
 /* ── Per-chunk shared state (reset each chunk) ────────────────── */
 static atomic_int  g_chunk_found  = 0;
@@ -166,6 +167,15 @@ static inline int test_password(CGPDFDocumentRef doc, const char *pass)
     return CGPDFDocumentUnlockWithPassword(doc, pass);
 }
 
+static inline int test_password_fast_mode(const char *pass)
+{
+    if (g_password_mode == PW_MODE_USER)
+        return pdf_verify_user_password(&g_enc_params, pass);
+    if (g_password_mode == PW_MODE_OWNER)
+        return pdf_verify_owner_password(&g_enc_params, pass);
+    return test_password_fast_mode(pass);
+}
+
 /* ================================================================
  * Brute-force worker (local thread)
  * ================================================================ */
@@ -210,7 +220,7 @@ static void *brute_local_worker(void *arg)
                                               memory_order_relaxed);
                     local_count = 0;
                 }
-                int hit = g_fast_crypto ? pdf_verify_password(&g_enc_params, pass)
+                int hit = g_fast_crypto ? test_password_fast_mode(pass)
                                         : test_password(doc, pass);
                 if (hit) {
                     if (!atomic_exchange(&g_chunk_found, 1))
@@ -231,7 +241,7 @@ static void *brute_local_worker(void *arg)
                                           memory_order_relaxed);
                 local_count = 0;
             }
-            int hit = g_fast_crypto ? pdf_verify_password(&g_enc_params, pass)
+            int hit = g_fast_crypto ? test_password_fast_mode(pass)
                                     : test_password(doc, pass);
             if (hit) {
                 if (!atomic_exchange(&g_chunk_found, 1))
@@ -292,7 +302,7 @@ static void *dict_local_worker(void *arg)
                                               memory_order_relaxed);
                     local_count = 0;
                 }
-                int hit = g_fast_crypto ? pdf_verify_password(&g_enc_params, a->words[i])
+                int hit = g_fast_crypto ? test_password_fast_mode(a->words[i])
                                         : test_password(doc, a->words[i]);
                 if (hit) {
                     if (!atomic_exchange(&g_chunk_found, 1))
@@ -312,7 +322,7 @@ static void *dict_local_worker(void *arg)
                                           memory_order_relaxed);
                 local_count = 0;
             }
-            int hit = g_fast_crypto ? pdf_verify_password(&g_enc_params, a->words[i])
+            int hit = g_fast_crypto ? test_password_fast_mode(a->words[i])
                                     : test_password(doc, a->words[i]);
             if (hit) {
                 if (!atomic_exchange(&g_chunk_found, 1))
@@ -881,8 +891,10 @@ static int run_session(const char *host, int port)
         return 1;
     }
 
-    if (sscanf(line, "CONFIG BRUTE %d", &g_max_len) == 1) {
+    int pw_mode_tmp = PW_MODE_BOTH;
+    if (sscanf(line, "CONFIG BRUTE %d %d", &g_max_len, &pw_mode_tmp) >= 1) {
         g_brute = 1;
+        g_password_mode = pw_mode_tmp;
         /* Read CHARSET line */
         if (sock_readline(fd, line, sizeof(line)) < 0) {
             close(fd); g_server_fd = -1; return 1;
@@ -893,11 +905,14 @@ static int run_session(const char *host, int port)
         }
         strncpy(g_charset, line + 8, sizeof(g_charset) - 1);
         g_cs_len = (int)strlen(g_charset);
-        fprintf(stderr, "Mode: brute-force (len 1..%d, charset \"%s\")\n",
-                g_max_len, g_charset);
-    } else if (strcmp(line, "CONFIG DICT") == 0) {
+        fprintf(stderr, "Mode: brute-force (len 1..%d, charset \"%s\", pw_mode %d)\n",
+                g_max_len, g_charset, g_password_mode);
+    } else if (sscanf(line, "CONFIG DICT %d", &pw_mode_tmp) >= 0 &&
+               strncmp(line, "CONFIG DICT", 11) == 0) {
         g_brute = 0;
-        fprintf(stderr, "Mode: dictionary\n");
+        if (sscanf(line, "CONFIG DICT %d", &pw_mode_tmp) == 1)
+            g_password_mode = pw_mode_tmp;
+        fprintf(stderr, "Mode: dictionary (pw_mode %d)\n", g_password_mode);
     } else {
         fprintf(stderr, "Unknown config: %s\n", line);
         close(fd); g_server_fd = -1; return 1;

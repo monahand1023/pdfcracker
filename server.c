@@ -83,6 +83,20 @@ static int   g_brute   = 0;
 static int   g_max_len = 4;
 static char *g_charset = NULL;
 static int   g_cs_len  = 0;
+static int   g_password_mode = PW_MODE_BOTH;
+
+/* Extended attack mode tracking (for checkpoint v2) */
+#define ATTACK_BRUTE   0
+#define ATTACK_DICT    1
+#define ATTACK_MASK    2
+#define ATTACK_RULE    3
+#define ATTACK_HYBRID  4
+#define ATTACK_AUTO    5
+static int   g_attack_mode       = ATTACK_BRUTE;
+static int   g_auto_phase        = 0;
+static char  g_mask_pattern[256] = {0};
+static int   g_hybrid_suffix_len = 0;
+static int   g_freq_mode         = 0;
 
 /* Work cursor (protected by g_work_lock) */
 static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -914,10 +928,10 @@ static void *client_handler(void *arg)
 
     /* ── Send config ───────────────────────────────────────────── */
     if (g_brute) {
-        sock_printf(fd, "CONFIG BRUTE %d", g_max_len);
+        sock_printf(fd, "CONFIG BRUTE %d %d", g_max_len, g_password_mode);
         sock_printf(fd, "CHARSET %s", g_charset);
     } else {
-        sock_printf(fd, "CONFIG DICT");
+        sock_printf(fd, "CONFIG DICT %d", g_password_mode);
     }
 
     /* ── Send PDF ──────────────────────────────────────────────── */
@@ -1211,12 +1225,22 @@ static void save_checkpoint(void)
     FILE *f = fopen(tmp_path, "w");
     if (!f) { perror("save_checkpoint"); return; }
 
-    fprintf(f, "PDFCRACKER_CHECKPOINT v1\n");
+    fprintf(f, "PDFCRACKER_CHECKPOINT v2\n");
     fprintf(f, "pdf_sha256 %s\n", g_pdf_sha256);
     fprintf(f, "wordlist_sha256 %s\n", g_wordlist_sha256[0] ? g_wordlist_sha256 : "none");
     fprintf(f, "mode %s\n", g_brute ? "brute" : "dict");
     fprintf(f, "charset %s\n", g_charset ? g_charset : "none");
     fprintf(f, "max_len %d\n", g_max_len);
+    fprintf(f, "attack_mode %d\n", g_attack_mode);
+    fprintf(f, "password_mode %d\n", g_password_mode);
+    if (g_auto_phase > 0)
+        fprintf(f, "auto_phase %d\n", g_auto_phase);
+    if (g_mask_pattern[0])
+        fprintf(f, "mask_pattern %s\n", g_mask_pattern);
+    if (g_hybrid_suffix_len > 0)
+        fprintf(f, "hybrid_suffix_len %d\n", g_hybrid_suffix_len);
+    if (g_freq_mode)
+        fprintf(f, "freq_mode 1\n");
 
     /* Lock order: g_lease_lock first, then g_work_lock (matches reaper) */
     pthread_mutex_lock(&g_lease_lock);
@@ -1259,9 +1283,10 @@ static int restore_checkpoint(const char *path)
 
     char line[MAX_LINE];
 
-    /* Header */
+    /* Header — accept v1 or v2 */
     if (!fgets(line, sizeof(line), f) ||
-        strncmp(line, "PDFCRACKER_CHECKPOINT v1", 23) != 0) {
+        (strncmp(line, "PDFCRACKER_CHECKPOINT v1", 23) != 0 &&
+         strncmp(line, "PDFCRACKER_CHECKPOINT v2", 23) != 0)) {
         fprintf(stderr, "Bad checkpoint header\n");
         fclose(f); return 0;
     }
@@ -1302,6 +1327,18 @@ static int restore_checkpoint(const char *path)
             atomic_store(&g_total_tested, t);
         } else if (strcmp(key, "keyspace") == 0) {
             sscanf(val, "%ld", &g_keyspace);
+        } else if (strcmp(key, "attack_mode") == 0) {
+            sscanf(val, "%d", &g_attack_mode);
+        } else if (strcmp(key, "password_mode") == 0) {
+            sscanf(val, "%d", &g_password_mode);
+        } else if (strcmp(key, "auto_phase") == 0) {
+            sscanf(val, "%d", &g_auto_phase);
+        } else if (strcmp(key, "mask_pattern") == 0) {
+            strncpy(g_mask_pattern, val, sizeof(g_mask_pattern) - 1);
+        } else if (strcmp(key, "hybrid_suffix_len") == 0) {
+            sscanf(val, "%d", &g_hybrid_suffix_len);
+        } else if (strcmp(key, "freq_mode") == 0) {
+            sscanf(val, "%d", &g_freq_mode);
         } else if (strcmp(key, "lease") == 0) {
             /* Push all saved leases into requeue */
             unsigned long long lid = 0;
@@ -1550,9 +1587,15 @@ int main(int argc, char *argv[])
     int         brute         = 0;
     int         max_len       = 4;
     int         port          = DEFAULT_PORT;
+    int         password_mode = PW_MODE_BOTH;
+
+    const char *mask_str       = NULL;
+    int         hybrid_suffix  = 0;
+    int         freq_mode_flag = 0;
+    int         auto_mode_flag = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "f:d:bl:c:p:R:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:d:bl:c:p:R:OUm:H:FA")) != -1) {
         switch (opt) {
             case 'f': pdf_path     = optarg;       break;
             case 'd': dict_path    = optarg;       break;
@@ -1561,6 +1604,12 @@ int main(int argc, char *argv[])
             case 'c': charset      = optarg;       break;
             case 'p': port         = atoi(optarg); break;
             case 'R': restore_path = optarg;       break;
+            case 'O': password_mode = PW_MODE_OWNER; break;
+            case 'U': password_mode = PW_MODE_USER;  break;
+            case 'm': mask_str     = optarg;       break;
+            case 'H': hybrid_suffix = atoi(optarg); break;
+            case 'F': freq_mode_flag = 1;          break;
+            case 'A': auto_mode_flag = 1;          break;
             default:  usage(argv[0]);
         }
     }
@@ -1579,6 +1628,21 @@ int main(int argc, char *argv[])
     g_max_len = max_len;
     g_charset = strdup(charset);
     g_cs_len  = (int)strlen(charset);
+    g_password_mode = password_mode;
+    g_freq_mode = freq_mode_flag;
+    if (mask_str) {
+        strncpy(g_mask_pattern, mask_str, sizeof(g_mask_pattern) - 1);
+        g_attack_mode = ATTACK_MASK;
+    } else if (auto_mode_flag) {
+        g_attack_mode = ATTACK_AUTO;
+    } else if (hybrid_suffix > 0) {
+        g_hybrid_suffix_len = hybrid_suffix;
+        g_attack_mode = ATTACK_HYBRID;
+    } else if (brute) {
+        g_attack_mode = ATTACK_BRUTE;
+    } else {
+        g_attack_mode = ATTACK_DICT;
+    }
 
     if (brute) {
         g_keyspace = total_keyspace(max_len, g_cs_len);

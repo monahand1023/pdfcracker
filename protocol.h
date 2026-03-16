@@ -56,7 +56,12 @@ _Static_assert(sizeof(long) >= 8, "64-bit long required");
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 /* ── Protocol version ────────────────────────────────────────── */
-#define PROTO_VERSION       2
+#define PROTO_VERSION       3
+
+/* ── Password mode ──────────────────────────────────────────── */
+#define PW_MODE_BOTH        0
+#define PW_MODE_USER        1
+#define PW_MODE_OWNER       2
 
 /* ── Adaptive chunk sizing ───────────────────────────────────── */
 #define MIN_CHUNK_BRUTE     10000L

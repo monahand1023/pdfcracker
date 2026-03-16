@@ -33,6 +33,7 @@
 #include <signal.h>
 #include <mach/mach_time.h>
 #include <ctype.h>
+#include <getopt.h>
 #include "pdf_encrypt.h"
 #include "metal_keygen.h"
 #include "md5_simd.h"
@@ -119,6 +120,10 @@ static long     g_mask_keyspace = 0;
 static int      g_mask_mode  = 0;
 static char     g_mask_str[256] = {0};  /* original mask pattern for checkpoint */
 
+/* ── Custom mask charsets (?1 through ?4) ────────────────────── */
+static char *g_custom_charset[4] = { NULL, NULL, NULL, NULL };
+static char  g_custom_charset_str[4][256] = {{0}}; /* for checkpoint */
+
 /* ── Rule-based mutations ────────────────────────────────────── */
 #define MAX_RULES 64
 typedef enum {
@@ -153,6 +158,165 @@ static int  g_freq_mode = 0;
 /* ── Auto mode ───────────────────────────────────────────────── */
 static int  g_auto_mode = 0;
 
+/* ── Password mode (user/owner/both) ─────────────────────────── */
+#define PW_MODE_BOTH  0
+#define PW_MODE_USER  1
+#define PW_MODE_OWNER 2
+static int  g_password_mode = PW_MODE_BOTH;
+static const char *g_found_type = NULL;  /* "User" or "Owner" */
+
+/* ── Markov chain ordering ────────────────────────────────────── */
+#define MARKOV_MAGIC 0x4D4B5631  /* "MKV1" */
+typedef struct {
+    uint32_t magic;
+    int      charset_size;
+    char     charset[256];
+    uint8_t  first_rank[256];   /* first_rank[rank] = char */
+    uint8_t  bigram[256][256];  /* bigram[prev_char][rank] = next_char */
+    int      threshold;         /* prune branches below this rank */
+} MarkovModel;
+static MarkovModel *g_markov = NULL;
+
+/* Train a Markov model from a wordlist and write binary file */
+static void markov_train(const char *wordlist_path, const char *model_path)
+{
+    FILE *f = fopen(wordlist_path, "r");
+    if (!f) { perror(wordlist_path); exit(1); }
+
+    /* Count frequencies */
+    long first_freq[256] = {0};
+    long bigram_freq[256][256] = {{0}};
+
+    char line[MAX_PASS_LEN + 4];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+        if (!len) continue;
+
+        first_freq[(unsigned char)line[0]]++;
+        for (size_t i = 1; i < len; i++)
+            bigram_freq[(unsigned char)line[i-1]][(unsigned char)line[i]]++;
+    }
+    fclose(f);
+
+    /* Build charset: all chars that appear as first or in any bigram */
+    char charset[256];
+    int cs_len = 0;
+    int char_present[256] = {0};
+    for (int i = 0; i < 256; i++) {
+        if (first_freq[i] > 0) char_present[i] = 1;
+        for (int j = 0; j < 256; j++) {
+            if (bigram_freq[i][j] > 0) {
+                char_present[i] = 1;
+                char_present[j] = 1;
+            }
+        }
+    }
+    for (int i = 0; i < 256; i++) {
+        if (char_present[i])
+            charset[cs_len++] = (char)i;
+    }
+    charset[cs_len] = '\0';
+
+    /* Sort first_rank by frequency (descending) */
+    MarkovModel model;
+    memset(&model, 0, sizeof(model));
+    model.magic = MARKOV_MAGIC;
+    model.charset_size = cs_len;
+    memcpy(model.charset, charset, (size_t)cs_len + 1);
+    model.threshold = cs_len; /* default: no pruning */
+
+    /* Build first_rank: sorted indices by frequency */
+    int sorted[256];
+    for (int i = 0; i < 256; i++) sorted[i] = i;
+    for (int i = 0; i < 255; i++) {
+        for (int j = i + 1; j < 256; j++) {
+            if (first_freq[sorted[j]] > first_freq[sorted[i]]) {
+                int tmp = sorted[i]; sorted[i] = sorted[j]; sorted[j] = tmp;
+            }
+        }
+    }
+    for (int r = 0; r < 256; r++)
+        model.first_rank[r] = (uint8_t)sorted[r];
+
+    /* Build bigram[prev][rank] = next_char, sorted by frequency */
+    for (int prev = 0; prev < 256; prev++) {
+        int bi_sorted[256];
+        for (int i = 0; i < 256; i++) bi_sorted[i] = i;
+        for (int i = 0; i < 255; i++) {
+            for (int j = i + 1; j < 256; j++) {
+                if (bigram_freq[prev][bi_sorted[j]] > bigram_freq[prev][bi_sorted[i]]) {
+                    int tmp = bi_sorted[i]; bi_sorted[i] = bi_sorted[j]; bi_sorted[j] = tmp;
+                }
+            }
+        }
+        for (int r = 0; r < 256; r++)
+            model.bigram[prev][r] = (uint8_t)bi_sorted[r];
+    }
+
+    /* Write binary model */
+    FILE *out = fopen(model_path, "wb");
+    if (!out) { perror(model_path); exit(1); }
+    fwrite(&model, sizeof(model), 1, out);
+    fclose(out);
+
+    fprintf(stderr, "Markov model trained: %d chars, written to %s\n",
+            cs_len, model_path);
+}
+
+/* Load a Markov model from binary file */
+static MarkovModel *markov_load(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return NULL; }
+
+    MarkovModel *m = malloc(sizeof(MarkovModel));
+    if (!m) { fclose(f); return NULL; }
+
+    if (fread(m, sizeof(MarkovModel), 1, f) != 1) {
+        fprintf(stderr, "Failed to read Markov model from %s\n", path);
+        free(m); fclose(f); return NULL;
+    }
+    fclose(f);
+
+    if (m->magic != MARKOV_MAGIC) {
+        fprintf(stderr, "Bad Markov model magic in %s\n", path);
+        free(m); return NULL;
+    }
+
+    fprintf(stderr, "Markov model loaded: %d chars from %s\n",
+            m->charset_size, path);
+    return m;
+}
+
+/* Convert index to password using Markov model ordering.
+ * Index 0 = all rank-0 choices = most probable password. */
+static void markov_index_to_pass(long idx, int length, char *out)
+{
+    int cs = g_markov->charset_size;
+    int threshold = g_markov->threshold;
+    int effective_cs = (threshold < cs) ? threshold : cs;
+    if (effective_cs < 1) effective_cs = 1;
+
+    /* Decompose index into per-position rank choices */
+    int ranks[MAX_PASS_LEN];
+    for (int i = length - 1; i >= 0; i--) {
+        ranks[i] = (int)(idx % effective_cs);
+        idx /= effective_cs;
+    }
+
+    /* Position 0: use first_rank */
+    out[0] = (char)g_markov->first_rank[ranks[0]];
+
+    /* Position 1+: use bigram[prev_char][rank] */
+    for (int i = 1; i < length; i++) {
+        unsigned char prev = (unsigned char)out[i - 1];
+        out[i] = (char)g_markov->bigram[prev][ranks[i]];
+    }
+    out[length] = '\0';
+}
+
 /* ── Function pointer for index-to-password (mask vs brute) ─── */
 static void (*g_idx_to_pass)(long idx, int length, char *out) = NULL;
 
@@ -175,7 +339,30 @@ static CGPDFDocumentRef open_pdf(void)
 
 static inline int test_password_fast(const char *pass)
 {
-    return pdf_verify_password(&g_enc_params, pass);
+    if (g_password_mode == PW_MODE_USER) {
+        if (pdf_verify_user_password(&g_enc_params, pass)) {
+            g_found_type = "User";
+            return 1;
+        }
+        return 0;
+    }
+    if (g_password_mode == PW_MODE_OWNER) {
+        if (pdf_verify_owner_password(&g_enc_params, pass)) {
+            g_found_type = "Owner";
+            return 1;
+        }
+        return 0;
+    }
+    /* PW_MODE_BOTH: try user first, then owner */
+    if (pdf_verify_user_password(&g_enc_params, pass)) {
+        g_found_type = "User";
+        return 1;
+    }
+    if (pdf_verify_owner_password(&g_enc_params, pass)) {
+        g_found_type = "Owner";
+        return 1;
+    }
+    return 0;
 }
 
 static inline int test_password_cg(CGPDFDocumentRef doc, const char *pass)
@@ -240,11 +427,7 @@ static void ckpt_save(void)
     };
     fprintf(f, "attack_mode=%s\n", mode_names[g_attack_mode]);
 
-    /* For pre-partitioned modes (NEON without GPU), g_next_idx may not
-     * reflect progress — use g_tested instead if it's larger */
     long cur_idx = atomic_load(&g_next_idx);
-    long tested  = atomic_load(&g_tested);
-    if (tested > cur_idx) cur_idx = tested;
     fprintf(f, "current_idx=%ld\n", cur_idx);
 
     if (g_is_brute || g_attack_mode == ATTACK_BRUTE ||
@@ -264,6 +447,13 @@ static void ckpt_save(void)
         fprintf(f, "auto_phase=%d\n", g_auto_phase);
     if (g_freq_mode)
         fprintf(f, "freq_mode=1\n");
+    if (g_password_mode != PW_MODE_BOTH)
+        fprintf(f, "password_mode=%d\n", g_password_mode);
+
+    for (int ci = 0; ci < 4; ci++) {
+        if (g_custom_charset_str[ci][0])
+            fprintf(f, "custom_charset_%d=%s\n", ci + 1, g_custom_charset_str[ci]);
+    }
 
     if (g_prefix_len) fprintf(f, "prefix=%s\n", g_prefix);
     if (g_suffix_len) fprintf(f, "suffix=%s\n", g_suffix);
@@ -286,6 +476,8 @@ typedef struct {
     int  hybrid_suffix_len;
     int  auto_phase;
     int  freq_mode;
+    int  password_mode;
+    char custom_charsets[4][256];
 } Checkpoint;
 
 static Checkpoint ckpt_load(void)
@@ -341,6 +533,12 @@ static Checkpoint ckpt_load(void)
             ck.auto_phase = atoi(line + 11);
         } else if (strncmp(line, "freq_mode=", 10) == 0) {
             ck.freq_mode = atoi(line + 10);
+        } else if (strncmp(line, "password_mode=", 14) == 0) {
+            ck.password_mode = atoi(line + 14);
+        } else if (strncmp(line, "custom_charset_", 15) == 0 &&
+                   line[15] >= '1' && line[15] <= '4' && line[16] == '=') {
+            int ci = line[15] - '1';
+            strncpy(ck.custom_charsets[ci], line + 17, sizeof(ck.custom_charsets[ci]) - 1);
         }
     }
     fclose(f);
@@ -655,10 +853,60 @@ static int parse_mask(const char *mask)
                     mp->chars[95] = '\0';
                     break;
                 }
+                case 'h': {
+                    /* hex lowercase: 0-9a-f */
+                    mp->nchars = 16;
+                    mp->chars = malloc(17);
+                    memcpy(mp->chars, "0123456789abcdef", 17);
+                    break;
+                }
+                case 'H': {
+                    /* hex uppercase: 0-9A-F */
+                    mp->nchars = 16;
+                    mp->chars = malloc(17);
+                    memcpy(mp->chars, "0123456789ABCDEF", 17);
+                    break;
+                }
+                case '1': case '2': case '3': case '4': {
+                    int ci = code - '1'; /* 0-3 */
+                    if (!g_custom_charset[ci]) {
+                        fprintf(stderr, "Custom charset ?%c not defined (use -%c)\n",
+                                code, code);
+                        return 0;
+                    }
+                    int n = (int)strlen(g_custom_charset[ci]);
+                    mp->nchars = n;
+                    mp->chars = malloc((size_t)n + 1);
+                    memcpy(mp->chars, g_custom_charset[ci], (size_t)n + 1);
+                    break;
+                }
                 default:
                     fprintf(stderr, "Unknown mask code: ?%c\n", code);
                     return 0;
             }
+        } else if (*p == '[') {
+            /* Inline range syntax: [a-f], [0-9A-F], [abc] */
+            p++; /* skip '[' */
+            char range_chars[256];
+            int rn = 0;
+            while (*p && *p != ']' && rn < 255) {
+                if (*(p + 1) == '-' && *(p + 2) && *(p + 2) != ']') {
+                    /* Range: x-y */
+                    char from = *p, to = *(p + 2);
+                    if (from > to) { char tmp = from; from = to; to = tmp; }
+                    for (char c = from; c <= to && rn < 255; c++)
+                        range_chars[rn++] = c;
+                    p += 3;
+                } else {
+                    range_chars[rn++] = *p;
+                    p++;
+                }
+            }
+            if (*p == ']') p++;
+            range_chars[rn] = '\0';
+            mp->nchars = rn;
+            mp->chars = malloc((size_t)rn + 1);
+            memcpy(mp->chars, range_chars, (size_t)rn + 1);
         } else {
             /* literal character */
             mp->nchars = 1;
@@ -948,7 +1196,29 @@ static void *brute_worker_neon(void *arg)
                     (int)strlen(pass[2]), (int)strlen(pass[3])
                 };
 
-                int hits = pdf_verify_user_batch4(&g_enc_params, pw, pwlen);
+                /* Dispatch to appropriate batch4 based on password mode */
+                int hits = 0;
+                if (g_password_mode == PW_MODE_OWNER)
+                    hits = pdf_verify_owner_batch4(&g_enc_params, pw, pwlen);
+                else if (g_password_mode == PW_MODE_USER)
+                    hits = pdf_verify_user_batch4(&g_enc_params, pw, pwlen);
+                else {
+                    /* BOTH: try user first, then owner for non-hits */
+                    hits = pdf_verify_user_batch4(&g_enc_params, pw, pwlen);
+                    if (hits) g_found_type = "User";
+                    int remaining_mask = (~hits) & 0xF;
+                    if (remaining_mask) {
+                        int owner_hits = pdf_verify_owner_batch4(&g_enc_params, pw, pwlen);
+                        owner_hits &= remaining_mask;
+                        if (owner_hits) g_found_type = "Owner";
+                        hits |= owner_hits;
+                    }
+                }
+                if (g_password_mode == PW_MODE_OWNER && hits)
+                    g_found_type = "Owner";
+                else if (g_password_mode == PW_MODE_USER && hits)
+                    g_found_type = "User";
+
                 local_count += 4;
                 if (local_count >= TESTED_BATCH) {
                     atomic_fetch_add_explicit(&g_tested, local_count,
@@ -1001,7 +1271,27 @@ static void *brute_worker_neon(void *arg)
                 (int)strlen(pass[2]), (int)strlen(pass[3])
             };
 
-            int hits = pdf_verify_user_batch4(&g_enc_params, pw, pwlen);
+            int hits = 0;
+            if (g_password_mode == PW_MODE_OWNER)
+                hits = pdf_verify_owner_batch4(&g_enc_params, pw, pwlen);
+            else if (g_password_mode == PW_MODE_USER)
+                hits = pdf_verify_user_batch4(&g_enc_params, pw, pwlen);
+            else {
+                hits = pdf_verify_user_batch4(&g_enc_params, pw, pwlen);
+                if (hits) g_found_type = "User";
+                int remaining_mask = (~hits) & 0xF;
+                if (remaining_mask) {
+                    int owner_hits = pdf_verify_owner_batch4(&g_enc_params, pw, pwlen);
+                    owner_hits &= remaining_mask;
+                    if (owner_hits) g_found_type = "Owner";
+                    hits |= owner_hits;
+                }
+            }
+            if (g_password_mode == PW_MODE_OWNER && hits)
+                g_found_type = "Owner";
+            else if (g_password_mode == PW_MODE_USER && hits)
+                g_found_type = "User";
+
             local_count += 4;
             if (local_count >= TESTED_BATCH) {
                 atomic_fetch_add_explicit(&g_tested, local_count,
@@ -2036,13 +2326,27 @@ static void usage(const char *p)
         "  -i  interactive mode (ask about password)\n"
         "  -m  mask attack (e.g. \"?u?u?u?d?d?d\" = 3 upper + 3 digits)\n"
         "        ?l=lowercase ?u=uppercase ?d=digit ?s=special ?a=all\n"
-        "        other characters are literal\n"
+        "        ?h=hex-lower ?H=hex-upper ?1..?4=custom charset\n"
+        "        [a-f]=inline range, other characters are literal\n"
+        "  -1  custom charset 1 (e.g. -1 abc)\n"
+        "  -2  custom charset 2\n"
+        "  -3  custom charset 3\n"
+        "  -4  custom charset 4\n"
         "  -R  rule-based mutations (use with -d, applies built-in rules)\n"
         "  -H  hybrid attack (use with -d, appends brute-force suffix)\n"
         "        argument is max suffix length\n"
         "  -A  auto mode: chains dict -> rules -> freq brute 1-6 -> brute 7-max\n"
         "  -B  benchmark mode (measure speed, no cracking)\n"
-        "  -F  frequency-ordered brute-force charset\n",
+        "  -F  frequency-ordered brute-force charset\n"
+        "  -O  crack owner password only\n"
+        "  -U  crack user password only\n"
+        "  -M  load Markov model for probability-ordered brute-force\n"
+        "  --markov-train <wordlist>   train a Markov model from a wordlist\n"
+        "  --markov-output <file>      output file for trained model (default: markov.model)\n"
+        "  --markov-threshold <N>      prune to top-N chars per position\n"
+        "  --markov-generate <N>       output top-N candidates from model\n"
+        "  --generate-wordlist <pat>   generate wordlist from pattern (e.g. \"Name{1990-2000}\")\n"
+        "  --combine                   merge and dedup wordlists from remaining args\n",
         p, p, p, p, p, p, p);
     exit(1);
 }
@@ -2065,8 +2369,28 @@ int main(int argc, char *argv[])
     int         nthreads  = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nthreads < 1) nthreads = 4;
 
+    /* Long options for Markov and wordlist tooling */
+    const char *markov_train_wordlist = NULL;
+    const char *markov_train_output   = NULL;
+    const char *markov_model_path     = NULL;
+    int         markov_threshold      = 0;
+    const char *generate_pattern      = NULL;
+    int         markov_generate_n     = 0;
+    int         combine_mode          = 0;
+
+    static struct option long_opts[] = {
+        {"markov-train",     required_argument, NULL, 0x100},
+        {"markov-output",    required_argument, NULL, 0x101},
+        {"markov-threshold", required_argument, NULL, 0x102},
+        {"generate-wordlist",required_argument, NULL, 0x103},
+        {"combine",          no_argument,       NULL, 0x104},
+        {"markov-generate",  required_argument, NULL, 0x105},
+        {NULL, 0, NULL, 0}
+    };
+
     int opt;
-    while ((opt = getopt(argc, argv, "f:d:bl:c:t:Grim:RH:BFA")) != -1) {
+    while ((opt = getopt_long(argc, argv, "f:d:bl:c:t:Grim:RH:BFAOU1:2:3:4:M:",
+                              long_opts, NULL)) != -1) {
         switch (opt) {
             case 'f': pdf_path    = optarg;       break;
             case 'd': dict_path   = optarg;       break;
@@ -2086,8 +2410,200 @@ int main(int argc, char *argv[])
             case 'B': g_benchmark_mode = 1;       break;
             case 'F': g_freq_mode = 1;            break;
             case 'A': g_auto_mode = 1;            break;
+            case 'O': g_password_mode = PW_MODE_OWNER; break;
+            case 'U': g_password_mode = PW_MODE_USER;  break;
+            case '1': case '2': case '3': case '4': {
+                int ci = opt - '1';
+                g_custom_charset[ci] = optarg;
+                strncpy(g_custom_charset_str[ci], optarg,
+                        sizeof(g_custom_charset_str[ci]) - 1);
+                break;
+            }
+            case 'M': markov_model_path = optarg; break;
+            case 0x100: markov_train_wordlist = optarg; break;
+            case 0x101: markov_train_output   = optarg; break;
+            case 0x102: markov_threshold      = atoi(optarg); break;
+            case 0x103: generate_pattern      = optarg; break;
+            case 0x104: combine_mode          = 1; break;
+            case 0x105: markov_generate_n     = atoi(optarg); break;
             default:  usage(argv[0]);
         }
+    }
+
+    /* ── Handle standalone utility modes (no PDF needed) ─────── */
+
+    /* Markov training mode */
+    if (markov_train_wordlist) {
+        const char *out_path = markov_train_output ? markov_train_output : "markov.model";
+        markov_train(markov_train_wordlist, out_path);
+        return 0;
+    }
+
+    /* Generate wordlist from pattern: "Name{1990-2000}" → Name1990..Name2000 */
+    if (generate_pattern) {
+        const char *p = generate_pattern;
+        char prefix[256] = {0};
+        int pi = 0;
+
+        while (*p && *p != '{' && pi < 255)
+            prefix[pi++] = *p++;
+        prefix[pi] = '\0';
+
+        if (*p == '{') {
+            p++; /* skip '{' */
+            /* Parse ranges and literals inside braces, support multiple {..} */
+            /* For simplicity: handle "prefix{N-M}" → prefix N, prefix N+1, ..., prefix M */
+            /* Also support "prefix{N-M}{N2-M2}" → nested iteration */
+            /* Single brace for now */
+            long range_start = 0, range_end = 0;
+            char suffix[256] = {0};
+
+            range_start = strtol(p, (char **)&p, 10);
+            if (*p == '-') {
+                p++;
+                range_end = strtol(p, (char **)&p, 10);
+            } else {
+                range_end = range_start;
+            }
+            if (*p == '}') p++;
+            strncpy(suffix, p, sizeof(suffix) - 1);
+
+            /* Handle nested second brace */
+            const char *brace2 = strchr(suffix, '{');
+            if (brace2) {
+                char suffix_pre[256] = {0};
+                memcpy(suffix_pre, suffix, (size_t)(brace2 - suffix));
+                const char *q = brace2 + 1;
+                long r2_start = strtol(q, (char **)&q, 10);
+                long r2_end = r2_start;
+                if (*q == '-') { q++; r2_end = strtol(q, (char **)&q, 10); }
+                if (*q == '}') q++;
+
+                for (long i = range_start; i <= range_end; i++) {
+                    for (long j = r2_start; j <= r2_end; j++) {
+                        printf("%s%ld%s%ld%s\n", prefix, i, suffix_pre, j, q);
+                    }
+                }
+            } else {
+                for (long i = range_start; i <= range_end; i++)
+                    printf("%s%ld%s\n", prefix, i, suffix);
+            }
+        } else {
+            /* No braces — just output the pattern as-is */
+            printf("%s\n", generate_pattern);
+        }
+        return 0;
+    }
+
+    /* Combine and dedup wordlists from remaining args */
+    if (combine_mode) {
+        /* FNV-1a hash set for dedup */
+        #define COMBINE_HASH_SIZE (1 << 20)  /* 1M buckets */
+        typedef struct CombineNode {
+            char *word;
+            struct CombineNode *next;
+        } CombineNode;
+
+        CombineNode **buckets = calloc(COMBINE_HASH_SIZE, sizeof(CombineNode *));
+        if (!buckets) { perror("calloc"); return 1; }
+
+        long total = 0, unique = 0;
+
+        for (int fi = optind; fi < argc; fi++) {
+            FILE *f = fopen(argv[fi], "r");
+            if (!f) { perror(argv[fi]); continue; }
+
+            char line[MAX_PASS_LEN + 4];
+            while (fgets(line, sizeof(line), f)) {
+                size_t len = strlen(line);
+                while (len && (line[len-1] == '\n' || line[len-1] == '\r'))
+                    line[--len] = '\0';
+                if (!len) continue;
+                total++;
+
+                /* FNV-1a hash */
+                uint32_t h = 2166136261u;
+                for (size_t i = 0; i < len; i++) {
+                    h ^= (uint8_t)line[i];
+                    h *= 16777619u;
+                }
+                int bucket = (int)(h & (COMBINE_HASH_SIZE - 1));
+
+                /* Check for duplicate */
+                int found = 0;
+                for (CombineNode *n = buckets[bucket]; n; n = n->next) {
+                    if (strcmp(n->word, line) == 0) { found = 1; break; }
+                }
+                if (found) continue;
+
+                /* Add to hash set and output */
+                CombineNode *node = malloc(sizeof(CombineNode));
+                node->word = strdup(line);
+                node->next = buckets[bucket];
+                buckets[bucket] = node;
+                unique++;
+                printf("%s\n", line);
+            }
+            fclose(f);
+        }
+
+        /* Cleanup */
+        for (int i = 0; i < COMBINE_HASH_SIZE; i++) {
+            CombineNode *n = buckets[i];
+            while (n) {
+                CombineNode *next = n->next;
+                free(n->word);
+                free(n);
+                n = next;
+            }
+        }
+        free(buckets);
+
+        fprintf(stderr, "Combined: %ld total, %ld unique (%ld duplicates removed)\n",
+                total, unique, total - unique);
+        return 0;
+    }
+
+    /* Markov generate: output top-N candidates from model */
+    if (markov_generate_n > 0) {
+        const char *model_path = markov_model_path;
+        if (!model_path && markov_train_output) model_path = markov_train_output;
+        if (!model_path) model_path = "markov.model";
+
+        MarkovModel *m = markov_load(model_path);
+        if (!m) return 1;
+        g_markov = m;
+
+        if (markov_threshold > 0)
+            g_markov->threshold = markov_threshold;
+
+        /* Generate passwords of varying lengths */
+        int gen_max_len = max_len > 0 ? max_len : 8;
+        int gen_min_len = min_len > 0 ? min_len : 1;
+        int generated = 0;
+
+        for (int len = gen_min_len; len <= gen_max_len && generated < markov_generate_n; len++) {
+            int effective_cs = g_markov->threshold < g_markov->charset_size
+                             ? g_markov->threshold : g_markov->charset_size;
+            long ks = 1;
+            for (int i = 0; i < len; i++) {
+                if (ks > (long)2e18 / effective_cs) { ks = (long)2e18; break; }
+                ks *= effective_cs;
+            }
+            long limit = markov_generate_n - generated;
+            if (limit > ks) limit = ks;
+
+            char pass[MAX_PASS_LEN + 1];
+            for (long idx = 0; idx < limit; idx++) {
+                markov_index_to_pass(idx, len, pass);
+                printf("%s\n", pass);
+                generated++;
+            }
+        }
+
+        free(g_markov);
+        g_markov = NULL;
+        return 0;
     }
 
     if (!pdf_path) { fprintf(stderr, "-f required\n"); usage(argv[0]); }
@@ -2150,7 +2666,26 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (!brute && !dict_path && !g_mask_mode && !g_benchmark_mode && !g_auto_mode) {
+    /* When resuming, peek at checkpoint to determine mode before validation */
+    if (resume && !brute && !dict_path && !g_mask_mode && !g_auto_mode) {
+        ckpt_make_path(pdf_path);
+        Checkpoint peek = ckpt_load();
+        if (peek.valid) {
+            if (peek.attack_mode == ATTACK_BRUTE) brute = 1;
+            else if (peek.attack_mode == ATTACK_MASK) {
+                g_mask_mode = 1;
+                if (peek.mask_pattern[0]) {
+                    strncpy(g_mask_str, peek.mask_pattern, sizeof(g_mask_str) - 1);
+                    mask_str = g_mask_str;
+                    parse_mask(mask_str);
+                }
+            } else if (peek.attack_mode == ATTACK_AUTO) g_auto_mode = 1;
+            else if (peek.attack_mode == ATTACK_RULE) g_rule_mode = 1;
+            else if (peek.attack_mode == ATTACK_HYBRID) g_hybrid_mode = 1;
+        }
+    }
+
+    if (!brute && !dict_path && !g_mask_mode && !g_benchmark_mode && !g_auto_mode && !resume) {
         fprintf(stderr, "-d, -b, -m, -A, or -B required\n");
         usage(argv[0]);
     }
@@ -2177,8 +2712,21 @@ int main(int argc, char *argv[])
     g_cs_len   = (int)strlen(charset);
     g_nthreads = nthreads;
 
-    /* Set default index-to-password function (mask overrides below) */
-    g_idx_to_pass = g_mask_mode ? mask_index_to_pass : index_to_pass;
+    /* Load Markov model if specified */
+    if (markov_model_path) {
+        g_markov = markov_load(markov_model_path);
+        if (!g_markov) return 1;
+        if (markov_threshold > 0)
+            g_markov->threshold = markov_threshold;
+        /* Override charset with Markov charset */
+        charset = g_markov->charset;
+    }
+
+    /* Set default index-to-password function (mask/markov overrides below) */
+    if (g_markov)
+        g_idx_to_pass = markov_index_to_pass;
+    else
+        g_idx_to_pass = g_mask_mode ? mask_index_to_pass : index_to_pass;
 
     /* ── Try fast crypto path (direct MD5+RC4) ─────────────────── */
     g_enc_params = pdf_parse_encrypt_file(pdf_path);
@@ -2201,7 +2749,9 @@ int main(int argc, char *argv[])
         select_best_engine(nthreads);
     } else if (g_fast_crypto && !no_gpu && g_enc_params.revision == 5) {
         /* R5: full SHA-256 verification on GPU (user password) */
-        g_sha256_ctx = metal_sha256_init(&g_enc_params, 0, NULL);
+        /* check_owner: 0=user, 1=owner. For BOTH mode, start with user pass. */
+        int check_owner = (g_password_mode == PW_MODE_OWNER) ? 1 : 0;
+        g_sha256_ctx = metal_sha256_init(&g_enc_params, check_owner, NULL);
         if (g_sha256_ctx)
             g_use_gpu = 1;
     } else if (g_fast_crypto && no_gpu && g_enc_params.revision >= 2 &&
@@ -2270,6 +2820,15 @@ int main(int argc, char *argv[])
                 g_suffix_len = (int)strlen(g_suffix);
             }
 
+            /* Restore custom charsets from checkpoint */
+            for (int ci = 0; ci < 4; ci++) {
+                if (ck.custom_charsets[ci][0] && !g_custom_charset[ci]) {
+                    strncpy(g_custom_charset_str[ci], ck.custom_charsets[ci],
+                            sizeof(g_custom_charset_str[ci]) - 1);
+                    g_custom_charset[ci] = g_custom_charset_str[ci];
+                }
+            }
+
             /* Restore mask pattern from checkpoint */
             if (ck.mask_pattern[0] && ck.attack_mode == ATTACK_MASK) {
                 strncpy(g_mask_str, ck.mask_pattern, sizeof(g_mask_str) - 1);
@@ -2303,6 +2862,10 @@ int main(int argc, char *argv[])
             /* Restore frequency mode from checkpoint */
             if (ck.freq_mode)
                 g_freq_mode = 1;
+
+            /* Restore password mode from checkpoint */
+            if (ck.password_mode)
+                g_password_mode = ck.password_mode;
         } else {
             fprintf(stderr, "Resume : no checkpoint found, starting fresh\n");
         }
@@ -2479,21 +3042,15 @@ int main(int argc, char *argv[])
                         pthread_create(&threads[spawned++], NULL, brute_worker, a);
                     }
                 } else {
-                    long remaining = total - idx0;
-                    long chunk = (remaining + nthreads - 1) / nthreads;
                     void *(*worker_fn)(void *) = brute_worker;
 #ifdef __ARM_NEON
                     if (g_use_neon)
                         worker_fn = brute_worker_neon;
 #endif
                     for (int t = 0; t < nthreads; t++) {
-                        long start = idx0 + (long)t * chunk;
-                        long end   = start + chunk;
-                        if (start >= total) break;
-                        if (end   > total)  end = total;
                         BruteArg *a = malloc(sizeof(BruteArg));
                         *a = (BruteArg){ .id = t, .length = len,
-                                         .start = start, .end = end, .use_shared = 0 };
+                                         .start = 0, .end = total, .use_shared = 1 };
                         pthread_create(&threads[spawned++], NULL, worker_fn, a);
                     }
                 }
@@ -2560,21 +3117,15 @@ int main(int argc, char *argv[])
                         pthread_create(&threads[spawned++], NULL, brute_worker, a);
                     }
                 } else {
-                    long remaining = total - idx0;
-                    long chunk = (remaining + nthreads - 1) / nthreads;
                     void *(*worker_fn)(void *) = brute_worker;
 #ifdef __ARM_NEON
                     if (g_use_neon)
                         worker_fn = brute_worker_neon;
 #endif
                     for (int t = 0; t < nthreads; t++) {
-                        long start = idx0 + (long)t * chunk;
-                        long end   = start + chunk;
-                        if (start >= total) break;
-                        if (end   > total)  end = total;
                         BruteArg *a = malloc(sizeof(BruteArg));
                         *a = (BruteArg){ .id = t, .length = len,
-                                         .start = start, .end = end, .use_shared = 0 };
+                                         .start = 0, .end = total, .use_shared = 1 };
                         pthread_create(&threads[spawned++], NULL, worker_fn, a);
                     }
                 }
@@ -2623,17 +3174,10 @@ int main(int argc, char *argv[])
             if (g_use_neon)
                 worker_fn = brute_worker_neon;
 #endif
-            long remaining = total - mask_start;
-            long chunk = (remaining + nthreads - 1) / nthreads;
             for (int t = 0; t < nthreads; t++) {
-                long start = mask_start + (long)t * chunk;
-                long end   = start + chunk;
-                if (start >= total) break;
-                if (end   > total)  end = total;
-
                 BruteArg *a = malloc(sizeof(BruteArg));
                 *a = (BruteArg){ .id = t, .length = g_mask_len,
-                                 .start = start, .end = end, .use_shared = 0 };
+                                 .start = 0, .end = total, .use_shared = 1 };
                 pthread_create(&threads[spawned++], NULL, worker_fn, a);
             }
         }
@@ -2809,11 +3353,7 @@ int main(int argc, char *argv[])
                     pthread_create(&threads[spawned++], NULL, brute_worker, a);
                 }
             } else {
-                /* Pre-partitioned ranges (CPU-only) */
-                long remaining = total - idx0;
-                long chunk = (remaining + nthreads - 1) / nthreads;
-
-                /* Select worker function: NEON batch or scalar */
+                /* Shared work counter mode (CPU-only, incl. NEON) */
                 void *(*worker_fn)(void *) = brute_worker;
 #ifdef __ARM_NEON
                 if (g_use_neon)
@@ -2821,14 +3361,9 @@ int main(int argc, char *argv[])
 #endif
 
                 for (int t = 0; t < nthreads; t++) {
-                    long start = idx0 + (long)t * chunk;
-                    long end   = start + chunk;
-                    if (start >= total) break;
-                    if (end   > total)  end = total;
-
                     BruteArg *a = malloc(sizeof(BruteArg));
                     *a = (BruteArg){ .id = t, .length = len,
-                                     .start = start, .end = end, .use_shared = 0 };
+                                     .start = 0, .end = total, .use_shared = 1 };
                     pthread_create(&threads[spawned++], NULL, worker_fn, a);
                 }
             }
@@ -2854,7 +3389,10 @@ auto_done:
     }
 
     if (g_password[0]) {
-        printf("Password found: %s\n", g_password);
+        if (g_found_type)
+            printf("%s password found: %s\n", g_found_type, g_password);
+        else
+            printf("Password found: %s\n", g_password);
         ckpt_delete();  /* success — remove checkpoint */
         return 0;
     }

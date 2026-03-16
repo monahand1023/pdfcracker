@@ -95,6 +95,15 @@ int pdf_compute_encryption_key(const PDFEncryptParams *params,
  */
 int pdf_verify_user_batch4(const PDFEncryptParams *params,
                            const char *pw[4], int pwlen[4]);
+
+/*
+ * Batch-verify 4 owner passwords simultaneously using NEON SIMD MD5.
+ * Only works for R2/R3/R4 (MD5+RC4 encryption).
+ * Returns a bitmask (bits 0-3) indicating which passwords matched.
+ * For R5/R6 or invalid params, returns 0 (caller should fall back).
+ */
+int pdf_verify_owner_batch4(const PDFEncryptParams *params,
+                            const char *pw[4], int pwlen[4]);
 #endif
 
 #endif /* PDF_ENCRYPT_H */

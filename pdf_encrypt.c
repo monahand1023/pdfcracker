@@ -1031,4 +1031,112 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
     return result;
 }
 
+int pdf_verify_owner_batch4(const PDFEncryptParams *params,
+                            const char *pw[4], int pwlen[4])
+{
+    if (!params->valid) return 0;
+
+    /* R5/R6: use scalar path (SHA-256 based, no NEON MD5 benefit) */
+    if (params->revision >= 5) {
+        int result = 0;
+        for (int i = 0; i < 4; i++) {
+            if (pdf_verify_owner_password(params, pw[i]))
+                result |= (1 << i);
+        }
+        return result;
+    }
+
+    if (params->revision < 2 || params->revision > 4) return 0;
+
+    int key_bytes = params->key_length / 8;
+    if (key_bytes < 5)  key_bytes = 5;
+    if (key_bytes > 16) key_bytes = 16;
+
+    /* ── Owner key derivation for all 4 passwords (SIMD MD5) ── */
+
+    /* Step a: Pad each owner password to 32 bytes */
+    uint8_t padded[4][32];
+    for (int i = 0; i < 4; i++) {
+        int plen = pwlen[i];
+        if (plen > 32) plen = 32;
+        if (plen > 0) memcpy(padded[i], pw[i], (size_t)plen);
+        if (plen < 32) memcpy(padded[i] + plen, PDF_PASSWORD_PADDING, (size_t)(32 - plen));
+    }
+
+    /* Step b: MD5 hash of padded password (4-way SIMD) */
+    const uint8_t *ptrs[4] = { padded[0], padded[1], padded[2], padded[3] };
+    size_t lens[4] = { 32, 32, 32, 32 };
+    uint8_t hash[4][16];
+    md5_x4(ptrs, lens, hash);
+
+    /* Step c: For R >= 3, iterate MD5 50 times on first key_bytes */
+    if (params->revision >= 3) {
+        uint8_t buf[4][64];
+        for (int iter = 0; iter < 50; iter++) {
+            for (int i = 0; i < 4; i++)
+                memcpy(buf[i], hash[i], (size_t)key_bytes);
+            md5_x4_short(buf, (size_t)key_bytes, hash);
+        }
+    }
+
+    /* Now hash[i] contains the owner key for password i */
+    uint8_t keys[4][16];
+    for (int i = 0; i < 4; i++)
+        memcpy(keys[i], hash[i], (size_t)key_bytes);
+
+    /* ── Per-password: RC4-decrypt O value, then verify as user ── */
+    int result = 0;
+
+    for (int i = 0; i < 4; i++) {
+        uint8_t user_pass[32];
+
+        if (params->revision == 2) {
+            /* Single RC4 decryption */
+            size_t out_len = 32;
+            CCCrypt(kCCDecrypt, kCCAlgorithmRC4, 0,
+                    keys[i], (size_t)key_bytes,
+                    NULL, params->o_value, 32,
+                    user_pass, 32, &out_len);
+        } else {
+            /* R3/R4: 20 RC4 passes in reverse (19 down to 0) */
+            memcpy(user_pass, params->o_value, 32);
+            for (int r = 19; r >= 0; r--) {
+                uint8_t mod_key[16];
+                for (int j = 0; j < key_bytes; j++)
+                    mod_key[j] = keys[i][j] ^ (uint8_t)r;
+                uint8_t temp[32];
+                size_t out_len = 32;
+                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
+                        mod_key, (size_t)key_bytes,
+                        NULL, user_pass, 32,
+                        temp, 32, &out_len);
+                memcpy(user_pass, temp, 32);
+            }
+        }
+
+        /* Convert recovered padded user password to string */
+        char user_str[33];
+        int ulen = 32;
+        for (int k = 0; k < 32; k++) {
+            if (user_pass[k] == PDF_PASSWORD_PADDING[0]) {
+                int is_pad = 1;
+                for (int j = 0; j + k < 32 && j < 32; j++) {
+                    if (user_pass[k + j] != PDF_PASSWORD_PADDING[j]) {
+                        is_pad = 0;
+                        break;
+                    }
+                }
+                if (is_pad) { ulen = k; break; }
+            }
+        }
+        memcpy(user_str, user_pass, (size_t)ulen);
+        user_str[ulen] = '\0';
+
+        if (pdf_verify_user_password(params, user_str))
+            result |= (1 << i);
+    }
+
+    return result;
+}
+
 #endif /* __ARM_NEON */
