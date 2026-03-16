@@ -11,6 +11,7 @@
  *   make client
  *
  * Usage:
+ *   ./client                                # auto-discover server via Bonjour
  *   ./client -s 192.168.1.10                # connect to server
  *   ./client -s 192.168.1.10 -p 8888        # custom port
  *   ./client -s 192.168.1.10 -t 4           # limit to 4 threads
@@ -28,6 +29,8 @@
 #include <mach/mach_time.h>
 #include <signal.h>
 #include <pwd.h>
+#include <dns_sd.h>
+#include <sys/select.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <CommonCrypto/CommonDigest.h>
@@ -619,6 +622,182 @@ static void cleanup(void)
 }
 
 /* ================================================================
+ * Bonjour/mDNS auto-discovery for _pdfcracker._tcp
+ * ================================================================ */
+
+/* Context passed through the chain of callbacks */
+typedef struct {
+    char     host[256];
+    int      port;
+    int      found;
+    int      resolved;
+    int      got_addr;
+} DiscoverCtx;
+
+/* Wait for a single dns_sd event with a timeout (seconds).
+ * Returns 0 on success, -1 on timeout or error. */
+static int dnssd_wait(DNSServiceRef ref, int timeout_secs)
+{
+    int fd = DNSServiceRefSockFD(ref);
+    if (fd < 0) return -1;
+
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(fd, &fds);
+
+    struct timeval tv = { .tv_sec = timeout_secs, .tv_usec = 0 };
+    int ret = select(fd + 1, &fds, NULL, NULL, &tv);
+    if (ret <= 0) return -1;
+
+    DNSServiceErrorType err = DNSServiceProcessResult(ref);
+    return (err == kDNSServiceErr_NoError) ? 0 : -1;
+}
+
+/* Callback: DNSServiceGetAddrInfo resolved hostname to IP */
+static void DNSSD_API getaddr_callback(
+    DNSServiceRef sdRef,
+    DNSServiceFlags flags,
+    uint32_t interfaceIndex,
+    DNSServiceErrorType errorCode,
+    const char *hostname,
+    const struct sockaddr *address,
+    uint32_t ttl,
+    void *context)
+{
+    (void)sdRef; (void)flags; (void)interfaceIndex;
+    (void)hostname; (void)ttl;
+
+    DiscoverCtx *ctx = (DiscoverCtx *)context;
+    if (errorCode != kDNSServiceErr_NoError) return;
+    if (ctx->got_addr) return;  /* take first result only */
+
+    if (address->sa_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)address;
+        inet_ntop(AF_INET, &sin->sin_addr, ctx->host, sizeof(ctx->host));
+        ctx->got_addr = 1;
+    } else if (address->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)address;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, ctx->host, sizeof(ctx->host));
+        ctx->got_addr = 1;
+    }
+}
+
+/* Callback: DNSServiceResolve found hostname + port */
+static void DNSSD_API resolve_callback(
+    DNSServiceRef sdRef,
+    DNSServiceFlags flags,
+    uint32_t interfaceIndex,
+    DNSServiceErrorType errorCode,
+    const char *fullname,
+    const char *hosttarget,
+    uint16_t port,
+    uint16_t txtLen,
+    const unsigned char *txtRecord,
+    void *context)
+{
+    (void)sdRef; (void)flags; (void)fullname;
+    (void)txtLen; (void)txtRecord;
+
+    DiscoverCtx *ctx = (DiscoverCtx *)context;
+    if (errorCode != kDNSServiceErr_NoError) return;
+
+    ctx->port = ntohs(port);
+    ctx->resolved = 1;
+
+    /* Now resolve the hostname to an IP address */
+    DNSServiceRef addrRef = NULL;
+    DNSServiceErrorType err = DNSServiceGetAddrInfo(
+        &addrRef, 0, interfaceIndex,
+        kDNSServiceProtocol_IPv4,
+        hosttarget, getaddr_callback, ctx);
+
+    if (err == kDNSServiceErr_NoError) {
+        /* Wait up to 5 seconds for address resolution */
+        dnssd_wait(addrRef, 5);
+        DNSServiceRefDeallocate(addrRef);
+    }
+}
+
+/* Callback: DNSServiceBrowse found a service instance */
+static void DNSSD_API browse_callback(
+    DNSServiceRef sdRef,
+    DNSServiceFlags flags,
+    uint32_t interfaceIndex,
+    DNSServiceErrorType errorCode,
+    const char *serviceName,
+    const char *regtype,
+    const char *replyDomain,
+    void *context)
+{
+    (void)sdRef; (void)flags;
+
+    DiscoverCtx *ctx = (DiscoverCtx *)context;
+    if (errorCode != kDNSServiceErr_NoError) return;
+    if (ctx->found) return;  /* take first service */
+
+    ctx->found = 1;
+    fprintf(stderr, "Bonjour: found \"%s\" (%s%s)\n",
+            serviceName, regtype, replyDomain);
+
+    /* Resolve this service to get hostname + port */
+    DNSServiceRef resolveRef = NULL;
+    DNSServiceErrorType err = DNSServiceResolve(
+        &resolveRef, 0, interfaceIndex,
+        serviceName, regtype, replyDomain,
+        resolve_callback, ctx);
+
+    if (err == kDNSServiceErr_NoError) {
+        /* Wait up to 5 seconds for resolution */
+        dnssd_wait(resolveRef, 5);
+        DNSServiceRefDeallocate(resolveRef);
+    }
+}
+
+/*
+ * discover_server — Browse for _pdfcracker._tcp via Bonjour.
+ * On success, writes the IP string into host_out (must be >= 256 bytes)
+ * and the port into *port_out. Returns 0 on success, -1 on failure.
+ */
+static int discover_server(char *host_out, size_t host_out_sz, int *port_out)
+{
+    fprintf(stderr, "Searching for _pdfcracker._tcp via Bonjour...\n");
+
+    DiscoverCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    DNSServiceRef browseRef = NULL;
+    DNSServiceErrorType err = DNSServiceBrowse(
+        &browseRef, 0, 0,
+        "_pdfcracker._tcp", NULL,
+        browse_callback, &ctx);
+
+    if (err != kDNSServiceErr_NoError) {
+        fprintf(stderr, "DNSServiceBrowse failed: %d\n", (int)err);
+        return -1;
+    }
+
+    /* Wait up to 5 seconds for a browse result */
+    if (dnssd_wait(browseRef, 5) < 0 && !ctx.found) {
+        fprintf(stderr, "Bonjour: no _pdfcracker._tcp service found "
+                        "(timed out after 5s)\n");
+        DNSServiceRefDeallocate(browseRef);
+        return -1;
+    }
+    DNSServiceRefDeallocate(browseRef);
+
+    if (!ctx.got_addr) {
+        fprintf(stderr, "Bonjour: service found but could not resolve address\n");
+        return -1;
+    }
+
+    snprintf(host_out, host_out_sz, "%s", ctx.host);
+    *port_out = ctx.port;
+
+    fprintf(stderr, "Bonjour: resolved to %s:%d\n", host_out, *port_out);
+    return 0;
+}
+
+/* ================================================================
  * Connect to server
  * ================================================================ */
 static int connect_to_server(const char *host, int port)
@@ -1002,8 +1181,9 @@ static void usage(const char *p)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  %s -s <server_host> [-p <port>] [-t <threads>] [-G]\n"
+        "  %s [-s <server_host>] [-p <port>] [-t <threads>] [-G]\n"
         "\nConnects to a pdfcrack server and cracks locally.\n"
+        "Without -s, auto-discovers the server via Bonjour (mDNS).\n"
         "  -G  disable GPU acceleration\n", p);
     exit(1);
 }
@@ -1031,7 +1211,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (!host) { fprintf(stderr, "-s required\n"); usage(argv[0]); }
     if (nthreads > 64) nthreads = 64;
     g_nthreads = nthreads;
     atexit(cleanup);
@@ -1049,6 +1228,18 @@ int main(int argc, char *argv[])
     fprintf(stderr, "Client UUID: %s\n", g_client_uuid);
     fprintf(stderr, "Threads: %d, GPU: %s\n", nthreads,
             g_no_gpu ? "disabled" : "auto");
+
+    /* If no host specified, auto-discover via Bonjour */
+    char discovered_host[256];
+    if (!host) {
+        if (discover_server(discovered_host, sizeof(discovered_host),
+                            &port) < 0) {
+            fprintf(stderr, "Auto-discovery failed. "
+                            "Use -s <host> to specify manually.\n");
+            return 1;
+        }
+        host = discovered_host;
+    }
 
     /* Run with auto-reconnect */
     int rc = reconnect_loop(host, port);

@@ -56,4 +56,36 @@ double metal_keygen_benchmark(MetalKeygenContext *ctx, int bench_count);
  */
 void metal_keygen_free(MetalKeygenContext *ctx);
 
+/* ── R5 SHA-256 GPU verification ─────────────────────────────── */
+
+/* Opaque handle to R5 SHA-256 Metal pipeline */
+typedef struct MetalSHA256Context MetalSHA256Context;
+
+/*
+ * Initialize Metal pipeline for R5 SHA-256 password verification.
+ * check_owner: 0 = verify user password, 1 = verify owner password.
+ * Returns NULL if Metal is unavailable or setup fails.
+ */
+MetalSHA256Context *metal_sha256_init(const PDFEncryptParams *params,
+                                       int check_owner,
+                                       const char *metallib_path);
+
+/*
+ * Verify a batch of passwords on the GPU using SHA-256 (R5).
+ *
+ * passwords:    array of null-terminated C strings
+ * count:        number of passwords in the batch
+ *
+ * Returns the index (0-based) of the first matching password,
+ * or -1 if no match was found in this batch.
+ */
+int metal_sha256_verify_batch(MetalSHA256Context *ctx,
+                               const char **passwords,
+                               int count);
+
+/*
+ * Free all Metal resources for the SHA-256 pipeline.
+ */
+void metal_sha256_free(MetalSHA256Context *ctx);
+
 #endif /* METAL_KEYGEN_H */

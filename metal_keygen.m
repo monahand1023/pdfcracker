@@ -297,3 +297,211 @@ void metal_keygen_free(MetalKeygenContext *ctx)
     /* ARC handles Metal objects; just free the struct */
     free(ctx);
 }
+
+/* ================================================================
+ * R5 SHA-256 GPU verification pipeline
+ * ================================================================ */
+
+/* Must match the struct in pdf_md5.metal exactly */
+typedef struct __attribute__((packed)) {
+    uint8_t  u_hash[32];
+    uint8_t  u_salt[8];
+    uint8_t  o_hash[32];
+    uint8_t  o_salt[8];
+    uint8_t  u_full[48];
+    uint32_t check_owner;
+} PDFR5GPU;
+
+#define SHA256_PW_PACKED_LEN  128   /* each password slot: max 127 chars + padding */
+
+struct MetalSHA256Context {
+    id<MTLDevice>               device;
+    id<MTLCommandQueue>         queue;
+    id<MTLComputePipelineState> pipeline;
+
+    id<MTLBuffer> pw_buf[2];       /* passwords, packed SHA256_PW_PACKED_LEN each */
+    id<MTLBuffer> len_buf[2];      /* password lengths, 1 byte each */
+    id<MTLBuffer> params_buf;      /* constant PDFR5GPU */
+    id<MTLBuffer> results_buf[2];  /* 1 byte per password: 1=match, 0=no */
+
+    int max_batch;
+    int current_buf;
+};
+
+MetalSHA256Context *metal_sha256_init(const PDFEncryptParams *params,
+                                       int check_owner,
+                                       const char *metallib_path)
+{
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            fprintf(stderr, "Metal SHA-256: no GPU device found\n");
+            return NULL;
+        }
+
+        /* Load shader library (same search order as MD5 pipeline) */
+        NSError *error = nil;
+        id<MTLLibrary> library = nil;
+
+        if (metallib_path) {
+            NSString *path = [NSString stringWithUTF8String:metallib_path];
+            NSURL *url = [NSURL fileURLWithPath:path];
+            library = [device newLibraryWithURL:url error:&error];
+        }
+
+        if (!library) {
+            NSString *execPath = [[NSBundle mainBundle] executablePath];
+            if (execPath) {
+                NSString *dir = [execPath stringByDeletingLastPathComponent];
+                NSString *libPath = [dir stringByAppendingPathComponent:@"pdf_md5.metallib"];
+                NSURL *url = [NSURL fileURLWithPath:libPath];
+                library = [device newLibraryWithURL:url error:&error];
+            }
+        }
+
+        if (!library) {
+            NSURL *url = [NSURL fileURLWithPath:@"pdf_md5.metallib"];
+            library = [device newLibraryWithURL:url error:&error];
+        }
+
+        if (!library) {
+            fprintf(stderr, "Metal SHA-256: failed to load shader library: %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "unknown");
+            return NULL;
+        }
+
+        id<MTLFunction> func = [library newFunctionWithName:@"pdf_sha256_verify"];
+        if (!func) {
+            fprintf(stderr, "Metal SHA-256: kernel 'pdf_sha256_verify' not found\n");
+            return NULL;
+        }
+
+        id<MTLComputePipelineState> pipeline =
+            [device newComputePipelineStateWithFunction:func error:&error];
+        if (!pipeline) {
+            fprintf(stderr, "Metal SHA-256: failed to create pipeline: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            return NULL;
+        }
+
+        MetalSHA256Context *ctx = calloc(1, sizeof(MetalSHA256Context));
+        if (!ctx) return NULL;
+
+        ctx->device   = device;
+        ctx->queue    = [device newCommandQueue];
+        ctx->pipeline = pipeline;
+        ctx->max_batch = MAX_BATCH_SIZE;
+        ctx->current_buf = 0;
+
+        /* Create GPU buffers (double-buffered) */
+        NSUInteger pw_size      = (NSUInteger)MAX_BATCH_SIZE * SHA256_PW_PACKED_LEN;
+        NSUInteger len_size     = (NSUInteger)MAX_BATCH_SIZE;
+        NSUInteger results_size = (NSUInteger)MAX_BATCH_SIZE;
+
+        for (int i = 0; i < 2; i++) {
+            ctx->pw_buf[i]      = [device newBufferWithLength:pw_size
+                                    options:MTLResourceStorageModeShared];
+            ctx->len_buf[i]     = [device newBufferWithLength:len_size
+                                    options:MTLResourceStorageModeShared];
+            ctx->results_buf[i] = [device newBufferWithLength:results_size
+                                    options:MTLResourceStorageModeShared];
+            if (!ctx->pw_buf[i] || !ctx->len_buf[i] || !ctx->results_buf[i]) {
+                fprintf(stderr, "Metal SHA-256: failed to allocate buffers\n");
+                free(ctx);
+                return NULL;
+            }
+        }
+
+        /* Fill constant params buffer */
+        PDFR5GPU gpu_params;
+        memset(&gpu_params, 0, sizeof(gpu_params));
+        memcpy(gpu_params.u_hash, params->u_value, 32);
+        memcpy(gpu_params.u_salt, params->u_value + 32, 8);
+        memcpy(gpu_params.o_hash, params->o_value, 32);
+        memcpy(gpu_params.o_salt, params->o_value + 32, 8);
+        memcpy(gpu_params.u_full, params->u_value, 48);
+        gpu_params.check_owner = (uint32_t)check_owner;
+
+        ctx->params_buf = [device newBufferWithBytes:&gpu_params
+                                    length:sizeof(gpu_params)
+                                    options:MTLResourceStorageModeShared];
+
+        fprintf(stderr, "Metal SHA-256: initialized on %s (R5 %s, max batch: %d)\n",
+                [[device name] UTF8String],
+                check_owner ? "owner" : "user",
+                MAX_BATCH_SIZE);
+
+        return ctx;
+    }
+}
+
+int metal_sha256_verify_batch(MetalSHA256Context *ctx,
+                               const char **passwords,
+                               int count)
+{
+    if (!ctx || count <= 0) return -1;
+    if (count > ctx->max_batch) count = ctx->max_batch;
+
+    @autoreleasepool {
+        int buf = ctx->current_buf;
+        ctx->current_buf ^= 1;
+
+        /* Pack passwords into GPU buffer */
+        uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
+        uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
+
+        memset(pw_data, 0, (size_t)count * SHA256_PW_PACKED_LEN);
+        for (int i = 0; i < count; i++) {
+            size_t plen = strlen(passwords[i]);
+            if (plen > 127) plen = 127;
+            memcpy(pw_data + (size_t)i * SHA256_PW_PACKED_LEN, passwords[i], plen);
+            len_data[i] = (uint8_t)plen;
+        }
+
+        /* Clear results */
+        memset([ctx->results_buf[buf] contents], 0, (size_t)count);
+
+        /* Create command buffer and encoder */
+        id<MTLCommandBuffer> cmdBuf = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+
+        [encoder setComputePipelineState:ctx->pipeline];
+        [encoder setBuffer:ctx->pw_buf[buf]      offset:0 atIndex:0];
+        [encoder setBuffer:ctx->len_buf[buf]     offset:0 atIndex:1];
+        [encoder setBuffer:ctx->params_buf       offset:0 atIndex:2];
+        [encoder setBuffer:ctx->results_buf[buf] offset:0 atIndex:3];
+
+        NSUInteger threadWidth = ctx->pipeline.maxTotalThreadsPerThreadgroup;
+        if (threadWidth > 256) threadWidth = 256;
+        MTLSize gridSize = MTLSizeMake((NSUInteger)count, 1, 1);
+        MTLSize groupSize = MTLSizeMake(threadWidth, 1, 1);
+
+        [encoder dispatchThreads:gridSize
+           threadsPerThreadgroup:groupSize];
+        [encoder endEncoding];
+
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.error) {
+            fprintf(stderr, "Metal SHA-256: compute error: %s\n",
+                    [[cmdBuf.error localizedDescription] UTF8String]);
+            return -1;
+        }
+
+        /* Scan results for first match */
+        uint8_t *results = (uint8_t *)[ctx->results_buf[buf] contents];
+        for (int i = 0; i < count; i++) {
+            if (results[i])
+                return i;
+        }
+
+        return -1;
+    }
+}
+
+void metal_sha256_free(MetalSHA256Context *ctx)
+{
+    if (!ctx) return;
+    free(ctx);
+}

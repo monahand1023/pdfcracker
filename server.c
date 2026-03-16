@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <libgen.h>
+#include <dns_sd.h>
 
 /* ================================================================
  * Data Structures
@@ -127,6 +128,12 @@ static int g_listenfd = -1;
 
 /* Server binary directory (for serving files over HTTP) */
 static char g_server_dir[PATH_MAX] = ".";
+
+/* Start time (monotonic, for elapsed calculation) */
+static double g_start_time = 0;
+
+/* Bonjour service reference */
+static DNSServiceRef g_mdns_ref = NULL;
 
 /* ================================================================
  * Load PDF file into memory
@@ -551,20 +558,195 @@ static void http_serve_file(int fd, const char *path, const char *content_type)
     fclose(fp);
 }
 
+/* ================================================================
+ * JSON API endpoint — /api/status
+ * ================================================================ */
+static void http_serve_api_status(int fd)
+{
+    double now = mono_time();
+    long tested = atomic_load(&g_total_tested);
+    int found = atomic_load(&g_found);
+    long elapsed = (long)(now - g_start_time);
+
+    /* Sum per-client speeds */
+    double total_speed = 0;
+    pthread_mutex_lock(&g_clients_lock);
+    for (int i = 0; i < g_nclient_ids; i++) {
+        if (g_clients[i].active)
+            total_speed += g_clients[i].speed;
+    }
+
+    /* ETA */
+    long eta_secs = -1;
+    long speed = (long)total_speed;
+    if (speed > 0 && g_keyspace > tested)
+        eta_secs = (g_keyspace - tested) / speed;
+
+    double pct = 0;
+    if (g_keyspace > 0)
+        pct = (double)tested / (double)g_keyspace * 100.0;
+    if (pct > 100.0) pct = 100.0;
+
+    /* Build JSON in a buffer */
+    char body[8192];
+    int off = 0;
+    off += snprintf(body + off, sizeof(body) - (size_t)off,
+        "{\"progress_pct\":%.4f,\"tested\":%ld,\"speed\":%ld,"
+        "\"eta_secs\":%ld,\"keyspace\":%ld,\"elapsed\":%ld,"
+        "\"found\":%d,\"password\":\"%s\",\"clients\":[",
+        pct, tested, speed, eta_secs, g_keyspace, elapsed,
+        found, found ? g_password : "");
+
+    for (int i = 0; i < g_nclient_ids; i++) {
+        ClientInfo *ci = &g_clients[i];
+        if (ci->slot_free) continue;
+        int ago = ci->active ? (int)(now - ci->last_seen) : -1;
+        if (off > 0 && body[off - 1] == '}') {
+            off += snprintf(body + off, sizeof(body) - (size_t)off, ",");
+        }
+        off += snprintf(body + off, sizeof(body) - (size_t)off,
+            "{\"id\":%d,\"ip\":\"%s\",\"cores\":%d,\"speed\":%ld,"
+            "\"tested\":%ld,\"last_seen_ago\":%d,\"lease_id\":%llu,\"active\":%d}",
+            ci->id, ci->ip_str, ci->cores, (long)ci->speed,
+            ci->tested, ago,
+            (unsigned long long)ci->current_lease_id,
+            ci->active);
+    }
+    pthread_mutex_unlock(&g_clients_lock);
+
+    off += snprintf(body + off, sizeof(body) - (size_t)off, "]}");
+
+    dprintf(fd, "HTTP/1.0 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Content-Length: %d\r\n"
+                "\r\n%s", off, body);
+}
+
+/* ================================================================
+ * Web dashboard — /
+ * ================================================================ */
+static void http_serve_dashboard(int fd)
+{
+    static const char html[] =
+        "<!DOCTYPE html>\n"
+        "<html><head><meta charset=\"utf-8\">\n"
+        "<title>pdfcracker dashboard</title>\n"
+        "<style>\n"
+        "  * { box-sizing: border-box; margin: 0; padding: 0; }\n"
+        "  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;\n"
+        "         background: #0d1117; color: #c9d1d9; padding: 24px; }\n"
+        "  h1 { font-size: 1.4em; margin-bottom: 16px; color: #58a6ff; }\n"
+        "  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;\n"
+        "          padding: 16px; margin-bottom: 16px; }\n"
+        "  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); gap: 12px; }\n"
+        "  .stat-label { font-size: 0.75em; color: #8b949e; text-transform: uppercase; }\n"
+        "  .stat-value { font-size: 1.5em; font-weight: 600; color: #f0f6fc; }\n"
+        "  .bar-bg { background: #21262d; border-radius: 4px; height: 20px; margin: 12px 0; overflow: hidden; }\n"
+        "  .bar-fg { background: #238636; height: 100%; border-radius: 4px; transition: width 0.5s; }\n"
+        "  table { width: 100%; border-collapse: collapse; font-size: 0.9em; }\n"
+        "  th { text-align: left; color: #8b949e; font-weight: 500; padding: 8px 12px;\n"
+        "       border-bottom: 1px solid #30363d; }\n"
+        "  td { padding: 8px 12px; border-bottom: 1px solid #21262d; }\n"
+        "  tr:hover td { background: #1c2128; }\n"
+        "  .online { color: #3fb950; }\n"
+        "  .offline { color: #f85149; }\n"
+        "  .found { background: #238636; color: #fff; padding: 8px 16px; border-radius: 6px;\n"
+        "           font-size: 1.2em; font-weight: 700; display: none; text-align: center; }\n"
+        "</style>\n"
+        "</head><body>\n"
+        "<h1>pdfcracker dashboard</h1>\n"
+        "<div id=\"found\" class=\"found\"></div>\n"
+        "<div class=\"card\">\n"
+        "  <div class=\"bar-bg\"><div id=\"bar\" class=\"bar-fg\" style=\"width:0%\"></div></div>\n"
+        "  <div class=\"stats\">\n"
+        "    <div><div class=\"stat-label\">Progress</div><div class=\"stat-value\" id=\"pct\">--</div></div>\n"
+        "    <div><div class=\"stat-label\">Tested</div><div class=\"stat-value\" id=\"tested\">--</div></div>\n"
+        "    <div><div class=\"stat-label\">Speed</div><div class=\"stat-value\" id=\"speed\">--</div></div>\n"
+        "    <div><div class=\"stat-label\">ETA</div><div class=\"stat-value\" id=\"eta\">--</div></div>\n"
+        "    <div><div class=\"stat-label\">Elapsed</div><div class=\"stat-value\" id=\"elapsed\">--</div></div>\n"
+        "    <div><div class=\"stat-label\">Keyspace</div><div class=\"stat-value\" id=\"keyspace\">--</div></div>\n"
+        "  </div>\n"
+        "</div>\n"
+        "<div class=\"card\">\n"
+        "  <table><thead><tr>\n"
+        "    <th>ID</th><th>IP</th><th>Cores</th><th>Speed</th>\n"
+        "    <th>Lease</th><th>Tested</th><th>Last Seen</th><th>Status</th>\n"
+        "  </tr></thead><tbody id=\"clients\"></tbody></table>\n"
+        "</div>\n"
+        "<script>\n"
+        "function fmt(n) {\n"
+        "  if (n >= 1e9) return (n/1e9).toFixed(1)+'G';\n"
+        "  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';\n"
+        "  if (n >= 1e3) return (n/1e3).toFixed(1)+'K';\n"
+        "  return n.toString();\n"
+        "}\n"
+        "function ftime(s) {\n"
+        "  if (s < 0) return '---';\n"
+        "  if (s >= 3600) return Math.floor(s/3600)+'h'+String(Math.floor(s%3600/60)).padStart(2,'0')+'m';\n"
+        "  if (s >= 60) return Math.floor(s/60)+'m'+String(Math.floor(s%60)).padStart(2,'0')+'s';\n"
+        "  return Math.floor(s)+'s';\n"
+        "}\n"
+        "async function refresh() {\n"
+        "  try {\n"
+        "    const r = await fetch('/api/status');\n"
+        "    const d = await r.json();\n"
+        "    document.getElementById('pct').textContent = d.progress_pct.toFixed(2)+'%';\n"
+        "    document.getElementById('bar').style.width = Math.min(d.progress_pct,100)+'%';\n"
+        "    document.getElementById('tested').textContent = fmt(d.tested);\n"
+        "    document.getElementById('speed').textContent = fmt(d.speed)+'/s';\n"
+        "    document.getElementById('eta').textContent = ftime(d.eta_secs);\n"
+        "    document.getElementById('elapsed').textContent = ftime(d.elapsed);\n"
+        "    document.getElementById('keyspace').textContent = fmt(d.keyspace);\n"
+        "    if (d.found) {\n"
+        "      var el = document.getElementById('found');\n"
+        "      el.textContent = 'PASSWORD FOUND: ' + d.password;\n"
+        "      el.style.display = 'block';\n"
+        "    }\n"
+        "    var tb = document.getElementById('clients');\n"
+        "    tb.innerHTML = '';\n"
+        "    d.clients.forEach(function(c) {\n"
+        "      var tr = document.createElement('tr');\n"
+        "      var status = c.active ? '<span class=\"online\">online</span>' : '<span class=\"offline\">offline</span>';\n"
+        "      var seen = c.last_seen_ago >= 0 ? c.last_seen_ago+'s ago' : '---';\n"
+        "      tr.innerHTML = '<td>'+c.id+'</td><td>'+c.ip+'</td><td>'+c.cores+'</td>'\n"
+        "        +'<td>'+fmt(c.speed)+'/s</td><td>'+c.lease_id+'</td>'\n"
+        "        +'<td>'+fmt(c.tested)+'</td><td>'+seen+'</td><td>'+status+'</td>';\n"
+        "      tb.appendChild(tr);\n"
+        "    });\n"
+        "  } catch(e) {}\n"
+        "}\n"
+        "refresh();\n"
+        "setInterval(refresh, 2000);\n"
+        "</script>\n"
+        "</body></html>\n";
+
+    int body_len = (int)sizeof(html) - 1;  /* sizeof includes null terminator */
+    char hdr[128];
+    int hdr_len = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %d\r\n"
+        "\r\n", body_len);
+    write(fd, hdr, hdr_len);
+    write(fd, html, body_len);
+}
+
 static void handle_http_request(int fd, const char *request_line)
 {
-    /* Parse "GET /path HTTP/1.x" */
+    /* Parse "GET /path HTTP/1.x" — extract path between first / and next space */
     char path[256] = {0};
-    if (sscanf(request_line, "GET /%255s", path) < 1) {
-        /* GET / — serve a simple help page */
-        const char *body =
-            "pdfcracker - run this on any Mac to join:\n\n"
-            "  curl http://THIS_IP:THIS_PORT/join.sh | bash\n\n";
-        dprintf(fd, "HTTP/1.0 200 OK\r\n"
-                    "Content-Type: text/plain\r\n"
-                    "Content-Length: %zu\r\n"
-                    "\r\n%s", strlen(body), body);
-        return;
+    {
+        const char *start = strchr(request_line, '/');
+        if (start) {
+            start++;  /* skip the / */
+            const char *end = strchr(start, ' ');
+            if (!end) end = start + strlen(start);
+            size_t len = (size_t)(end - start);
+            if (len >= sizeof(path)) len = sizeof(path) - 1;
+            memcpy(path, start, len);
+            path[len] = '\0';
+        }
     }
 
     /* Drain remaining HTTP headers */
@@ -573,8 +755,16 @@ static void handle_http_request(int fd, const char *request_line)
         if (hdr[0] == '\0' || hdr[0] == '\r') break;
     }
 
+    /* GET / — serve the dashboard */
+    if (path[0] == '\0') {
+        http_serve_dashboard(fd);
+        return;
+    }
+
     /* Only serve known files */
-    if (strcmp(path, "client") == 0) {
+    if (strcmp(path, "api/status") == 0) {
+        http_serve_api_status(fd);
+    } else if (strcmp(path, "client") == 0) {
         char fpath[PATH_MAX];
         snprintf(fpath, sizeof(fpath), "%s/client", g_server_dir);
         http_serve_file(fd, fpath, "application/octet-stream");
@@ -1224,25 +1414,27 @@ static void print_bar(double pct)
 static void *progress_thread(void *arg)
 {
     (void)arg;
-    long   prev = 0;
-    double t0   = mono_time();
 
     while (!g_shutdown && !atomic_load(&g_found)) {
         struct timespec ts = {1, 0};
         nanosleep(&ts, NULL);
 
         long cur     = atomic_load(&g_total_tested);
-        long rate    = cur - prev;
-        prev         = cur;
         double now   = mono_time();
-        long elapsed = (long)(now - t0);
+        long elapsed = (long)(now - g_start_time);
 
-        /* Count active clients */
+        /* Count active clients and sum their speeds */
         int nactive = 0;
+        double total_speed = 0;
         pthread_mutex_lock(&g_clients_lock);
-        for (int i = 0; i < g_nclient_ids; i++)
-            if (g_clients[i].active) nactive++;
+        for (int i = 0; i < g_nclient_ids; i++) {
+            if (g_clients[i].active) {
+                nactive++;
+                total_speed += g_clients[i].speed;
+            }
+        }
         pthread_mutex_unlock(&g_clients_lock);
+        long rate = (long)total_speed;
 
         /* Clear line */
         fputs("\r\033[K", stderr);
@@ -1413,6 +1605,9 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* ── Record start time ─────────────────────────────────────── */
+    g_start_time = mono_time();
+
     /* ── Register signal handler ──────────────────────────────── */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -1446,7 +1641,18 @@ int main(int argc, char *argv[])
     if (listen(g_listenfd, 16) < 0) { perror("listen"); return 1; }
 
     fprintf(stderr, "\nListening on port %d\n", port);
-    fprintf(stderr, "Other Macs can join:  curl http://<this-ip>:%d/join.sh | bash\n\n", port);
+    fprintf(stderr, "Other Macs can join:  curl http://<this-ip>:%d/join.sh | bash\n", port);
+
+    /* ── Register Bonjour/mDNS service ────────────────────────── */
+    DNSServiceErrorType mdns_err = DNSServiceRegister(
+        &g_mdns_ref, 0, 0, NULL, "_pdfcracker._tcp",
+        NULL, NULL, htons((uint16_t)port), 0, NULL, NULL, NULL);
+    if (mdns_err == kDNSServiceErr_NoError) {
+        fprintf(stderr, "Bonjour: registered _pdfcracker._tcp on port %d\n\n", port);
+    } else {
+        fprintf(stderr, "Bonjour: registration failed (error %d), continuing without mDNS\n\n",
+                mdns_err);
+    }
 
     /* ── Spawn local client (cracks on this machine too) ──────── */
     pid_t local_client_pid = -1;
@@ -1505,6 +1711,12 @@ int main(int argc, char *argv[])
     g_shutdown = 1;
     broadcast_abort();
     save_checkpoint();
+
+    /* Deregister Bonjour */
+    if (g_mdns_ref) {
+        DNSServiceRefDeallocate(g_mdns_ref);
+        g_mdns_ref = NULL;
+    }
 
     /* Stop local client */
     if (local_client_pid > 0) {

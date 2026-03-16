@@ -900,3 +900,135 @@ int pdf_verify_password(const PDFEncryptParams *params, const char *password)
     return pdf_verify_user_password(params, password) ||
            pdf_verify_owner_password(params, password);
 }
+
+/* ================================================================
+ * ARM NEON SIMD batch verification: 4 user passwords in parallel
+ * ================================================================ */
+#ifdef __ARM_NEON
+#include "md5_simd.h"
+
+int pdf_verify_user_batch4(const PDFEncryptParams *params,
+                           const char *pw[4], int pwlen[4])
+{
+    if (!params->valid) return 0;
+    if (params->revision < 2 || params->revision > 4) return 0;
+
+    int key_bytes = params->key_length / 8;
+    if (key_bytes < 5)  key_bytes = 5;
+    if (key_bytes > 16) key_bytes = 16;
+
+    /* ── Algorithm 2 (key derivation) for all 4 passwords ──────── */
+
+    /* Step a: Pad each password to 32 bytes */
+    uint8_t padded[4][32];
+    for (int i = 0; i < 4; i++) {
+        int plen = pwlen[i];
+        if (plen > 32) plen = 32;
+        if (plen > 0) memcpy(padded[i], pw[i], (size_t)plen);
+        if (plen < 32) memcpy(padded[i] + plen, PDF_PASSWORD_PADDING, (size_t)(32 - plen));
+    }
+
+    /* Steps b-f: Build the MD5 input for each password.
+     * Input = padded(32) + O(32) + P(4) + fileID(N) [+ 0xFFFFFFFF if R>=4 && !encryptMeta]
+     * All 4 share the same O, P, fileID, so they differ only in the first 32 bytes. */
+    uint8_t p_bytes[4];
+    int32_t perm = params->permissions;
+    p_bytes[0] = (uint8_t)(perm & 0xFF);
+    p_bytes[1] = (uint8_t)((perm >> 8) & 0xFF);
+    p_bytes[2] = (uint8_t)((perm >> 16) & 0xFF);
+    p_bytes[3] = (uint8_t)((perm >> 24) & 0xFF);
+
+    int extra = (params->revision >= 4 && !params->encrypt_metadata) ? 4 : 0;
+    size_t msg_len = 32 + 32 + 4 + (size_t)params->file_id_len + (size_t)extra;
+
+    /* Build message buffers (max ~116 bytes each, well within md5_x4 limits) */
+    uint8_t msg[4][256];
+    for (int i = 0; i < 4; i++) {
+        size_t off = 0;
+        memcpy(msg[i] + off, padded[i], 32); off += 32;
+        memcpy(msg[i] + off, params->o_value, 32); off += 32;
+        memcpy(msg[i] + off, p_bytes, 4); off += 4;
+        memcpy(msg[i] + off, params->file_id, (size_t)params->file_id_len);
+        off += (size_t)params->file_id_len;
+        if (extra) {
+            uint8_t ff[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+            memcpy(msg[i] + off, ff, 4);
+        }
+    }
+
+    /* Initial MD5 hash (4-way SIMD) */
+    const uint8_t *ptrs[4] = { msg[0], msg[1], msg[2], msg[3] };
+    size_t lens[4] = { msg_len, msg_len, msg_len, msg_len };
+    uint8_t hash[4][16];
+    md5_x4(ptrs, lens, hash);
+
+    /* Step g: For R >= 3, iterate MD5 50 times on first key_bytes */
+    if (params->revision >= 3) {
+        uint8_t buf[4][64]; /* key_bytes <= 16, fits in single block */
+        for (int iter = 0; iter < 50; iter++) {
+            for (int i = 0; i < 4; i++)
+                memcpy(buf[i], hash[i], (size_t)key_bytes);
+            md5_x4_short(buf, (size_t)key_bytes, hash);
+        }
+    }
+
+    /* Now hash[i] contains the encryption key for password i */
+    uint8_t keys[4][16];
+    for (int i = 0; i < 4; i++)
+        memcpy(keys[i], hash[i], (size_t)key_bytes);
+
+    /* ── RC4 verification (per-password, cannot be vectorized) ─── */
+    int result = 0;
+
+    if (params->revision == 2) {
+        /* Algorithm 4: RC4-encrypt padding, compare 32 bytes */
+        for (int i = 0; i < 4; i++) {
+            uint8_t computed_u[32];
+            size_t out_len = 32;
+            CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
+                    keys[i], (size_t)key_bytes,
+                    NULL, PDF_PASSWORD_PADDING, 32,
+                    computed_u, 32, &out_len);
+            if (memcmp(computed_u, params->u_value, 32) == 0)
+                result |= (1 << i);
+        }
+    } else {
+        /* Algorithm 5 (R3/R4): MD5(padding+fileID), 20 RC4 passes, compare 16 bytes.
+         * The initial MD5(padding+fileID) is the same for all 4, compute once. */
+        CC_MD5_CTX md5ctx;
+        CC_MD5_Init(&md5ctx);
+        CC_MD5_Update(&md5ctx, PDF_PASSWORD_PADDING, 32);
+        CC_MD5_Update(&md5ctx, params->file_id, (CC_LONG)params->file_id_len);
+        uint8_t base_hash[16];
+        CC_MD5_Final(base_hash, &md5ctx);
+
+        for (int i = 0; i < 4; i++) {
+            uint8_t encrypted[16];
+            size_t out_len = 16;
+            CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
+                    keys[i], (size_t)key_bytes,
+                    NULL, base_hash, 16,
+                    encrypted, 16, &out_len);
+
+            for (int r = 1; r <= 19; r++) {
+                uint8_t mod_key[16];
+                for (int j = 0; j < key_bytes; j++)
+                    mod_key[j] = keys[i][j] ^ (uint8_t)r;
+                uint8_t temp[16];
+                out_len = 16;
+                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
+                        mod_key, (size_t)key_bytes,
+                        NULL, encrypted, 16,
+                        temp, 16, &out_len);
+                memcpy(encrypted, temp, 16);
+            }
+
+            if (memcmp(encrypted, params->u_value, 16) == 0)
+                result |= (1 << i);
+        }
+    }
+
+    return result;
+}
+
+#endif /* __ARM_NEON */
