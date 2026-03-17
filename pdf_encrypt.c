@@ -891,6 +891,18 @@ int pdf_verify_user_password(const PDFEncryptParams *params, const char *passwor
  * Recover the user password from the O value using the owner password,
  * then verify it as a user password.
  * ================================================================ */
+static inline void rc4_owner_decrypt(const uint8_t *key, int key_len, uint8_t data[32])
+{
+    for (int r = 19; r >= 0; r--) {
+        uint8_t mod_key[16];
+        for (int j = 0; j < key_len; j++)
+            mod_key[j] = key[j] ^ (uint8_t)r;
+        uint8_t temp[32];
+        rc4_encrypt(mod_key, key_len, data, temp, 32);
+        memcpy(data, temp, 32);
+    }
+}
+
 int pdf_verify_owner_password(const PDFEncryptParams *params, const char *password)
 {
     if (!params->valid) return 0;
@@ -928,14 +940,7 @@ int pdf_verify_owner_password(const PDFEncryptParams *params, const char *passwo
     } else {
         /* R3/R4: 20 RC4 passes in reverse (19 down to 0) */
         memcpy(user_pass, params->o_value, 32);
-        for (int i = 19; i >= 0; i--) {
-            uint8_t mod_key[16];
-            for (int j = 0; j < key_bytes; j++)
-                mod_key[j] = key[j] ^ (uint8_t)i;
-            uint8_t temp[32];
-            rc4_encrypt(mod_key, key_bytes, user_pass, temp, 32);
-            memcpy(user_pass, temp, 32);
-        }
+        rc4_owner_decrypt(key, key_bytes, user_pass);
     }
 
     /* Step e: The recovered value is the padded user password.
@@ -992,12 +997,8 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
 
     /* Step a: Pad each password to 32 bytes */
     uint8_t padded[4][32];
-    for (int i = 0; i < 4; i++) {
-        int plen = pwlen[i];
-        if (plen > 32) plen = 32;
-        if (plen > 0) memcpy(padded[i], pw[i], (size_t)plen);
-        if (plen < 32) memcpy(padded[i] + plen, PDF_PASSWORD_PADDING, (size_t)(32 - plen));
-    }
+    for (int i = 0; i < 4; i++)
+        pad_password(pw[i], padded[i]);
 
     /* Steps b-f: Build the MD5 input for each password.
      * Input = padded(32) + O(32) + P(4) + fileID(N) [+ 0xFFFFFFFF if R>=4 && !encryptMeta]
@@ -1111,12 +1112,8 @@ int pdf_verify_owner_batch4(const PDFEncryptParams *params,
 
     /* Step a: Pad each owner password to 32 bytes */
     uint8_t padded[4][32];
-    for (int i = 0; i < 4; i++) {
-        int plen = pwlen[i];
-        if (plen > 32) plen = 32;
-        if (plen > 0) memcpy(padded[i], pw[i], (size_t)plen);
-        if (plen < 32) memcpy(padded[i] + plen, PDF_PASSWORD_PADDING, (size_t)(32 - plen));
-    }
+    for (int i = 0; i < 4; i++)
+        pad_password(pw[i], padded[i]);
 
     /* Step b: MD5 hash of padded password (4-way SIMD) */
     const uint8_t *ptrs[4] = { padded[0], padded[1], padded[2], padded[3] };
@@ -1151,14 +1148,7 @@ int pdf_verify_owner_batch4(const PDFEncryptParams *params,
         } else {
             /* R3/R4: 20 RC4 passes in reverse (19 down to 0) */
             memcpy(user_pass, params->o_value, 32);
-            for (int r = 19; r >= 0; r--) {
-                uint8_t mod_key[16];
-                for (int j = 0; j < key_bytes; j++)
-                    mod_key[j] = keys[i][j] ^ (uint8_t)r;
-                uint8_t temp[32];
-                rc4_encrypt(mod_key, key_bytes, user_pass, temp, 32);
-                memcpy(user_pass, temp, 32);
-            }
+            rc4_owner_decrypt(keys[i], key_bytes, user_pass);
         }
 
         /* Convert recovered padded user password to string */

@@ -2889,15 +2889,20 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
         int user_match = 0;
 
         if (g_enc_params.revision == 2) {
-            /* Algorithm 4: RC4-encrypt padding, compare all 32 bytes of U */
-            /* Early first-byte exit: reject 255/256 candidates instantly */
-            if (rc4_first_byte(key, key_bytes, PDF_PASSWORD_PADDING[0])
-                != g_enc_params.u_value[0])
-                continue;
-            uint8_t computed_u[32];
-            rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, computed_u, 32);
-            if (memcmp(computed_u, g_enc_params.u_value, 32) == 0)
-                user_match = 1;
+            /* Algorithm 4: RC4-encrypt padding, compare all 32 bytes of U.
+             * Early first-byte exit for user/both modes only — owner mode uses
+             * a different key derivation (Algorithm 3) so the GPU-derived user
+             * key will never match the user check; skip it and fall through to
+             * the owner verify below. */
+            if (g_password_mode != PW_MODE_OWNER) {
+                if (rc4_first_byte(key, key_bytes, PDF_PASSWORD_PADDING[0])
+                    == g_enc_params.u_value[0]) {
+                    uint8_t computed_u[32];
+                    rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, computed_u, 32);
+                    if (memcmp(computed_u, g_enc_params.u_value, 32) == 0)
+                        user_match = 1;
+                }
+            }
         } else {
             /* Algorithm 5: RC4 with pre-computed MD5(padding+fileID),
              * 20 RC4 passes, compare 16 bytes */
@@ -5782,15 +5787,153 @@ static const char *g_common_names[] = {
     "harry","judy","vincent","sophia","bobby","grace","dylan","denise",
     "billy","amber","joe","howard","carlos","marilyn","russell","beverly",
     "alan","theresa","wayne","natalie","elijah","diana",
+    /* Common short names / nicknames */
+    "dan","bob","tom","jim","joe","ben","sam","tim","jon","mike",
+    "matt","chris","dave","steve","bill","rick","jeff","nick","rob","pat",
+    "ted","ed","al","ray","ken","ron","don","lee","max","jake",
+    "luke","alex","kate","beth","sue","ann","jen","amy","meg","kim",
+    "liz","pam","deb","val","jan","kay","joy","eve","ivy","mae",
     NULL
 };
 
 /* ================================================================
- * Smart attack: intelligent multi-phase attack
+ * Smart attack: intelligent multi-phase attack (Passware-style)
  *
- * Analyzes PDF metadata/filename, generates targeted candidates,
- * then falls through progressively broader strategies.
+ * Phases ordered by probability × speed:
+ *  0. Metadata + filename seeds (instant)
+ *  1. Common passwords (instant)
+ *  2. Seed mutations: word+digits, word+year, word+symbols (instant)
+ *  3. PINs 1-8 digits (seconds)
+ *  4. Date patterns in all formats (seconds)
+ *  5. Keyboard walks (seconds)
+ *  6. Name + short suffix: name+digit, name+year, Name!, etc. (seconds)
+ *  7. NAME + FULL DATE combos: all case × all date formats (~56M, ~4 min)
+ *  8. Reversed dictionary words (if -d provided)
+ *  9. Dictionary + rules (if -d provided)
+ * 10. Short brute-force: digits 1-8, lower 1-6, alnum 1-5 (minutes-hours)
+ * 11. Alphanumeric brute 6-7 (days — last resort)
  * ================================================================ */
+
+/* Helper: try one candidate, return 1 if found */
+static inline int smart_try(const char *pw)
+{
+    if (test_password_fast(pw)) {
+        if (!atomic_exchange(&g_found, 1))
+            strncpy(g_password, pw, MAX_PASS_LEN);
+        return 1;
+    }
+    atomic_fetch_add(&g_tested, 1);
+    return 0;
+}
+
+/* ── Smart dispatch: verify a generated word list through GPU+NEON dict workers ── */
+#define SMART_CHUNK_SIZE 65536
+
+static void smart_dict_dispatch(char **words, long nwords,
+                                int nthreads, pthread_t *threads)
+{
+    if (nwords <= 0 || atomic_load(&g_found)) return;
+
+    /* Save existing dict state */
+    char **saved_words = g_words;
+    long saved_nwords = g_nwords;
+    int saved_reverse = g_reverse_mode;
+
+    /* Point dict infrastructure at our generated words */
+    g_words = words;
+    g_nwords = nwords;
+    g_reverse_mode = 0;  /* no reverse for generated candidates */
+
+    atomic_store(&g_tested, 0);
+    atomic_store(&g_total, nwords);
+    atomic_store(&g_next_idx, 0);
+
+    int spawned = 0;
+
+    /* Launch GPU worker.
+     * For R3/R4 (RC4) dict batches, NEON processes ~240K/s while GPU does
+     * ~9K/s effective throughput (high per-dispatch overhead).  If NEON is
+     * available, skip GPU unless the batch is large enough to amortize GPU
+     * setup cost — or we're running an R6 / SHA-256 PDF where GPU shines. */
+    int neon_available = 0;
+#ifdef __ARM_NEON
+    neon_available = g_use_neon && g_fast_crypto;
+#endif
+    int gpu_useful = !neon_available          /* no NEON → always use GPU */
+                  || g_r6_ctx                 /* R6 AES-256: GPU wins     */
+                  || g_sha256_ctx             /* SHA-256 variant           */
+                  || (nwords >= GPU_BATCH_SIZE * 20); /* large batch       */
+    if (g_use_gpu && g_gpu_ctx && gpu_useful) {
+        pthread_create(&threads[spawned++], NULL,
+                       g_r6_ctx ? gpu_r6_dict_worker :
+                       g_sha256_ctx ? gpu_sha256_dict_worker :
+                       gpu_dict_worker, NULL);
+    }
+
+    /* Launch NEON/scalar dict workers */
+    int limit = nthreads < (int)nwords ? nthreads : (int)nwords;
+    void *(*dict_fn)(void *) = dict_worker;
+#ifdef __ARM_NEON
+    if (g_use_neon && g_fast_crypto) dict_fn = dict_worker_neon;
+#endif
+    for (int t = 0; t < limit; t++) {
+        DictArg *a = malloc(sizeof(DictArg));
+        a->id = t;
+        a->use_shared = 1;  /* always use shared atomic counter */
+        pthread_create(&threads[spawned++], NULL, dict_fn, a);
+    }
+
+    for (int t = 0; t < spawned; t++)
+        pthread_join(threads[t], NULL);
+
+    /* Restore dict state */
+    g_words = saved_words;
+    g_nwords = saved_nwords;
+    g_reverse_mode = saved_reverse;
+}
+
+/* Helper: run a brute-force sub-phase with given charset and length range */
+static void smart_brute_phase(const char *charset, int cs_len,
+                              int min_len, int max_len,
+                              int nthreads, pthread_t *threads)
+{
+    const char *saved_cs = g_charset;
+    int saved_cs_len = g_cs_len;
+    void (*saved_fn)(long, int, char *) = g_idx_to_pass;
+    g_charset = charset;
+    g_cs_len = cs_len;
+    build_next_char_lut();
+    g_idx_to_pass = index_to_pass;
+
+    for (int len = min_len; len <= max_len && !atomic_load(&g_found); len++) {
+        long total = 1;
+        for (int i = 0; i < len; i++) total *= cs_len;
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, total);
+        atomic_store(&g_next_idx, 0);
+        int sp = 0;
+        if (g_use_gpu && g_gpu_ctx) {
+            GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
+            *ga = (GPUBruteArg){ .length = len, .total = total };
+            pthread_create(&threads[sp++], NULL, gpu_brute_worker, ga);
+        }
+        void *(*worker_fn)(void *) = brute_worker;
+#ifdef __ARM_NEON
+        if (g_use_neon) worker_fn = brute_worker_neon;
+#endif
+        for (int t = 0; t < nthreads; t++) {
+            BruteArg *a = malloc(sizeof(BruteArg));
+            *a = (BruteArg){ .id = t, .length = len,
+                             .start = 0, .end = total, .use_shared = 1 };
+            pthread_create(&threads[sp++], NULL, worker_fn, a);
+        }
+        for (int t = 0; t < sp; t++) pthread_join(threads[t], NULL);
+    }
+    g_charset = saved_cs;
+    g_cs_len = saved_cs_len;
+    g_idx_to_pass = saved_fn;
+}
+
 static int run_smart_attack(int nthreads, pthread_t *threads, int *spawned_out)
 {
     fprintf(stderr, "Mode   : smart (intelligent multi-phase attack)\n");
@@ -5801,7 +5944,6 @@ static int run_smart_attack(int nthreads, pthread_t *threads, int *spawned_out)
     int file_count = extract_filename_seeds(g_pdf_path, &file_seeds);
     int total_seeds = meta_count + file_count;
 
-    /* Merge seeds into one array */
     char **all_seeds = malloc(sizeof(char *) * (size_t)(total_seeds + 1));
     int seed_count = 0;
     if (all_seeds) {
@@ -5811,277 +5953,334 @@ static int run_smart_attack(int nthreads, pthread_t *threads, int *spawned_out)
     free(meta_seeds);
     free(file_seeds);
 
+    char pw[MAX_PASS_LEN + 1];
+    int phase = 0;
+
     /* ── Phase 0: Metadata + filename seeds (direct) ────────── */
-    if (seed_count > 0) {
-        fprintf(stderr, "  Phase 0: metadata + filename seeds (%d candidates)...\n", seed_count);
-        for (int i = 0; i < seed_count && !atomic_load(&g_found); i++) {
-            if (test_password_fast(all_seeds[i])) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, all_seeds[i], MAX_PASS_LEN);
-                goto smart_done;
-            }
-            atomic_fetch_add(&g_tested, 1);
-        }
+    if (seed_count > 0 && !atomic_load(&g_found)) {
+        fprintf(stderr, "  Phase %d: metadata + filename seeds (%d candidates)...\n", phase, seed_count);
+        for (int i = 0; i < seed_count && !atomic_load(&g_found); i++)
+            if (smart_try(all_seeds[i])) goto smart_done;
     }
+    phase++;
 
     /* ── Phase 1: Common passwords ──────────────────────────── */
     if (!atomic_load(&g_found)) {
         int n_common = 0;
         for (int i = 0; g_fingerprint_passwords[i]; i++) n_common++;
-        fprintf(stderr, "  Phase 1: common passwords (%d)...\n", n_common);
-        for (int i = 0; g_fingerprint_passwords[i] && !atomic_load(&g_found); i++) {
-            if (test_password_fast(g_fingerprint_passwords[i])) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, g_fingerprint_passwords[i], MAX_PASS_LEN);
-                goto smart_done;
-            }
-            atomic_fetch_add(&g_tested, 1);
-        }
+        fprintf(stderr, "  Phase %d: common passwords (%d)...\n", phase, n_common);
+        for (int i = 0; g_fingerprint_passwords[i] && !atomic_load(&g_found); i++)
+            if (smart_try(g_fingerprint_passwords[i])) goto smart_done;
     }
+    phase++;
 
-    /* ── Phase 2: Metadata/filename mutations ───────────────── */
+    /* ── Phase 2: Seed mutations ────────────────────────────── */
     if (!atomic_load(&g_found) && seed_count > 0) {
-        fprintf(stderr, "  Phase 2: seed mutations (%d seeds x ~100 mutations)...\n", seed_count);
-        char pw[MAX_PASS_LEN + 1];
+        fprintf(stderr, "  Phase %d: seed mutations (%d seeds)...\n", phase, seed_count);
         for (int s = 0; s < seed_count && !atomic_load(&g_found); s++) {
             const char *seed = all_seeds[s];
             size_t slen = strlen(seed);
-            if (slen == 0 || slen > MAX_PASS_LEN - 4) continue;
+            if (slen == 0 || slen > MAX_PASS_LEN - 8) continue;
 
-            /* Variants: original, capitalized, reversed */
-            char variants[3][MAX_PASS_LEN + 1];
+            /* Case variants: original, Capitalized, UPPER, lower */
+            char variants[4][MAX_PASS_LEN + 1];
             int nvariants = 0;
 
             strncpy(variants[nvariants++], seed, MAX_PASS_LEN);
+            variants[nvariants - 1][MAX_PASS_LEN] = '\0';
 
             /* Capitalized */
             strncpy(variants[nvariants], seed, MAX_PASS_LEN);
+            variants[nvariants][MAX_PASS_LEN] = '\0';
             variants[nvariants][0] = (char)toupper((unsigned char)variants[nvariants][0]);
-            if (strcmp(variants[nvariants], seed) != 0) nvariants++;
+            if (strcmp(variants[nvariants], variants[0]) != 0) nvariants++;
 
-            /* Reversed */
-            reverse_string(seed, variants[nvariants], slen);
-            if (strcmp(variants[nvariants], seed) != 0) nvariants++;
+            /* UPPER */
+            for (size_t c = 0; c < slen && c < MAX_PASS_LEN; c++)
+                variants[nvariants][c] = (char)toupper((unsigned char)seed[c]);
+            variants[nvariants][slen] = '\0';
+            if (strcmp(variants[nvariants], variants[0]) != 0 &&
+                (nvariants < 2 || strcmp(variants[nvariants], variants[1]) != 0))
+                nvariants++;
+
+            /* lower */
+            for (size_t c = 0; c < slen && c < MAX_PASS_LEN; c++)
+                variants[nvariants][c] = (char)tolower((unsigned char)seed[c]);
+            variants[nvariants][slen] = '\0';
+            if (strcmp(variants[nvariants], variants[0]) != 0)
+                nvariants++;
 
             for (int v = 0; v < nvariants && !atomic_load(&g_found); v++) {
                 const char *base = variants[v];
                 size_t blen = strlen(base);
-
+                /* base alone */
+                if (smart_try(base)) goto smart_done;
                 /* base + digit 0-9 */
                 for (int d = 0; d <= 9 && !atomic_load(&g_found); d++) {
                     snprintf(pw, sizeof(pw), "%s%d", base, d);
-                    if (test_password_fast(pw)) {
-                        if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN);
-                        goto smart_done;
-                    }
-                    atomic_fetch_add(&g_tested, 1);
+                    if (smart_try(pw)) goto smart_done;
                 }
-                /* base + year 2000-2026 */
-                for (int y = 2000; y <= 2026 && !atomic_load(&g_found); y++) {
+                /* base + 2-digit 00-99 */
+                for (int d = 0; d <= 99 && !atomic_load(&g_found); d++) {
+                    snprintf(pw, sizeof(pw), "%s%02d", base, d);
+                    if (smart_try(pw)) goto smart_done;
+                }
+                /* base + year 1950-2026 */
+                for (int y = 2026; y >= 1950 && !atomic_load(&g_found); y--) {
                     if (blen + 4 > MAX_PASS_LEN) break;
                     snprintf(pw, sizeof(pw), "%s%d", base, y);
-                    if (test_password_fast(pw)) {
-                        if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN);
-                        goto smart_done;
-                    }
-                    atomic_fetch_add(&g_tested, 1);
+                    if (smart_try(pw)) goto smart_done;
                 }
                 /* base + common suffixes */
-                static const char *suffixes[] = { "!", "@", "#", "123", "1234", "!", "1", "12", NULL };
+                static const char *suffixes[] = {
+                    "!", "@", "#", "$", "123", "1234", "12345", "123456",
+                    "1!", "12!", "123!", "1234!", NULL
+                };
                 for (int i = 0; suffixes[i] && !atomic_load(&g_found); i++) {
                     if (blen + strlen(suffixes[i]) > MAX_PASS_LEN) continue;
                     snprintf(pw, sizeof(pw), "%s%s", base, suffixes[i]);
-                    if (test_password_fast(pw)) {
-                        if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN);
-                        goto smart_done;
-                    }
-                    atomic_fetch_add(&g_tested, 1);
+                    if (smart_try(pw)) goto smart_done;
+                }
+                /* Reversed variant */
+                if (blen > 1 && blen <= MAX_PASS_LEN) {
+                    char rev[MAX_PASS_LEN + 1];
+                    reverse_string(base, rev, blen);
+                    if (strcmp(rev, base) != 0 && smart_try(rev)) goto smart_done;
                 }
             }
         }
     }
+    phase++;
 
-    /* ── Phase 3: Keyboard walks ────────────────────────────── */
+    /* ── Phase 3: User-provided dictionary (if -d given) ─────── */
+    if (!atomic_load(&g_found) && g_words && g_nwords > 0) {
+        /* Forward words via GPU+NEON dispatch */
+        fprintf(stderr, "  Phase %d: user dictionary words (%ld, GPU+NEON)...\n", phase, g_nwords);
+        smart_dict_dispatch(g_words, g_nwords, nthreads, threads);
+        phase++;
+
+        /* Reversed words — pre-generate and dispatch */
+        if (!atomic_load(&g_found)) {
+            char **rev_words = malloc((size_t)g_nwords * sizeof(char *));
+            if (rev_words) {
+                long rev_count = 0;
+                for (long i = 0; i < g_nwords; i++) {
+                    size_t wlen = strlen(g_words[i]);
+                    if (wlen > 1 && wlen <= MAX_PASS_LEN) {
+                        char *rev = malloc(wlen + 1);
+                        if (rev) {
+                            reverse_string(g_words[i], rev, wlen);
+                            if (strcmp(rev, g_words[i]) != 0)
+                                rev_words[rev_count++] = rev;
+                            else
+                                free(rev);
+                        }
+                    }
+                }
+                if (rev_count > 0) {
+                    fprintf(stderr, "  Phase %d: user dictionary reversed (%ld, GPU+NEON)...\n", phase, rev_count);
+                    smart_dict_dispatch(rev_words, rev_count, nthreads, threads);
+                }
+                for (long i = 0; i < rev_count; i++) free(rev_words[i]);
+                free(rev_words);
+            }
+        }
+        phase++;
+    }
+
+    /* ── Phase N: PINs 1-8 digits ───────────────────────────── */
     if (!atomic_load(&g_found)) {
-        fprintf(stderr, "  Phase 3: keyboard walks...\n");
+        fprintf(stderr, "  Phase %d: PINs (1-8 digits, 111M candidates)...\n", phase);
+        smart_brute_phase("0123456789", 10, 1, 8, nthreads, threads);
+    }
+    phase++;
+
+    /* ── Phase 4: Date patterns (multi-threaded GPU+NEON) ──── */
+    if (!atomic_load(&g_found)) {
+        fprintf(stderr, "  Phase %d: date patterns (1940-2026, all formats, GPU+NEON)...\n", phase);
+        /* Pre-generate all date candidates: 87 years × ~365 days × 6 formats + 87 years ≈ 191K */
+        #define DATE_MAX 200000
+        typedef char DateEntry[12]; /* max "MMDDYYYY" = 8 + NUL */
+        DateEntry *dp_buf = malloc((size_t)DATE_MAX * sizeof(DateEntry));
+        char **dp_ptrs = malloc((size_t)DATE_MAX * sizeof(char *));
+        if (dp_buf && dp_ptrs) {
+            for (int i = 0; i < DATE_MAX; i++) dp_ptrs[i] = dp_buf[i];
+            int dp_count = 0;
+            for (int y = 2026; y >= 1940; y--) {
+                for (int m = 1; m <= 12; m++) {
+                    int dim = 31;
+                    if (m == 2) dim = (y % 4 == 0) ? 29 : 28;
+                    else if (m == 4 || m == 6 || m == 9 || m == 11) dim = 30;
+                    for (int d = 1; d <= dim && dp_count < DATE_MAX - 6; d++) {
+                        snprintf(dp_buf[dp_count++], 12, "%04d%02d%02d", y, m, d);
+                        snprintf(dp_buf[dp_count++], 12, "%02d%02d%04d", m, d, y);
+                        snprintf(dp_buf[dp_count++], 12, "%02d%02d%04d", d, m, y);
+                        snprintf(dp_buf[dp_count++], 12, "%02d%02d", m, d);
+                        snprintf(dp_buf[dp_count++], 12, "%02d%02d%02d", m, d, y % 100);
+                        snprintf(dp_buf[dp_count++], 12, "%02d%02d%02d", d, m, y % 100);
+                    }
+                }
+                if (dp_count < DATE_MAX)
+                    snprintf(dp_buf[dp_count++], 12, "%04d", y);
+            }
+            smart_dict_dispatch(dp_ptrs, dp_count, nthreads, threads);
+        }
+        free(dp_buf);
+        free(dp_ptrs);
+    }
+    phase++;
+
+    /* ── Phase 5: Keyboard walks (multi-threaded GPU+NEON) ── */
+    if (!atomic_load(&g_found)) {
+        fprintf(stderr, "  Phase %d: keyboard walks (GPU+NEON)...\n", phase);
         typedef char KWEntry[MAX_PASS_LEN + 1];
         KWEntry *kw_walks = malloc(50000 * sizeof(KWEntry));
         if (kw_walks) {
             int nwalks = keywalk_generate(kw_walks, 50000);
-            for (int i = 0; i < nwalks && !atomic_load(&g_found); i++) {
-                if (test_password_fast(kw_walks[i])) {
-                    if (!atomic_exchange(&g_found, 1))
-                        strncpy(g_password, kw_walks[i], MAX_PASS_LEN);
-                    free(kw_walks);
-                    goto smart_done;
-                }
-                atomic_fetch_add(&g_tested, 1);
+            /* Build pointer array for dispatch */
+            char **kw_ptrs = malloc((size_t)nwalks * sizeof(char *));
+            if (kw_ptrs) {
+                for (int i = 0; i < nwalks; i++) kw_ptrs[i] = kw_walks[i];
+                smart_dict_dispatch(kw_ptrs, nwalks, nthreads, threads);
+                free(kw_ptrs);
             }
             free(kw_walks);
         }
     }
+    phase++;
 
-    /* ── Phase 4: Date patterns ─────────────────────────────── */
-    if (!atomic_load(&g_found)) {
-        fprintf(stderr, "  Phase 4: date patterns (1950-2026)...\n");
-        char datepw[16];
-        for (int y = 2026; y >= 1950 && !atomic_load(&g_found); y--) {
-            for (int m = 1; m <= 12 && !atomic_load(&g_found); m++) {
-                int dim = 31;
-                if (m == 2) dim = (y % 4 == 0) ? 29 : 28;
-                else if (m == 4 || m == 6 || m == 9 || m == 11) dim = 30;
-                for (int d = 1; d <= dim && !atomic_load(&g_found); d++) {
-                    snprintf(datepw, sizeof(datepw), "%04d%02d%02d", y, m, d);
-                    if (test_password_fast(datepw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN); goto smart_done; }
-                    snprintf(datepw, sizeof(datepw), "%02d%02d%04d", m, d, y);
-                    if (test_password_fast(datepw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN); goto smart_done; }
-                    snprintf(datepw, sizeof(datepw), "%02d%02d%04d", d, m, y);
-                    if (test_password_fast(datepw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN); goto smart_done; }
-                    snprintf(datepw, sizeof(datepw), "%02d%02d", m, d);
-                    if (test_password_fast(datepw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN); goto smart_done; }
-                    atomic_fetch_add(&g_tested, 4);
-                }
-            }
-            snprintf(datepw, sizeof(datepw), "%04d", y);
-            if (test_password_fast(datepw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN); goto smart_done; }
-            atomic_fetch_add(&g_tested, 1);
-        }
-    }
-
-    /* ── Phase 5: Reversed dictionary (if -d provided) ──────── */
-    if (!atomic_load(&g_found) && g_words && g_nwords > 0) {
-        fprintf(stderr, "  Phase 5: reversed dictionary words (%ld)...\n", g_nwords);
-        char rev[MAX_PASS_LEN + 1];
-        for (long i = 0; i < g_nwords && !atomic_load(&g_found); i++) {
-            size_t wlen = strlen(g_words[i]);
-            if (wlen > 0 && wlen <= MAX_PASS_LEN) {
-                reverse_string(g_words[i], rev, wlen);
-                if (strcmp(rev, g_words[i]) != 0 && test_password_fast(rev)) {
-                    if (!atomic_exchange(&g_found, 1))
-                        strncpy(g_password, rev, MAX_PASS_LEN);
-                    goto smart_done;
-                }
-            }
-            atomic_fetch_add(&g_tested, 1);
-        }
-    }
-
-    /* ── Phase 6: Common name + year/digit patterns ─────────── */
+    /* ── Phase 6: Name + short suffix (multi-threaded GPU+NEON) ── */
     if (!atomic_load(&g_found)) {
         int n_names = 0;
         for (int i = 0; g_common_names[i]; i++) n_names++;
-        long pattern_est = (long)n_names * (27 + 10 + 3) * 2;
-        char num_buf[16];
-        fmt_num(pattern_est, num_buf, sizeof(num_buf));
-        fprintf(stderr, "  Phase 6: name patterns (%d names, ~%s candidates)...\n",
-                n_names, num_buf);
-        char pw[MAX_PASS_LEN + 1];
-        for (int i = 0; g_common_names[i] && !atomic_load(&g_found); i++) {
-            const char *name = g_common_names[i];
-            size_t nlen = strlen(name);
+        fprintf(stderr, "  Phase %d: name + suffix patterns (%d names, GPU+NEON)...\n", phase, n_names);
 
-            /* Capitalized variant */
-            char cap[MAX_PASS_LEN + 1];
-            strncpy(cap, name, MAX_PASS_LEN);
-            cap[0] = (char)toupper((unsigned char)cap[0]);
+        /* Per name: 3 cases × (10 + 77 + 990 + 6) = ~3249 candidates */
+        #define NAME_SUFFIX_MAX 4000
+        typedef char NSEntry[MAX_PASS_LEN + 1];
+        NSEntry *ns_buf = malloc((size_t)NAME_SUFFIX_MAX * sizeof(NSEntry));
+        char **ns_ptrs = malloc((size_t)NAME_SUFFIX_MAX * sizeof(char *));
 
-            /* name + year, Name + year */
-            for (int y = 2000; y <= 2026 && !atomic_load(&g_found); y++) {
-                snprintf(pw, sizeof(pw), "%s%d", name, y);
-                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
-                snprintf(pw, sizeof(pw), "%s%d", cap, y);
-                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
-                atomic_fetch_add(&g_tested, 2);
-            }
-            /* name + digit, Name + digit */
-            for (int d = 0; d <= 9 && !atomic_load(&g_found); d++) {
-                snprintf(pw, sizeof(pw), "%s%d", name, d);
-                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
-                snprintf(pw, sizeof(pw), "%s%d", cap, d);
-                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
-                atomic_fetch_add(&g_tested, 2);
-            }
-            /* Name + symbol */
-            if (nlen + 1 <= MAX_PASS_LEN) {
-                snprintf(pw, sizeof(pw), "%s!", cap);
-                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
-                snprintf(pw, sizeof(pw), "%s@", cap);
-                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
-                snprintf(pw, sizeof(pw), "%s#", cap);
-                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
-                atomic_fetch_add(&g_tested, 3);
+        if (ns_buf && ns_ptrs) {
+            for (int i = 0; i < NAME_SUFFIX_MAX; i++) ns_ptrs[i] = ns_buf[i];
+
+            for (int i = 0; g_common_names[i] && !atomic_load(&g_found); i++) {
+                const char *name = g_common_names[i];
+                size_t nlen = strlen(name);
+
+                char cases[3][MAX_PASS_LEN + 1];
+                strncpy(cases[0], name, MAX_PASS_LEN); cases[0][MAX_PASS_LEN] = '\0';
+                strncpy(cases[1], name, MAX_PASS_LEN); cases[1][MAX_PASS_LEN] = '\0';
+                cases[1][0] = (char)toupper((unsigned char)cases[1][0]);
+                for (size_t c = 0; c < nlen && c < MAX_PASS_LEN; c++)
+                    cases[2][c] = (char)toupper((unsigned char)name[c]);
+                cases[2][nlen] = '\0';
+
+                int ns_count = 0;
+                for (int cv = 0; cv < 3; cv++) {
+                    const char *base = cases[cv];
+                    for (int d = 0; d <= 9 && ns_count < NAME_SUFFIX_MAX; d++)
+                        snprintf(ns_buf[ns_count++], MAX_PASS_LEN+1, "%s%d", base, d);
+                    for (int y = 2026; y >= 1950 && ns_count < NAME_SUFFIX_MAX; y--)
+                        snprintf(ns_buf[ns_count++], MAX_PASS_LEN+1, "%s%d", base, y);
+                    for (int d = 10; d <= 999 && ns_count < NAME_SUFFIX_MAX; d++)
+                        snprintf(ns_buf[ns_count++], MAX_PASS_LEN+1, "%s%d", base, d);
+                    static const char *syms[] = { "!", "@", "#", "$", "123", "1234", NULL };
+                    for (int s = 0; syms[s] && ns_count < NAME_SUFFIX_MAX; s++) {
+                        if (nlen + strlen(syms[s]) > MAX_PASS_LEN) continue;
+                        snprintf(ns_buf[ns_count++], MAX_PASS_LEN+1, "%s%s", base, syms[s]);
+                    }
+                }
+                smart_dict_dispatch(ns_ptrs, ns_count, nthreads, threads);
             }
         }
+        free(ns_buf);
+        free(ns_ptrs);
     }
+    phase++;
 
-    /* ── Phase 7: PIN brute-force 1-8 digits ────────────────── */
+    /* ── Phase 7: NAME + FULL DATE combos (multi-threaded GPU+NEON) ── *
+     * Pre-generate all candidates PER NAME (~575K each, ~12MB) and
+     * dispatch as a single batch through dict workers.
+     * Thread spawn/join overhead is <5% with batches this large. */
     if (!atomic_load(&g_found)) {
-        fprintf(stderr, "  Phase 7: digit-only brute-force (1-8 chars)...\n");
-        const char *saved_cs = g_charset;
-        int saved_cs_len = g_cs_len;
-        void (*saved_fn)(long, int, char *) = g_idx_to_pass;
-        g_charset = "0123456789";
-        g_cs_len = 10;
-        build_next_char_lut();
-        g_idx_to_pass = index_to_pass;
+        int n_names = 0;
+        for (int i = 0; g_common_names[i]; i++) n_names++;
+        long est = (long)n_names * 3 * 31000 * 6;
+        char nbuf[32];
+        fmt_num(est, nbuf, sizeof(nbuf));
+        fprintf(stderr, "  Phase %d: name + full date combos (%d names × dates, ~%s candidates, GPU+NEON)...\n",
+                phase, n_names, nbuf);
 
-        for (int len = 1; len <= 8 && !atomic_load(&g_found); len++) {
-            long total = 1;
-            for (int i = 0; i < len; i++) total *= 10;
-            atomic_store(&g_tested, 0);
-            atomic_store(&g_total, total);
-            atomic_store(&g_next_idx, 0);
-            int sp = 0;
-            void *(*worker_fn)(void *) = brute_worker;
-#ifdef __ARM_NEON
-            if (g_use_neon) worker_fn = brute_worker_neon;
-#endif
-            for (int t = 0; t < nthreads; t++) {
-                BruteArg *a = malloc(sizeof(BruteArg));
-                *a = (BruteArg){ .id = t, .length = len,
-                                 .start = 0, .end = total, .use_shared = 1 };
-                pthread_create(&threads[sp++], NULL, worker_fn, a);
+        /* Max candidates per name: 3 cases × 87 years × 366 days × 6 formats = 575,208 */
+        #define NAME_DATE_MAX 600000
+        typedef char NDEntry[20]; /* enough for name(~12) + date(8) + NUL */
+        NDEntry *nd_buf = malloc((size_t)NAME_DATE_MAX * sizeof(NDEntry));
+        char **nd_ptrs = malloc((size_t)NAME_DATE_MAX * sizeof(char *));
+
+        if (nd_buf && nd_ptrs) {
+            for (int i = 0; i < NAME_DATE_MAX; i++) nd_ptrs[i] = nd_buf[i];
+
+            for (int ni = 0; g_common_names[ni] && !atomic_load(&g_found); ni++) {
+                const char *name = g_common_names[ni];
+                size_t nlen = strlen(name);
+                if (nlen + 8 > MAX_PASS_LEN) continue;
+
+                /* 3 case variants */
+                char cases[3][MAX_PASS_LEN + 1];
+                strncpy(cases[0], name, MAX_PASS_LEN); cases[0][MAX_PASS_LEN] = '\0';
+                strncpy(cases[1], name, MAX_PASS_LEN); cases[1][MAX_PASS_LEN] = '\0';
+                cases[1][0] = (char)toupper((unsigned char)cases[1][0]);
+                for (size_t c = 0; c < nlen && c < MAX_PASS_LEN; c++)
+                    cases[2][c] = (char)toupper((unsigned char)name[c]);
+                cases[2][nlen] = '\0';
+
+                int count = 0;
+                for (int cv = 0; cv < 3; cv++) {
+                    for (int y = 2026; y >= 1940; y--) {
+                        for (int m = 1; m <= 12; m++) {
+                            int dim = 31;
+                            if (m == 2) dim = (y % 4 == 0) ? 29 : 28;
+                            else if (m == 4 || m == 6 || m == 9 || m == 11) dim = 30;
+                            for (int d = 1; d <= dim && count < NAME_DATE_MAX - 6; d++) {
+                                snprintf(nd_buf[count++], 20, "%s%02d%02d%04d", cases[cv], m, d, y);
+                                snprintf(nd_buf[count++], 20, "%s%02d%02d%04d", cases[cv], d, m, y);
+                                snprintf(nd_buf[count++], 20, "%s%04d%02d%02d", cases[cv], y, m, d);
+                                snprintf(nd_buf[count++], 20, "%02d%02d%04d%s", m, d, y, cases[cv]);
+                                snprintf(nd_buf[count++], 20, "%s%02d%02d%02d", cases[cv], m, d, y % 100);
+                                snprintf(nd_buf[count++], 20, "%s%02d%02d%02d", cases[cv], d, m, y % 100);
+                            }
+                        }
+                    }
+                }
+
+                /* Dispatch all candidates for this name in one batch */
+                smart_dict_dispatch(nd_ptrs, count, nthreads, threads);
+                if (atomic_load(&g_found)) break;
             }
-            for (int t = 0; t < sp; t++) pthread_join(threads[t], NULL);
         }
-        g_charset = saved_cs;
-        g_cs_len = saved_cs_len;
-        g_idx_to_pass = saved_fn;
+        free(nd_buf);
+        free(nd_ptrs);
     }
+    phase++;
 
-    /* ── Phase 8: Alpha-lowercase brute-force 1-6 ──────────── */
+    /* ── Phase N: Short brute-force ─────────────────────────── */
     if (!atomic_load(&g_found)) {
-        fprintf(stderr, "  Phase 8: lowercase alpha brute-force (1-6 chars)...\n");
-        const char *saved_cs = g_charset;
-        int saved_cs_len = g_cs_len;
-        void (*saved_fn)(long, int, char *) = g_idx_to_pass;
-        g_charset = "abcdefghijklmnopqrstuvwxyz";
-        g_cs_len = 26;
-        build_next_char_lut();
-        g_idx_to_pass = index_to_pass;
+        fprintf(stderr, "  Phase %d: lowercase brute-force (1-6 chars)...\n", phase);
+        smart_brute_phase("abcdefghijklmnopqrstuvwxyz", 26, 1, 6, nthreads, threads);
+    }
+    phase++;
 
-        for (int len = 1; len <= 6 && !atomic_load(&g_found); len++) {
-            long total = 1;
-            for (int i = 0; i < len; i++) total *= 26;
-            atomic_store(&g_tested, 0);
-            atomic_store(&g_total, total);
-            atomic_store(&g_next_idx, 0);
-            int sp = 0;
-            void *(*worker_fn)(void *) = brute_worker;
-#ifdef __ARM_NEON
-            if (g_use_neon) worker_fn = brute_worker_neon;
-#endif
-            for (int t = 0; t < nthreads; t++) {
-                BruteArg *a = malloc(sizeof(BruteArg));
-                *a = (BruteArg){ .id = t, .length = len,
-                                 .start = 0, .end = total, .use_shared = 1 };
-                pthread_create(&threads[sp++], NULL, worker_fn, a);
-            }
-            for (int t = 0; t < sp; t++) pthread_join(threads[t], NULL);
-        }
-        g_charset = saved_cs;
-        g_cs_len = saved_cs_len;
-        g_idx_to_pass = saved_fn;
+    if (!atomic_load(&g_found)) {
+        fprintf(stderr, "  Phase %d: alphanumeric brute-force (1-5 chars)...\n", phase);
+        smart_brute_phase(DEFAULT_CHARSET, 62, 1, 5, nthreads, threads);
+    }
+    phase++;
+
+    /* ── Phase 11: Full alphanumeric brute 6-7 (last resort) ── */
+    if (!atomic_load(&g_found)) {
+        fprintf(stderr, "  Phase %d: full alphanumeric brute-force (6-7 chars, may take hours)...\n", phase);
+        smart_brute_phase(DEFAULT_CHARSET, 62, 6, 7, nthreads, threads);
     }
 
 smart_done:
