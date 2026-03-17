@@ -105,6 +105,33 @@ int main(void)
                (int)(N/our_s), (int)(N/cg_s), cg_s/our_s);
     }
 
+    /* ── Batch4 cross-validation: NEON SIMD must match scalar ──── */
+    printf("━━━ Batch4 NEON vs Scalar cross-validation ━━━\n");
+    for (int c = 0; cases[c].file; c++) {
+        TestCase *tc = &cases[c];
+        PDFEncryptParams params = pdf_parse_encrypt_file(tc->file);
+        if (!params.valid || params.revision >= 5) continue;
+
+        const char *pw_user[4]  = { tc->user_pass,  "WRONG1", "WRONG2", "WRONG3" };
+        const char *pw_owner[4] = { tc->owner_pass, "WRONG1", "WRONG2", "WRONG3" };
+        int ul[4] = { (int)strlen(pw_user[0]),  6, 6, 6 };
+        int ol[4] = { (int)strlen(pw_owner[0]), 6, 6, 6 };
+
+        int u_hits = pdf_verify_user_batch4(&params, pw_user, ul);
+        int o_hits = pdf_verify_owner_batch4(&params, pw_owner, ol);
+
+        int u_ok = (u_hits & 1) == 1 && (u_hits & 0xE) == 0;
+        int o_ok = (o_hits & 1) == 1 && (o_hits & 0xE) == 0;
+
+        if (u_ok) total_pass++; else total_fail++;
+        printf("  [%s] %s batch4 user  \"%s\"\n",
+               u_ok ? "PASS" : "FAIL", tc->file, tc->user_pass);
+        if (o_ok) total_pass++; else total_fail++;
+        printf("  [%s] %s batch4 owner \"%s\"\n",
+               o_ok ? "PASS" : "FAIL", tc->file, tc->owner_pass);
+    }
+    printf("\n");
+
     printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     printf("Total: %d passed, %d failed\n", total_pass, total_fail);
     return total_fail > 0 ? 1 : 0;
