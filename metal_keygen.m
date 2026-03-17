@@ -519,6 +519,91 @@ void metal_sha256_free(MetalSHA256Context *ctx)
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * Async R5 SHA-256 pipeline (double-dispatch for pipelining)
+ * ═══════════════════════════════════════════════════════════════ */
+
+void *metal_sha256_submit_async(MetalSHA256Context *ctx, const char **passwords, int count)
+{
+    if (!ctx || count <= 0) return NULL;
+    if (count > ctx->max_batch) count = ctx->max_batch;
+
+    @autoreleasepool {
+        int buf = ctx->current_buf;
+        ctx->current_buf ^= 1;
+
+        uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
+        uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
+
+        memset(pw_data, 0, (size_t)count * SHA256_PW_PACKED_LEN);
+        for (int i = 0; i < count; i++) {
+            size_t plen = strlen(passwords[i]);
+            if (plen > 127) plen = 127;
+            memcpy(pw_data + (size_t)i * SHA256_PW_PACKED_LEN, passwords[i], plen);
+            len_data[i] = (uint8_t)plen;
+        }
+
+        memset([ctx->results_buf[buf] contents], 0, (size_t)count);
+
+        id<MTLCommandBuffer> cmdBuf = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+
+        [encoder setComputePipelineState:ctx->pipeline];
+        [encoder setBuffer:ctx->pw_buf[buf]      offset:0 atIndex:0];
+        [encoder setBuffer:ctx->len_buf[buf]     offset:0 atIndex:1];
+        [encoder setBuffer:ctx->params_buf       offset:0 atIndex:2];
+        [encoder setBuffer:ctx->results_buf[buf] offset:0 atIndex:3];
+
+        NSUInteger threadWidth = ctx->pipeline.maxTotalThreadsPerThreadgroup;
+        if (threadWidth > 256) threadWidth = 256;
+        MTLSize gridSize  = MTLSizeMake((NSUInteger)count, 1, 1);
+        MTLSize groupSize = MTLSizeMake(threadWidth, 1, 1);
+
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
+        [encoder endEncoding];
+
+        [cmdBuf commit];
+
+        /* Return command buffer as opaque handle — retain so it survives autorelease */
+        return (__bridge_retained void *)cmdBuf;
+    }
+}
+
+int metal_sha256_wait_results_ex(MetalSHA256Context *ctx, void *handle, int count,
+                                  int *match_type)
+{
+    if (match_type) *match_type = 0;
+    if (!ctx || !handle) return -1;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuf = (__bridge_transfer id<MTLCommandBuffer>)handle;
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.error) {
+            fprintf(stderr, "Metal SHA-256 async: compute error: %s\n",
+                    [[cmdBuf.error localizedDescription] UTF8String]);
+            return -1;
+        }
+
+        /* Results are in the OTHER buffer (we toggled current_buf in submit) */
+        int results_buf = ctx->current_buf ^ 1;
+
+        uint8_t *results = (uint8_t *)[ctx->results_buf[results_buf] contents];
+        for (int i = 0; i < count; i++) {
+            if (results[i]) {
+                if (match_type) *match_type = (int)results[i];
+                return i;
+            }
+        }
+        return -1;
+    }
+}
+
+int metal_sha256_wait_results(MetalSHA256Context *ctx, void *handle, int count)
+{
+    return metal_sha256_wait_results_ex(ctx, handle, count, NULL);
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * R6 GPU verification context (Algorithm 2.B)
  * ═══════════════════════════════════════════════════════════════ */
 

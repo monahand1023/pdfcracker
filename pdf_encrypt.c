@@ -30,6 +30,7 @@
 /* NEON SIMD acceleration for SHA-256/384/512 and AES-128-CBC (R6 path) */
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_SHA2)
 #include "sha256_simd.h"
+#include "sha512_simd.h"
 #endif
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_CRYPTO)
 #include "aes_simd.h"
@@ -668,8 +669,18 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
             memcpy(seq + pw_len + hash_len, extra, (size_t)extra_len);
 
         size_t K1_len = seq_len * 64;
-        for (int i = 0; i < 64; i++)
-            memcpy(K1 + i * seq_len, seq, seq_len);
+
+        /* Doubling memcpy: copy seq once, then double the filled region
+         * each iteration (1→2→4→8→16→32→64) instead of 64 individual copies. */
+        memcpy(K1, seq, seq_len);
+        size_t filled = seq_len;
+        while (filled < K1_len) {
+            size_t chunk = filled;
+            if (chunk > K1_len - filled)
+                chunk = K1_len - filled;
+            memcpy(K1 + filled, K1, chunk);
+            filled += chunk;
+        }
 
         /* Step c: AES-CBC encrypt K1 in-place with key=hash[0:16], iv=hash[16:32] */
         /* K1_len is always a multiple of 16 because seq_len * 64 and the
@@ -708,11 +719,19 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
                 hash_len = 32;
                 break;
             case 1:
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_SHA512)
+                sha384_hash_neon(K1, aes_len, hash);
+#else
                 CC_SHA384(K1, (CC_LONG)aes_len, hash);
+#endif
                 hash_len = 48;
                 break;
             case 2:
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_SHA512)
+                sha512_hash_neon(K1, aes_len, hash);
+#else
                 CC_SHA512(K1, (CC_LONG)aes_len, hash);
+#endif
                 hash_len = 64;
                 break;
         }

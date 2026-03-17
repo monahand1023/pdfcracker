@@ -56,6 +56,8 @@ static int              g_fast_crypto = 0;
 #define GPU_BATCH_SIZE  65536
 #define CPU_WORK_CHUNK  512
 static MetalKeygenContext *g_gpu_ctx = NULL;
+static MetalSHA256Context *g_sha256_ctx = NULL;
+static MetalR6Context     *g_r6_ctx    = NULL;
 static int                 g_use_gpu = 0;
 static atomic_long         g_next_idx = 0;
 
@@ -345,24 +347,85 @@ static void *dict_local_worker(void *arg)
 static int benchmark_gpu(void)
 {
     const int N = 2000;
-    int key_bytes = metal_keygen_key_bytes(g_gpu_ctx);
 
     const char **passwords = malloc(sizeof(char *) * N);
-    char *pw_storage = malloc(8 * N);
-    uint8_t *keys = malloc((size_t)N * key_bytes);
-    if (!passwords || !pw_storage || !keys) {
-        free(passwords); free(pw_storage); free(keys);
+    char *pw_storage = malloc(16 * N);
+    if (!passwords || !pw_storage) {
+        free(passwords); free(pw_storage);
         return 0;
     }
     for (int i = 0; i < N; i++) {
-        snprintf(pw_storage + i * 8, 8, "bench%d", i);
-        passwords[i] = pw_storage + i * 8;
+        snprintf(pw_storage + i * 16, 16, "bench%d", i);
+        passwords[i] = pw_storage + i * 16;
     }
 
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);
 
-    uint64_t t0 = mach_absolute_time();
+    uint64_t t0, t1;
+
+    if (g_enc_params.revision >= 6 && g_r6_ctx) {
+        /* R6 GPU benchmark */
+        int bench_n = N < 500 ? N : 500; /* R6 is slow, use fewer */
+        t0 = mach_absolute_time();
+        metal_r6_verify_batch(g_r6_ctx, passwords, bench_n);
+        t1 = mach_absolute_time();
+        double gpu_s = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+        double gpu_rate = gpu_s > 0 ? bench_n / gpu_s : 0;
+
+        t0 = mach_absolute_time();
+        for (int i = 0; i < bench_n; i++)
+            pdf_verify_user_password(&g_enc_params, passwords[i]);
+        t1 = mach_absolute_time();
+        double cpu_s = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+        double cpu_rate = cpu_s > 0 ? bench_n / cpu_s : 0;
+
+        free(passwords); free(pw_storage);
+        fprintf(stderr, "Bench  : GPU %.0f/s vs CPU %.0f/s (single-core, R6)",
+                gpu_rate, cpu_rate);
+        if (gpu_rate > cpu_rate * 0.5) {
+            fprintf(stderr, " — GPU enabled\n");
+            return 1;
+        } else {
+            fprintf(stderr, " — GPU disabled (too slow)\n");
+            return 0;
+        }
+    } else if (g_enc_params.revision == 5 && g_sha256_ctx) {
+        /* R5 GPU benchmark */
+        t0 = mach_absolute_time();
+        metal_sha256_verify_batch(g_sha256_ctx, passwords, N);
+        t1 = mach_absolute_time();
+        double gpu_s = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+        double gpu_rate = gpu_s > 0 ? N / gpu_s : 0;
+
+        t0 = mach_absolute_time();
+        for (int i = 0; i < N; i++)
+            pdf_verify_user_password(&g_enc_params, passwords[i]);
+        t1 = mach_absolute_time();
+        double cpu_s = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+        double cpu_rate = cpu_s > 0 ? N / cpu_s : 0;
+
+        free(passwords); free(pw_storage);
+        fprintf(stderr, "Bench  : GPU %.0f/s vs CPU %.0f/s (single-core, R5)",
+                gpu_rate, cpu_rate);
+        if (gpu_rate > cpu_rate * 0.5) {
+            fprintf(stderr, " — GPU enabled\n");
+            return 1;
+        } else {
+            fprintf(stderr, " — GPU disabled (too slow)\n");
+            return 0;
+        }
+    }
+
+    /* R2-R4: original keygen + RC4 benchmark */
+    int key_bytes = metal_keygen_key_bytes(g_gpu_ctx);
+    uint8_t *keys = malloc((size_t)N * key_bytes);
+    if (!keys) {
+        free(passwords); free(pw_storage);
+        return 0;
+    }
+
+    t0 = mach_absolute_time();
     int n = metal_keygen_batch(g_gpu_ctx, passwords, N, keys);
     if (n > 0) {
         for (int i = 0; i < n; i++) {
@@ -391,7 +454,7 @@ static int benchmark_gpu(void)
             }
         }
     }
-    uint64_t t1 = mach_absolute_time();
+    t1 = mach_absolute_time();
     double gpu_s = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
     double gpu_rate = gpu_s > 0 ? N / gpu_s : 0;
 
@@ -537,6 +600,284 @@ done:
 }
 
 /* ================================================================
+ * SHA-256 (R5) wait-and-check helper
+ * ================================================================ */
+static inline int sha256_wait_and_check(void *handle, int count,
+                                         const char **pw_buf)
+{
+    int match_type = 0;
+    int match = (g_password_mode == PW_MODE_BOTH)
+        ? metal_sha256_wait_results_ex(g_sha256_ctx, handle, count, &match_type)
+        : metal_sha256_wait_results(g_sha256_ctx, handle, count);
+    if (match >= 0) {
+        if (!atomic_exchange(&g_chunk_found, 1)) {
+            strncpy(g_chunk_pass, pw_buf[match], MAX_PASS_LEN);
+            g_chunk_pass[MAX_PASS_LEN] = '\0';
+        }
+    }
+    return match;
+}
+
+/* ================================================================
+ * R6 wait-and-check helper
+ * ================================================================ */
+static inline int r6_wait_and_check(void *handle, int count,
+                                     const char **pw_buf)
+{
+    int match_type = 0;
+    int match = (g_password_mode == PW_MODE_BOTH)
+        ? metal_r6_wait_results_ex(g_r6_ctx, handle, count, &match_type)
+        : metal_r6_wait_results(g_r6_ctx, handle, count);
+    if (match >= 0) {
+        if (!atomic_exchange(&g_chunk_found, 1)) {
+            strncpy(g_chunk_pass, pw_buf[match], MAX_PASS_LEN);
+            g_chunk_pass[MAX_PASS_LEN] = '\0';
+        }
+    }
+    return match;
+}
+
+/* ================================================================
+ * GPU R5 SHA-256 brute-force worker for client chunks
+ * ================================================================ */
+static void *gpu_sha256_brute_local_worker(void *arg)
+{
+    GPUBruteLocalArg *a = (GPUBruteLocalArg *)arg;
+
+    /* Double-buffered password arrays for pipelining */
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN + 1));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_chunk_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
+        if (start >= a->total_end) break;
+        long end = start + GPU_BATCH_SIZE;
+        if (end > a->total_end) end = a->total_end;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
+            index_to_password(start + i, a->length, g_charset, g_cs_len, pw);
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_chunk_tested, (long)pending_count,
+                                      memory_order_relaxed);
+        }
+
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx,
+                                                    pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_chunk_tested, (long)pending_count,
+                                  memory_order_relaxed);
+    }
+
+done:
+    for (int b = 0; b < 2; b++) {
+        free(pw_ptrs[b]);
+        free(pw_storage[b]);
+    }
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
+ * GPU R5 SHA-256 dictionary worker for client chunks
+ * ================================================================ */
+typedef struct { char **words; long count; } GPUSHA256DictLocalArg;
+
+static void *gpu_sha256_dict_local_worker(void *arg)
+{
+    GPUSHA256DictLocalArg *a = (GPUSHA256DictLocalArg *)arg;
+
+    const char **pw_ptrs[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        if (!pw_ptrs[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_chunk_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
+        if (start >= a->count) break;
+        long end = start + GPU_BATCH_SIZE;
+        if (end > a->count) end = a->count;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++)
+            pw_ptrs[cur_buf][i] = a->words[start + i];
+
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_chunk_tested, (long)pending_count,
+                                      memory_order_relaxed);
+        }
+
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx,
+                                                    pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_chunk_tested, (long)pending_count,
+                                  memory_order_relaxed);
+    }
+
+done:
+    for (int b = 0; b < 2; b++) free(pw_ptrs[b]);
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
+ * GPU R6 brute-force worker for client chunks
+ * ================================================================ */
+static void *gpu_r6_brute_local_worker(void *arg)
+{
+    GPUBruteLocalArg *a = (GPUBruteLocalArg *)arg;
+    int batch = metal_r6_max_batch(g_r6_ctx);
+    if (batch > GPU_BATCH_SIZE) batch = GPU_BATCH_SIZE;
+
+    /* Double-buffered password arrays for pipelining */
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN + 1));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_chunk_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= a->total_end) break;
+        long end = start + batch;
+        if (end > a->total_end) end = a->total_end;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
+            index_to_password(start + i, a->length, g_charset, g_cs_len, pw);
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_chunk_tested, (long)pending_count,
+                                      memory_order_relaxed);
+        }
+
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_chunk_tested, (long)pending_count,
+                                  memory_order_relaxed);
+    }
+
+done:
+    for (int b = 0; b < 2; b++) {
+        free(pw_ptrs[b]);
+        free(pw_storage[b]);
+    }
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
+ * GPU R6 dictionary worker for client chunks
+ * ================================================================ */
+typedef struct { char **words; long count; } GPUR6DictLocalArg;
+
+static void *gpu_r6_dict_local_worker(void *arg)
+{
+    GPUR6DictLocalArg *a = (GPUR6DictLocalArg *)arg;
+    int batch = metal_r6_max_batch(g_r6_ctx);
+    if (batch > GPU_BATCH_SIZE) batch = GPU_BATCH_SIZE;
+
+    const char **pw_ptrs[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        if (!pw_ptrs[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_chunk_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= a->count) break;
+        long end = start + batch;
+        if (end > a->count) end = a->count;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++)
+            pw_ptrs[cur_buf][i] = a->words[start + i];
+
+        if (pending_handle) {
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_chunk_tested, (long)pending_count,
+                                      memory_order_relaxed);
+        }
+
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_chunk_tested, (long)pending_count,
+                                  memory_order_relaxed);
+    }
+
+done:
+    for (int b = 0; b < 2; b++) free(pw_ptrs[b]);
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
  * Crack a brute-force chunk locally
  * Returns: 1 if found (password in g_chunk_pass), 0 if exhausted
  * ================================================================ */
@@ -558,7 +899,10 @@ static int crack_brute_chunk(int length, long start, long end)
         GPUBruteLocalArg *ga = malloc(sizeof(GPUBruteLocalArg));
         ga->length = length;
         ga->total_end = end;
-        pthread_create(&threads[spawned++], NULL, gpu_brute_local_worker, ga);
+        void *(*gpu_fn)(void *) = gpu_brute_local_worker;
+        if (g_r6_ctx)       gpu_fn = gpu_r6_brute_local_worker;
+        else if (g_sha256_ctx) gpu_fn = gpu_sha256_brute_local_worker;
+        pthread_create(&threads[spawned++], NULL, gpu_fn, ga);
 
         /* CPU threads use shared counter */
         for (int t = 0; t < nt; t++) {
@@ -602,10 +946,22 @@ static int crack_dict_chunk(char **words, long count)
     int spawned = 0;
 
     if (g_use_gpu) {
-        GPUDictLocalArg *ga = malloc(sizeof(GPUDictLocalArg));
-        ga->words = words;
-        ga->count = count;
-        pthread_create(&threads[spawned++], NULL, gpu_dict_local_worker, ga);
+        if (g_r6_ctx) {
+            GPUR6DictLocalArg *ga = malloc(sizeof(GPUR6DictLocalArg));
+            ga->words = words;
+            ga->count = count;
+            pthread_create(&threads[spawned++], NULL, gpu_r6_dict_local_worker, ga);
+        } else if (g_sha256_ctx) {
+            GPUSHA256DictLocalArg *ga = malloc(sizeof(GPUSHA256DictLocalArg));
+            ga->words = words;
+            ga->count = count;
+            pthread_create(&threads[spawned++], NULL, gpu_sha256_dict_local_worker, ga);
+        } else {
+            GPUDictLocalArg *ga = malloc(sizeof(GPUDictLocalArg));
+            ga->words = words;
+            ga->count = count;
+            pthread_create(&threads[spawned++], NULL, gpu_dict_local_worker, ga);
+        }
     }
 
     for (int t = 0; t < nt; t++) {
@@ -859,6 +1215,8 @@ static void reset_session_state(void)
     g_fast_crypto = 0;
     g_use_gpu = 0;
     if (g_gpu_ctx) { metal_keygen_free(g_gpu_ctx); g_gpu_ctx = NULL; }
+    if (g_sha256_ctx) { metal_sha256_free(g_sha256_ctx); g_sha256_ctx = NULL; }
+    if (g_r6_ctx) { metal_r6_free(g_r6_ctx); g_r6_ctx = NULL; }
     g_current_lease_id = 0;
     memset(&g_enc_params, 0, sizeof(g_enc_params));
     if (g_pdf_path[0]) { unlink(g_pdf_path); g_pdf_path[0] = '\0'; }
@@ -981,7 +1339,7 @@ static int run_session(const char *host, int port)
     }
     free(pdf_buf);
 
-    /* Try GPU acceleration (only for R2-R4, Metal shader does MD5) */
+    /* Try GPU acceleration */
     if (g_fast_crypto && !g_no_gpu && g_enc_params.revision <= 4) {
         g_gpu_ctx = metal_keygen_init(&g_enc_params, NULL);
         if (g_gpu_ctx) {
@@ -990,6 +1348,30 @@ static int run_session(const char *host, int port)
             } else {
                 metal_keygen_free(g_gpu_ctx);
                 g_gpu_ctx = NULL;
+            }
+        }
+    } else if (g_fast_crypto && !g_no_gpu && g_enc_params.revision == 5) {
+        int check_owner = (g_password_mode == PW_MODE_OWNER) ? 1 :
+                           (g_password_mode == PW_MODE_BOTH) ? 2 : 0;
+        g_sha256_ctx = metal_sha256_init(&g_enc_params, check_owner, NULL);
+        if (g_sha256_ctx) {
+            if (benchmark_gpu()) {
+                g_use_gpu = 1;
+            } else {
+                metal_sha256_free(g_sha256_ctx);
+                g_sha256_ctx = NULL;
+            }
+        }
+    } else if (g_fast_crypto && !g_no_gpu && g_enc_params.revision == 6) {
+        int check_owner = (g_password_mode == PW_MODE_OWNER) ? 1 :
+                           (g_password_mode == PW_MODE_BOTH) ? 2 : 0;
+        g_r6_ctx = metal_r6_init(&g_enc_params, check_owner, NULL);
+        if (g_r6_ctx) {
+            if (benchmark_gpu()) {
+                g_use_gpu = 1;
+            } else {
+                metal_r6_free(g_r6_ctx);
+                g_r6_ctx = NULL;
             }
         }
     }

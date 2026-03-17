@@ -170,6 +170,62 @@ run_test "Pot file lookup" "Found in pot file: test123" \
 run_test "JSON output" '"status":"found"' \
     $PDFCRACK -f test_encrypted.pdf --fingerprint --json
 
+# --- 19. Toggle-case attack ---
+echo "TEST123" > "$TMPDIR/dict_toggle.txt"
+run_test "Toggle-case attack" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_toggle.txt" --toggle --no-pot
+
+# --- 20. Combinator attack ---
+echo "test" > "$TMPDIR/dict_combo1.txt"
+echo "123" > "$TMPDIR/dict_combo2.txt"
+run_test "Combinator attack" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_combo1.txt" --combinator "$TMPDIR/dict_combo2.txt" --no-pot
+
+# --- 21. Mask+rules attack ---
+echo ":" > "$TMPDIR/rules_identity.txt"
+run_test "Mask+rules attack" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -m "test?d?d?d" -R "$TMPDIR/rules_identity.txt" --no-pot
+
+# --- 22. Progress file ---
+PROGRESS_FILE="$TMPDIR/progress.json"
+# Run brute-force long enough for the progress thread to write at least once (~0.5s intervals)
+# Use a charset that won't find the password, let it run 2 seconds then kill
+timeout 3 $PDFCRACK -f test_encrypted.pdf -b -l 4 -c "XYZW" --progress-file "$PROGRESS_FILE" --no-pot >/dev/null 2>&1 || true
+if [ -f "$PROGRESS_FILE" ] && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$PROGRESS_FILE" 2>/dev/null; then
+    echo "  [PASS] Progress file (valid JSON)"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] Progress file (missing or invalid JSON)"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- 23. Custom pot file ---
+CUSTOM_POT="$TMPDIR/custom.pot"
+rm -f "$CUSTOM_POT"
+echo "test123" > "$TMPDIR/dict_custompot.txt"
+$PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_custompot.txt" --pot-file "$CUSTOM_POT" >/dev/null 2>&1
+if [ -f "$CUSTOM_POT" ] && grep -qF "test123" "$CUSTOM_POT"; then
+    echo "  [PASS] Custom pot file"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] Custom pot file (missing or no password)"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- 24. Date attack ---
+run_test "Date attack" "Password not found" \
+    $PDFCRACK -f test_encrypted.pdf --dates --date-range 2020-2022 --no-pot
+
+# --- 25. Mutate attack ---
+echo "test" > "$TMPDIR/dict_mutate.txt"
+run_test "Mutate attack" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_mutate.txt" --mutate --no-pot
+
+# --- 26. Leet attack ---
+echo "test123" > "$TMPDIR/dict_leet.txt"
+run_test "Leet attack" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_leet.txt" --leet --no-pot
+
 echo ""
 echo "=== Summary ==="
 echo "Total: $PASS passed, $FAIL failed"

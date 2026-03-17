@@ -1,6 +1,6 @@
 # pdfcracker
 
-Fast PDF password cracker for macOS, optimized for Apple Silicon. Supports dictionary and brute-force attacks using all CPU cores and GPU via Metal compute shaders.
+Fast PDF password cracker for macOS, optimized for Apple Silicon. Supports multiple attack modes using all CPU cores and GPU via Metal compute shaders. ARM NEON SIMD and hardware SHA-256/512 intrinsics for maximum throughput.
 
 ## Requirements
 
@@ -36,6 +36,22 @@ This builds three binaries: `pdfcrack` (standalone), `server` (distributed coord
 ./pdfcrack -f document.pdf -i
 ```
 
+### Attack Modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| Dictionary | `-d <wordlist>` | Try each word in a wordlist |
+| Brute-force | `-b` | Enumerate all combinations of a charset |
+| Mask | `-m <pattern>` | Pattern-based: `?l`=lower, `?u`=upper, `?d`=digit, `?s`=special, `?a`=all |
+| Rules | `-R <file>` | Apply hashcat-compatible rules to dictionary words |
+| Hybrid | `-H <N>` | Append N-char brute-force suffix to dictionary words |
+| PRINCE | `-P` | Probabilistic password generation from dictionary |
+| Fingerprint | `--fingerprint` | Smart patterns: dates, keyboard walks, common formats |
+| Combinator | `--combinator <dict2>` | Cartesian product of two wordlists (use with `-d`) |
+| Toggle-case | `--toggle` | All case variations of dictionary words (use with `-d`) |
+| Mask+Rules | `-m <pat> -R <file>` | Apply rules to mask-generated candidates |
+| Incremental | `-I -M <model>` | Markov-model probability ordering |
+
 ### Options
 
 | Flag | Description |
@@ -49,6 +65,15 @@ This builds three binaries: `pdfcrack` (standalone), `server` (distributed coord
 | `-G` | Disable GPU acceleration |
 | `-r` | Resume from checkpoint |
 | `-i` | Interactive mode — prompts for password hints |
+| `-O` / `-U` | Crack owner / user password only (default: both) |
+| `-F` | Frequency-ordered charset (common chars first) |
+| `--no-pot` | Don't use the pot file (found passwords cache) |
+| `--pot-file <path>` | Use custom pot file path |
+| `--progress-file <path>` | Write JSON progress to file for external monitoring |
+| `--max-rounds <N>` | Limit R6 KDF rounds (trades accuracy for speed) |
+| `--gpu-batch <N>` | Override GPU batch size |
+| `--json` | JSON output mode |
+| `--session <name>` | Named session for checkpoint management |
 
 ### Checkpoints
 
@@ -139,13 +164,13 @@ Tested on M4 Pro (14 cores):
 
 | Revision | Speed | Engine | Notes |
 |----------|-------|--------|-------|
-| R2 (40-bit RC4) | ~15.9M/s | NEON SIMD | Fastest |
-| R3 (128-bit RC4) | ~812K/s | NEON SIMD | Most common |
-| R4 (AES-128) | ~812K/s | NEON SIMD | Same crypto as R3 |
-| R5 (AES-256) | ~104M/s | Metal GPU | SHA-256 based |
-| R6 (AES-256) | ~14K/s | CPU only | Deliberately slow KDF |
+| R2 (40-bit RC4) | ~5M/s | NEON SIMD | 4-way parallel MD5 per core |
+| R3 (128-bit RC4) | ~1.2M/s | NEON SIMD | Most common |
+| R4 (AES-128) | ~1.2M/s | NEON SIMD | Same crypto as R3 |
+| R5 (AES-256) | ~46M/s | Metal GPU | Full SHA-256 on-chip |
+| R6 (AES-256) | ~16K/s | GPU+CPU cooperative | Deliberately slow KDF |
 
-The engine is auto-selected at startup: NEON SIMD for R2-R4 (4 passwords per core via ARM vector registers), Metal GPU for R5 (full SHA-256 verification on-chip). Use `-G` to force CPU-only mode.
+The engine is auto-selected at startup: NEON SIMD for R2-R4 (4 passwords per core via ARM vector registers), Metal GPU for R5 (full SHA-256 verification on-chip), GPU+CPU cooperative for R6. Use `-G` to force CPU-only mode.
 
 ## Supported PDF Encryption
 
@@ -163,16 +188,20 @@ The engine is auto-selected at startup: NEON SIMD for R2-R4 (4 passwords per cor
 |------|---------|
 | `pdfcrack.c` | Standalone single-machine cracker |
 | `server.c` | Distributed coordinator + local worker |
-| `client.c` | Distributed worker node |
+| `client.c` | Distributed worker node (supports R2-R6 GPU) |
 | `protocol.h` | Shared protocol constants and helpers |
 | `pdf_encrypt.c` | PDF parser and crypto verification |
 | `pdf_encrypt.h` | Parser/crypto API |
+| `sha256_simd.h` | NEON SHA-256 intrinsics (header-only) |
+| `sha512_simd.h` | NEON SHA-384/512 intrinsics (header-only) |
+| `saslprep.c` | Unicode normalization for R5/R6 passwords |
 | `pdf_md5.metal` | Metal GPU shader for MD5 key derivation |
-| `metal_keygen.m` | Objective-C Metal pipeline |
+| `metal_keygen.m` | Objective-C Metal pipeline (R2-R6) |
 | `metal_keygen.h` | Metal API header |
 | `deploy.sh` | Push client to remote Mac over SSH |
 | `join.sh` | Pull client from server over SSH |
 | `test_all.c` | Test suite (32 tests across 8 PDF variants) |
+| `test_integration.sh` | Integration tests (23 end-to-end scenarios) |
 | `Makefile` | Build system |
 
 ## Running Tests

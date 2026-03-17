@@ -38,6 +38,7 @@
 #include <signal.h>
 #include <mach/mach_time.h>
 #include <ctype.h>
+#include <errno.h>
 #include <getopt.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -221,8 +222,12 @@ static MarkovModel *g_markov = NULL;
 
 /* -- Pot file -------------------------------------------------- */
 static char g_pot_path[1024] = {0};
+static const char *g_custom_pot_path = NULL;
 static int  g_show_pot = 0;
 static int  g_no_pot = 0;
+
+/* -- Progress file for external monitoring --------------------- */
+static const char *g_progress_file = NULL;
 
 /* -- JSON output ----------------------------------------------- */
 static int  g_json_mode = 0;
@@ -257,6 +262,54 @@ static pthread_cond_t  g_incr_not_full  = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_incr_not_empty = PTHREAD_COND_INITIALIZER;
 static int    g_incremental_mode = 0;
 
+/* -- Toggle-case walk mode ------------------------------------ */
+static int    g_toggle_mode = 0;
+
+/* -- Combinator attack ---------------------------------------- */
+#define ATTACK_COMBINATOR 8
+static char  **g_words2 = NULL;
+static long    g_nwords2 = 0;
+static const char *g_dict2_path = NULL;
+
+/* -- Mask+rules hybrid attack --------------------------------- */
+#define ATTACK_MASK_RULE 9
+
+/* -- Incremental resume (attack mode) ------------------------- */
+#define ATTACK_INCREMENTAL 10
+
+/* -- Date-based attack ---------------------------------------- */
+#define ATTACK_DATES 11
+static int  g_dates_mode = 0;
+static int  g_date_year_start = 1940;
+static int  g_date_year_end   = 2026;
+
+/* -- Smart mutations attack ----------------------------------- */
+#define ATTACK_MUTATE 12
+static int  g_mutate_mode = 0;
+
+/* -- L33tspeak substitutions attack --------------------------- */
+#define ATTACK_LEET 13
+static int  g_leet_mode = 0;
+
+/* -- Global incremental heap (for resume) --------------------- */
+static IncrHeap *g_incr_heap = NULL;
+
+/* Forward declarations for incremental save/load (defined later) */
+static void incr_heap_save(const char *path);
+static int incr_heap_load(const char *path);
+
+/* ── Safe integer parsing with range checking ────────────────── */
+static int safe_atoi(const char *s, int min_val, int max_val, const char *name)
+{
+    char *end;
+    errno = 0;
+    long val = strtol(s, &end, 10);
+    if (errno == ERANGE || val < min_val || val > max_val || end == s || *end != '\0') {
+        fprintf(stderr, "Invalid value for %s: '%s' (must be %d..%d)\n", name, s, min_val, max_val);
+        exit(1);
+    }
+    return (int)val;
+}
 
 /* Train a Markov model from a wordlist and write binary file */
 static void markov_train(const char *wordlist_path, const char *model_path)
@@ -504,7 +557,8 @@ static void ckpt_save(void)
 
     /* Save attack mode */
     static const char *mode_names[] = {
-        "brute", "dict", "mask", "rule", "hybrid", "auto", "prince", "fingerprint"
+        "brute", "dict", "mask", "rule", "hybrid", "auto", "prince", "fingerprint",
+        "combinator", "mask_rule", "incremental", "dates", "mutate", "leet"
     };
     fprintf(f, "attack_mode=%s\n", mode_names[g_attack_mode]);
 
@@ -550,6 +604,13 @@ static void ckpt_save(void)
 
     fclose(f);
     rename(tmp, g_ckpt_path);  /* atomic replace */
+
+    /* Also save incremental heap if in incremental mode */
+    if (g_attack_mode == ATTACK_INCREMENTAL && g_incr_heap && g_ckpt_path[0]) {
+        char incr_path[1040];
+        snprintf(incr_path, sizeof(incr_path), "%s.incr", g_ckpt_path);
+        incr_heap_save(incr_path);
+    }
 }
 
 typedef struct {
@@ -606,6 +667,12 @@ static Checkpoint ckpt_load(void)
             ck.attack_mode = ATTACK_PRINCE; ck.is_brute = 0;
         } else if (strncmp(line, "attack_mode=fingerprint", 23) == 0) {
             ck.attack_mode = ATTACK_FINGERPRINT; ck.is_brute = 1;
+        } else if (strncmp(line, "attack_mode=dates", 17) == 0) {
+            ck.attack_mode = ATTACK_DATES; ck.is_brute = 1;
+        } else if (strncmp(line, "attack_mode=mutate", 18) == 0) {
+            ck.attack_mode = ATTACK_MUTATE; ck.is_brute = 0;
+        } else if (strncmp(line, "attack_mode=leet", 16) == 0) {
+            ck.attack_mode = ATTACK_LEET; ck.is_brute = 0;
         } else if (strncmp(line, "attack_mode=auto", 16) == 0) {
             ck.attack_mode = ATTACK_AUTO;
         } else if (strncmp(line, "charset=", 8) == 0) {
@@ -670,6 +737,26 @@ static void print_bar(double pct)
     fputc(']', stderr);
 }
 
+static void write_progress_file(long cur, long total, long rate, long elapsed)
+{
+    if (!g_progress_file) return;
+    char tmp[1040];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", g_progress_file);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    double pct = (total > 0) ? (double)cur / (double)total * 100.0 : 0.0;
+    if (pct > 100.0) pct = 100.0;
+    long eta = (rate > 0 && total > cur) ? (total - cur) / rate : -1;
+    int cur_len = atomic_load(&g_current_len);
+    fprintf(f, "{\"speed\":%ld,\"tested\":%ld,\"total\":%ld,"
+               "\"progress_pct\":%.2f,\"elapsed_sec\":%ld,"
+               "\"eta_sec\":%ld,\"current_length\":%d,"
+               "\"timestamp\":%ld}\n",
+            rate, cur, total, pct, elapsed, eta, cur_len, (long)time(NULL));
+    fclose(f);
+    rename(tmp, g_progress_file);
+}
+
 static void *progress_thread(void *arg)
 {
     (void)arg;
@@ -691,6 +778,17 @@ static void *progress_thread(void *arg)
             if (now - last_ckpt >= CKPT_INTERVAL) {
                 ckpt_save();
                 last_ckpt = now;
+            }
+            if (g_progress_file && (avg_i <= 1 || (avg_i % 4) == 0)) {
+                long cur_j = atomic_load(&g_tested);
+                long total_j = atomic_load(&g_total);
+                long rate_j = (cur_j - prev) * 2;
+                prev = cur_j;
+                long elapsed_j = (long)(now - t0);
+                avg_i++;
+                write_progress_file(cur_j, total_j, rate_j, elapsed_j);
+            } else {
+                avg_i++;
             }
             if (g_interrupted) {
                 ckpt_save();
@@ -797,6 +895,10 @@ static void *progress_thread(void *arg)
                     s_cur, s_rate, s_elapsed);
         }
         fflush(stderr);
+
+        /* Write progress file every 4th iteration (~2s), plus first iteration */
+        if (g_progress_file && (avg_i <= 1 || (avg_i % 4) == 0))
+            write_progress_file(cur, total, rate, elapsed);
 
         /* Periodic checkpoint */
         time_t now = time(NULL);
@@ -1501,6 +1603,10 @@ static void apply_rule(const char *word, int rule_idx, char *out)
  * ================================================================ */
 static void pot_init(void)
 {
+    if (g_custom_pot_path) {
+        snprintf(g_pot_path, sizeof(g_pot_path), "%s", g_custom_pot_path);
+        return;
+    }
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
     char dir[1024];
@@ -1831,6 +1937,78 @@ static void heap_free(IncrHeap *h)
     h->size = 0;
 }
 
+/* Save incremental heap state to binary file */
+#define INCR_MAGIC 0x494E4352
+#define INCR_VERSION 1
+static void incr_heap_save(const char *path)
+{
+    if (!g_incr_heap || !path) return;
+    char tmp[1040];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+
+    uint32_t magic = INCR_MAGIC;
+    uint32_t version = INCR_VERSION;
+    fwrite(&magic, 4, 1, f);
+    fwrite(&version, 4, 1, f);
+
+    /* Heap state */
+    pthread_mutex_lock(&g_incr_mutex);
+    int heap_size = g_incr_heap->size;
+    fwrite(&heap_size, sizeof(int), 1, f);
+    fwrite(g_incr_heap->entries, sizeof(IncrEntry), (size_t)heap_size, f);
+
+    /* Ring buffer state */
+    fwrite(&g_incr_head, sizeof(int), 1, f);
+    fwrite(&g_incr_tail, sizeof(int), 1, f);
+
+    /* Tested count */
+    long tested = atomic_load(&g_tested);
+    fwrite(&tested, sizeof(long), 1, f);
+    pthread_mutex_unlock(&g_incr_mutex);
+
+    fclose(f);
+    rename(tmp, path);
+}
+
+static int incr_heap_load(const char *path)
+{
+    if (!path) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    uint32_t magic, version;
+    if (fread(&magic, 4, 1, f) != 1 || magic != INCR_MAGIC) { fclose(f); return 0; }
+    if (fread(&version, 4, 1, f) != 1 || version != INCR_VERSION) { fclose(f); return 0; }
+
+    int heap_size;
+    if (fread(&heap_size, sizeof(int), 1, f) != 1 || heap_size < 0 || heap_size > INCR_HEAP_CAP) {
+        fclose(f); return 0;
+    }
+
+    if (!g_incr_heap) {
+        g_incr_heap = malloc(sizeof(IncrHeap));
+        heap_init(g_incr_heap, INCR_HEAP_CAP);
+    }
+    if ((int)fread(g_incr_heap->entries, sizeof(IncrEntry), (size_t)heap_size, f) != heap_size) {
+        fclose(f); return 0;
+    }
+    g_incr_heap->size = heap_size;
+
+    /* Ring buffer (skip — we'll regenerate from heap) */
+    int dummy_head, dummy_tail;
+    fread(&dummy_head, sizeof(int), 1, f);
+    fread(&dummy_tail, sizeof(int), 1, f);
+
+    long tested;
+    if (fread(&tested, sizeof(long), 1, f) == 1)
+        atomic_store(&g_tested, tested);
+
+    fclose(f);
+    return 1;
+}
+
 /* Incremental producer thread */
 static void *incr_producer_thread(void *arg)
 {
@@ -1843,20 +2021,23 @@ static void *incr_producer_thread(void *arg)
     if (effective_cs < 1) effective_cs = 1;
     double log_base = log((double)effective_cs);
 
-    IncrHeap heap;
-    heap_init(&heap, INCR_HEAP_CAP);
+    /* Use global heap (may be pre-loaded from checkpoint) */
+    if (!g_incr_heap) {
+        g_incr_heap = malloc(sizeof(IncrHeap));
+        heap_init(g_incr_heap, INCR_HEAP_CAP);
 
-    /* Seed with best candidate at each length 1..MAX_PASS_LEN */
-    for (int len = 1; len <= MAX_PASS_LEN; len++) {
-        IncrEntry e;
-        memset(&e, 0, sizeof(e));
-        e.length = len;
-        e.log_prob = (double)len * log_base;
-        heap_push(&heap, &e);
+        /* Seed with best candidate at each length 1..MAX_PASS_LEN */
+        for (int len = 1; len <= MAX_PASS_LEN; len++) {
+            IncrEntry e;
+            memset(&e, 0, sizeof(e));
+            e.length = len;
+            e.log_prob = (double)len * log_base;
+            heap_push(g_incr_heap, &e);
+        }
     }
 
-    while (heap.size > 0 && !atomic_load_explicit(&g_found, memory_order_relaxed) && !g_interrupted) {
-        IncrEntry e = heap_pop(&heap);
+    while (g_incr_heap->size > 0 && !atomic_load_explicit(&g_found, memory_order_relaxed) && !g_interrupted) {
+        IncrEntry e = heap_pop(g_incr_heap);
 
         /* Reconstruct index from indices array and generate password */
         char pass[MAX_PASS_LEN + 1];
@@ -1889,8 +2070,8 @@ static void *incr_producer_thread(void *arg)
                 IncrEntry child = e;
                 child.indices[pos]++;
                 child.log_prob += log_base * 0.1;
-                if (heap.size < heap.capacity)
-                    heap_push(&heap, &child);
+                if (g_incr_heap->size < g_incr_heap->capacity)
+                    heap_push(g_incr_heap, &child);
                 break;
             }
         }
@@ -1901,7 +2082,6 @@ static void *incr_producer_thread(void *arg)
     pthread_cond_broadcast(&g_incr_not_empty);
     pthread_mutex_unlock(&g_incr_mutex);
 
-    heap_free(&heap);
     return NULL;
 }
 
@@ -2436,6 +2616,7 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
 {
     for (int i = 0; i < count; i++) {
         const uint8_t *key = keys + i * key_bytes;
+        int user_match = 0;
 
         if (g_enc_params.revision == 2) {
             /* Algorithm 4: RC4-encrypt padding, compare all 32 bytes of U */
@@ -2445,11 +2626,8 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
                     key, (size_t)key_bytes, NULL,
                     PDF_PASSWORD_PADDING, 32,
                     computed_u, 32, &out_len);
-            if (memcmp(computed_u, g_enc_params.u_value, 32) == 0) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, passwords[i], MAX_PASS_LEN);
-                return 1;
-            }
+            if (memcmp(computed_u, g_enc_params.u_value, 32) == 0)
+                user_match = 1;
         } else {
             /* Algorithm 5: MD5(padding+fileID), 20 RC4 passes, compare 16 bytes */
             CC_MD5_CTX md5;
@@ -2478,9 +2656,27 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
                 memcpy(encrypted, temp, 16);
             }
 
-            if (memcmp(encrypted, g_enc_params.u_value, 16) == 0) {
-                if (!atomic_exchange(&g_found, 1))
+            if (memcmp(encrypted, g_enc_params.u_value, 16) == 0)
+                user_match = 1;
+        }
+
+        /* GPU keygen computes user key (Algorithm 2). Check user match. */
+        if (user_match && g_password_mode != PW_MODE_OWNER) {
+            if (!atomic_exchange(&g_found, 1)) {
+                strncpy(g_password, passwords[i], MAX_PASS_LEN);
+                g_found_type = "User";
+            }
+            return 1;
+        }
+
+        /* For owner password: Algorithm 3 is different from Algorithm 2,
+         * so GPU-derived keys won't work. Fall back to CPU verify. */
+        if (g_password_mode == PW_MODE_OWNER || g_password_mode == PW_MODE_BOTH) {
+            if (pdf_verify_owner_password(&g_enc_params, passwords[i])) {
+                if (!atomic_exchange(&g_found, 1)) {
                     strncpy(g_password, passwords[i], MAX_PASS_LEN);
+                    g_found_type = "Owner";
+                }
                 return 1;
             }
         }
@@ -2780,17 +2976,44 @@ done:
 }
 
 /* ================================================================
- * R5 SHA-256 GPU workers — full verification on GPU, no CPU step
+ * R5 SHA-256 GPU workers — async double-buffered pipeline
  * ================================================================ */
+
+/* Helper: wait for R5 async results with _ex support for BOTH mode */
+static inline int sha256_wait_and_check(void *handle, int count, const char **pw_buf)
+{
+    int match_type = 0;
+    int match = (g_password_mode == PW_MODE_BOTH)
+        ? metal_sha256_wait_results_ex(g_sha256_ctx, handle, count, &match_type)
+        : metal_sha256_wait_results(g_sha256_ctx, handle, count);
+    if (match >= 0) {
+        if (!atomic_exchange(&g_found, 1)) {
+            strncpy(g_password, pw_buf[match], MAX_PASS_LEN);
+            if (match_type == 1) g_found_type = "User";
+            else if (match_type == 2) g_found_type = "Owner";
+            else g_found_type = (g_password_mode == PW_MODE_OWNER) ? "Owner" : "User";
+        }
+    }
+    return match;
+}
 
 static void *gpu_sha256_brute_worker(void *arg)
 {
     GPUBruteArg *a = (GPUBruteArg *)arg;
 
-    const char **pw_ptrs = malloc(sizeof(char *) * GPU_BATCH_SIZE);
-    char *pw_storage = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN + 1));
+    /* Double-buffered password arrays for pipelining */
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN + 1));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
 
-    if (!pw_ptrs || !pw_storage) goto done;
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
@@ -2800,23 +3023,33 @@ static void *gpu_sha256_brute_worker(void *arg)
         int count = (int)(end - start);
 
         for (int i = 0; i < count; i++) {
-            char *pw = pw_storage + i * (MAX_PASS_LEN + 1);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
             g_idx_to_pass(start + i, a->length, pw);
-            pw_ptrs[i] = pw;
+            pw_ptrs[cur_buf][i] = pw;
         }
 
-        int match = metal_sha256_verify_batch(g_sha256_ctx, pw_ptrs, count);
-        if (match >= 0) {
-            if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
-        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
 done:
-    free(pw_ptrs);
-    free(pw_storage);
+    for (int b = 0; b < 2; b++) {
+        free(pw_ptrs[b]);
+        free(pw_storage[b]);
+    }
     free(arg);
     return NULL;
 }
@@ -2825,8 +3058,16 @@ static void *gpu_sha256_dict_worker(void *arg)
 {
     (void)arg;
 
-    const char **pw_ptrs = malloc(sizeof(char *) * GPU_BATCH_SIZE);
-    if (!pw_ptrs) goto done;
+    const char **pw_ptrs[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        if (!pw_ptrs[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
@@ -2836,20 +3077,27 @@ static void *gpu_sha256_dict_worker(void *arg)
         int count = (int)(end - start);
 
         for (int i = 0; i < count; i++)
-            pw_ptrs[i] = g_words[start + i];
+            pw_ptrs[cur_buf][i] = g_words[start + i];
 
-        int match = metal_sha256_verify_batch(g_sha256_ctx,
-                                               (const char **)pw_ptrs, count);
-        if (match >= 0) {
-            if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
-        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
 done:
-    free(pw_ptrs);
+    for (int b = 0; b < 2; b++) free(pw_ptrs[b]);
     free(arg);
     return NULL;
 }
@@ -2859,10 +3107,18 @@ static void *gpu_sha256_rule_worker(void *arg)
     (void)arg;
     long total = g_nwords * g_nrules;
 
-    const char **pw_ptrs = malloc(sizeof(char *) * GPU_BATCH_SIZE);
-    char *pw_storage = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN * 2 + 2));
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN * 2 + 2));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
 
-    if (!pw_ptrs || !pw_storage) goto done;
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
@@ -2875,23 +3131,33 @@ static void *gpu_sha256_rule_worker(void *arg)
             long idx = start + i;
             long word_idx = idx / g_nrules;
             int  rule_idx = (int)(idx % g_nrules);
-            char *pw = pw_storage + i * (MAX_PASS_LEN * 2 + 2);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
             apply_rule(g_words[word_idx], rule_idx, pw);
-            pw_ptrs[i] = pw;
+            pw_ptrs[cur_buf][i] = pw;
         }
 
-        int match = metal_sha256_verify_batch(g_sha256_ctx, pw_ptrs, count);
-        if (match >= 0) {
-            if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
-        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
 done:
-    free(pw_ptrs);
-    free(pw_storage);
+    for (int b = 0; b < 2; b++) {
+        free(pw_ptrs[b]);
+        free(pw_storage[b]);
+    }
     free(arg);
     return NULL;
 }
@@ -2901,10 +3167,18 @@ static void *gpu_sha256_hybrid_worker(void *arg)
     (void)arg;
     long total = g_nwords * g_hybrid_suffix_keyspace;
 
-    const char **pw_ptrs = malloc(sizeof(char *) * GPU_BATCH_SIZE);
-    char *pw_storage = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN * 2 + 2));
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN * 2 + 2));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
 
-    if (!pw_ptrs || !pw_storage) goto done;
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
@@ -2917,23 +3191,33 @@ static void *gpu_sha256_hybrid_worker(void *arg)
             long idx = start + i;
             long word_idx = idx / g_hybrid_suffix_keyspace;
             long suffix_idx = idx % g_hybrid_suffix_keyspace;
-            char *pw = pw_storage + i * (MAX_PASS_LEN * 2 + 2);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
             hybrid_gen_pass(word_idx, suffix_idx, pw);
-            pw_ptrs[i] = pw;
+            pw_ptrs[cur_buf][i] = pw;
         }
 
-        int match = metal_sha256_verify_batch(g_sha256_ctx, pw_ptrs, count);
-        if (match >= 0) {
-            if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
-        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
 done:
-    free(pw_ptrs);
-    free(pw_storage);
+    for (int b = 0; b < 2; b++) {
+        free(pw_ptrs[b]);
+        free(pw_storage[b]);
+    }
     free(arg);
     return NULL;
 }
@@ -2941,6 +3225,24 @@ done:
 /* ================================================================
  * R6 GPU workers (Algorithm 2.B — SHA-256/384/512 + AES on GPU)
  * ================================================================ */
+
+/* Helper: wait for R6 async results with _ex support for BOTH mode */
+static inline int r6_wait_and_check(void *handle, int count, const char **pw_buf)
+{
+    int match_type = 0;
+    int match = (g_password_mode == PW_MODE_BOTH)
+        ? metal_r6_wait_results_ex(g_r6_ctx, handle, count, &match_type)
+        : metal_r6_wait_results(g_r6_ctx, handle, count);
+    if (match >= 0) {
+        if (!atomic_exchange(&g_found, 1)) {
+            strncpy(g_password, pw_buf[match], MAX_PASS_LEN);
+            if (match_type == 1) g_found_type = "User";
+            else if (match_type == 2) g_found_type = "Owner";
+            else g_found_type = (g_password_mode == PW_MODE_OWNER) ? "Owner" : "User";
+        }
+    }
+    return match;
+}
 
 static void *gpu_r6_brute_worker(void *arg)
 {
@@ -2978,12 +3280,8 @@ static void *gpu_r6_brute_worker(void *arg)
 
         /* Wait for previous batch if any */
         if (pending_handle) {
-            int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
             pending_handle = NULL;
-            if (match >= 0) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
-            }
             atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
@@ -2996,11 +3294,7 @@ static void *gpu_r6_brute_worker(void *arg)
 
     /* Wait for final batch */
     if (pending_handle) {
-        int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
-        if (match >= 0) {
-            if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
-        }
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
         atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
@@ -3041,12 +3335,8 @@ static void *gpu_r6_dict_worker(void *arg)
             pw_ptrs[cur_buf][i] = g_words[start + i];
 
         if (pending_handle) {
-            int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
             pending_handle = NULL;
-            if (match >= 0) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
-            }
             atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
@@ -3057,11 +3347,7 @@ static void *gpu_r6_dict_worker(void *arg)
     }
 
     if (pending_handle) {
-        int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
-        if (match >= 0) {
-            if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
-        }
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
         atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
@@ -3108,12 +3394,8 @@ static void *gpu_r6_rule_worker(void *arg)
         }
 
         if (pending_handle) {
-            int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
             pending_handle = NULL;
-            if (match >= 0) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
-            }
             atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
@@ -3124,11 +3406,7 @@ static void *gpu_r6_rule_worker(void *arg)
     }
 
     if (pending_handle) {
-        int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
-        if (match >= 0) {
-            if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
-        }
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
         atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
@@ -3178,12 +3456,8 @@ static void *gpu_r6_hybrid_worker(void *arg)
         }
 
         if (pending_handle) {
-            int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
             pending_handle = NULL;
-            if (match >= 0) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
-            }
             atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
@@ -3194,11 +3468,7 @@ static void *gpu_r6_hybrid_worker(void *arg)
     }
 
     if (pending_handle) {
-        int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
-        if (match >= 0) {
-            if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
-        }
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
         atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
@@ -3322,6 +3592,1157 @@ static void *prince_rule_worker(void *arg)
         }
     }
     atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
+ * Toggle-case walk: enumerate all case variations of dict words
+ * ================================================================ */
+static void *toggle_worker(void *arg)
+{
+    (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    long local_count = 0;
+    char pass[MAX_PASS_LEN + 1];
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long word_idx = atomic_fetch_add(&g_next_idx, 1);
+        if (word_idx >= g_nwords) break;
+
+        const char *word = g_words[word_idx];
+        size_t wlen = strlen(word);
+
+        /* Count alpha chars (positions where case can be toggled) */
+        int alpha_positions[MAX_PASS_LEN];
+        int nalpha = 0;
+        for (size_t j = 0; j < wlen && j < MAX_PASS_LEN; j++) {
+            if (isalpha((unsigned char)word[j]))
+                alpha_positions[nalpha++] = (int)j;
+        }
+        if (nalpha > 16) nalpha = 16; /* cap at 2^16 = 65536 variants */
+
+        long nvariants = 1L << nalpha;
+        strncpy(pass, word, MAX_PASS_LEN);
+        pass[MAX_PASS_LEN] = '\0';
+
+        for (long v = 0; v < nvariants && !atomic_load_explicit(&g_found, memory_order_relaxed); v++) {
+            /* Apply toggle bits */
+            for (int b = 0; b < nalpha; b++) {
+                int pos = alpha_positions[b];
+                char ch = word[pos];
+                pass[pos] = (v & (1L << b)) ? (islower((unsigned char)ch) ? toupper((unsigned char)ch) : tolower((unsigned char)ch)) : ch;
+            }
+
+            if (++local_count >= TESTED_BATCH) {
+                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+                local_count = 0;
+            }
+
+            if (test_password_fast(pass)) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pass, MAX_PASS_LEN);
+                break;
+            }
+        }
+    }
+    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    free(arg);
+    return NULL;
+}
+
+/* GPU toggle worker for R5/R6 */
+static void *gpu_sha256_toggle_worker(void *arg)
+{
+    (void)arg;
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN + 1));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    /* Each word generates up to 2^nalpha variants; iterate with a shared word counter */
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        int count = 0;
+        /* Fill a batch from toggle variants */
+        while (count < GPU_BATCH_SIZE) {
+            long idx = atomic_fetch_add(&g_next_idx, 1);
+            if (idx >= atomic_load(&g_total)) goto submit;
+            /* Decompose: idx encodes (word_idx, variant) pairs */
+            /* We use a flat index: for each word, we store 2^nalpha variants sequentially */
+            /* g_total = sum of 2^nalpha for all words, pre-computed */
+            /* We need a different approach: flat linear index into combined space */
+            long flat = idx;
+            /* For simplicity, use test_password_fast path in CPU toggle_worker;
+               GPU toggle fills batches of passwords from flat index space */
+            /* decode: scan words to find which word and variant */
+            /* This is slow; instead, precompute cumulative offsets */
+            /* For now: generate password from flat index into pw_storage */
+            char *pw = pw_storage[cur_buf] + count * (MAX_PASS_LEN + 1);
+            /* Simple approach: each word gets 2^min(nalpha,16) variants */
+            /* We stored cumulative count in g_total. Just generate inline. */
+            long word_idx = 0, cumul = 0;
+            for (long w = 0; w < g_nwords; w++) {
+                size_t wlen = strlen(g_words[w]);
+                int na = 0;
+                for (size_t j = 0; j < wlen && j < MAX_PASS_LEN; j++)
+                    if (isalpha((unsigned char)g_words[w][j])) na++;
+                if (na > 16) na = 16;
+                long nv = 1L << na;
+                if (flat < cumul + nv) { word_idx = w; flat -= cumul; break; }
+                cumul += nv;
+            }
+            const char *word = g_words[word_idx];
+            size_t wlen = strlen(word);
+            strncpy(pw, word, MAX_PASS_LEN);
+            pw[MAX_PASS_LEN] = '\0';
+            long v = flat;
+            int bi = 0;
+            for (size_t j = 0; j < wlen && j < MAX_PASS_LEN; j++) {
+                if (isalpha((unsigned char)word[j])) {
+                    if (bi < 16 && (v & (1L << bi)))
+                        pw[j] = islower((unsigned char)word[j]) ? toupper((unsigned char)word[j]) : tolower((unsigned char)word[j]);
+                    bi++;
+                }
+            }
+            pw_ptrs[cur_buf][count] = pw;
+            count++;
+        }
+    submit:
+        if (count == 0) break;
+
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
+ * Combinator attack: dict1 x dict2
+ * ================================================================ */
+static void *combinator_worker(void *arg)
+{
+    (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    long total = g_nwords * g_nwords2;
+    long local_count = 0;
+    char pass[MAX_PASS_LEN * 2 + 2];
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+        if (start >= total) break;
+        long end = start + CPU_WORK_CHUNK;
+        if (end > total) end = total;
+
+        for (long i = start; i < end && !atomic_load_explicit(&g_found, memory_order_relaxed); i++) {
+            long w1 = i / g_nwords2;
+            long w2 = i % g_nwords2;
+            size_t l1 = strlen(g_words[w1]);
+            size_t l2 = strlen(g_words2[w2]);
+            if (l1 + l2 > MAX_PASS_LEN) { if (++local_count >= TESTED_BATCH) { atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed); local_count = 0; } continue; }
+            memcpy(pass, g_words[w1], l1);
+            memcpy(pass + l1, g_words2[w2], l2);
+            pass[l1 + l2] = '\0';
+
+            if (++local_count >= TESTED_BATCH) {
+                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+                local_count = 0;
+            }
+
+            if (test_password_fast(pass)) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pass, MAX_PASS_LEN);
+                break;
+            }
+        }
+    }
+    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    free(arg);
+    return NULL;
+}
+
+/* GPU combinator worker for R5 */
+static void *gpu_sha256_combinator_worker(void *arg)
+{
+    (void)arg;
+    long total = g_nwords * g_nwords2;
+
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN * 2 + 2));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
+        if (start >= total) break;
+        long end = start + GPU_BATCH_SIZE;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            long idx = start + i;
+            long w1 = idx / g_nwords2;
+            long w2 = idx % g_nwords2;
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
+            size_t l1 = strlen(g_words[w1]);
+            size_t l2 = strlen(g_words2[w2]);
+            if (l1 + l2 <= MAX_PASS_LEN) {
+                memcpy(pw, g_words[w1], l1);
+                memcpy(pw + l1, g_words2[w2], l2);
+                pw[l1 + l2] = '\0';
+            } else {
+                pw[0] = '\0';
+            }
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    free(arg);
+    return NULL;
+}
+
+/* GPU combinator worker for R6 */
+static void *gpu_r6_combinator_worker(void *arg)
+{
+    (void)arg;
+    long total = g_nwords * g_nwords2;
+    int batch = metal_r6_max_batch(g_r6_ctx);
+    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
+
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= total) break;
+        long end = start + batch;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            long idx = start + i;
+            long w1 = idx / g_nwords2;
+            long w2 = idx % g_nwords2;
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
+            size_t l1 = strlen(g_words[w1]);
+            size_t l2 = strlen(g_words2[w2]);
+            if (l1 + l2 <= MAX_PASS_LEN) {
+                memcpy(pw, g_words[w1], l1);
+                memcpy(pw + l1, g_words2[w2], l2);
+                pw[l1 + l2] = '\0';
+            } else {
+                pw[0] = '\0';
+            }
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
+ * Date-based attack: try common date password formats
+ * ================================================================ */
+
+/* Number of date formats */
+#define DATE_FMT_COUNT 9
+/* Additional variations: YYYY, MMYYYY, YYYYMM */
+#define DATE_VAR_COUNT 3
+
+static long dates_compute_keyspace(void)
+{
+    int nyears = g_date_year_end - g_date_year_start + 1;
+    /* Full date formats: DATE_FMT_COUNT * 12 months * 31 days * nyears */
+    long full = (long)DATE_FMT_COUNT * 12 * 31 * nyears;
+    /* Variations: YYYY, MMYYYY, YYYYMM → nyears + 12*nyears + 12*nyears */
+    long var = (long)nyears + 2L * 12 * nyears;
+    return full + var;
+}
+
+static void dates_index_to_pass(long idx, char *out)
+{
+    int nyears = g_date_year_end - g_date_year_start + 1;
+    long full_count = (long)DATE_FMT_COUNT * 12 * 31 * nyears;
+
+    if (idx < full_count) {
+        /* Full date format */
+        int fmt = (int)(idx % DATE_FMT_COUNT);
+        long rem = idx / DATE_FMT_COUNT;
+        int day = (int)(rem % 31) + 1;
+        rem /= 31;
+        int month = (int)(rem % 12) + 1;
+        rem /= 12;
+        int year = (int)rem + g_date_year_start;
+        int yy = year % 100;
+
+        switch (fmt) {
+            case 0: snprintf(out, MAX_PASS_LEN+1, "%02d%02d%04d", month, day, year); break;  /* MMDDYYYY */
+            case 1: snprintf(out, MAX_PASS_LEN+1, "%02d%02d%04d", day, month, year); break;  /* DDMMYYYY */
+            case 2: snprintf(out, MAX_PASS_LEN+1, "%04d%02d%02d", year, month, day); break;  /* YYYYMMDD */
+            case 3: snprintf(out, MAX_PASS_LEN+1, "%02d/%02d/%04d", month, day, year); break; /* MM/DD/YYYY */
+            case 4: snprintf(out, MAX_PASS_LEN+1, "%02d/%02d/%04d", day, month, year); break; /* DD/MM/YYYY */
+            case 5: snprintf(out, MAX_PASS_LEN+1, "%04d-%02d-%02d", year, month, day); break; /* YYYY-MM-DD */
+            case 6: snprintf(out, MAX_PASS_LEN+1, "%02d%02d%02d", month, day, yy); break;    /* MMDDYY */
+            case 7: snprintf(out, MAX_PASS_LEN+1, "%02d%02d%02d", day, month, yy); break;    /* DDMMYY */
+            case 8: snprintf(out, MAX_PASS_LEN+1, "%02d%02d%02d", yy, month, day); break;    /* YYMMDD */
+        }
+    } else {
+        /* Variations */
+        long var_idx = idx - full_count;
+        if (var_idx < nyears) {
+            /* Just year: YYYY */
+            int year = (int)var_idx + g_date_year_start;
+            snprintf(out, MAX_PASS_LEN+1, "%04d", year);
+        } else {
+            var_idx -= nyears;
+            if (var_idx < 12L * nyears) {
+                /* MMYYYY */
+                int month = (int)(var_idx % 12) + 1;
+                int year = (int)(var_idx / 12) + g_date_year_start;
+                snprintf(out, MAX_PASS_LEN+1, "%02d%04d", month, year);
+            } else {
+                var_idx -= 12L * nyears;
+                /* YYYYMM */
+                int month = (int)(var_idx % 12) + 1;
+                int year = (int)(var_idx / 12) + g_date_year_start;
+                snprintf(out, MAX_PASS_LEN+1, "%04d%02d", year, month);
+            }
+        }
+    }
+}
+
+static void *dates_worker(void *arg)
+{
+    (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    long total = atomic_load(&g_total);
+    long local_count = 0;
+    char pass[MAX_PASS_LEN + 1];
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+        if (start >= total) break;
+        long end = start + CPU_WORK_CHUNK;
+        if (end > total) end = total;
+
+        for (long i = start; i < end && !atomic_load_explicit(&g_found, memory_order_relaxed); i++) {
+            dates_index_to_pass(i, pass);
+
+            if (++local_count >= TESTED_BATCH) {
+                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+                local_count = 0;
+            }
+
+            if (test_password_fast(pass)) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pass, MAX_PASS_LEN);
+                break;
+            }
+        }
+    }
+    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    free(arg);
+    return NULL;
+}
+
+static void *gpu_sha256_dates_worker(void *arg)
+{
+    (void)arg;
+    long total = atomic_load(&g_total);
+
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN + 1));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
+        if (start >= total) break;
+        long end = start + GPU_BATCH_SIZE;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
+            dates_index_to_pass(start + i, pw);
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    free(arg);
+    return NULL;
+}
+
+static void *gpu_r6_dates_worker(void *arg)
+{
+    (void)arg;
+    long total = atomic_load(&g_total);
+    int batch = metal_r6_max_batch(g_r6_ctx);
+    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
+
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN + 1));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= total) break;
+        long end = start + batch;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
+            dates_index_to_pass(start + i, pw);
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
+ * Smart mutations attack: apply common mutations to dictionary words
+ * Mutations per word: 10 + 100 + 1000 + 77 + 10 + 9 + 1 + 1 + 1 + 1 = 1210
+ * ================================================================ */
+#define MUTATE_NMUTATIONS 1210
+
+static const char *mutate_suffixes[] = {
+    "!", "@", "#", "$", "123", "1234", "12345", "!!", "!!!", "@#$"
+};
+#define MUTATE_NSUFFIXES 10
+
+static void mutate_index_to_pass(long word_idx, int mut_idx, char *out)
+{
+    const char *word = g_words[word_idx];
+    size_t wlen = strlen(word);
+
+    if (mut_idx < 10) {
+        /* Append single digit 0-9 */
+        if (wlen + 1 <= MAX_PASS_LEN) {
+            memcpy(out, word, wlen);
+            out[wlen] = '0' + mut_idx;
+            out[wlen + 1] = '\0';
+        } else { out[0] = '\0'; }
+    } else if (mut_idx < 110) {
+        /* Append two digits 00-99 */
+        int n = mut_idx - 10;
+        if (wlen + 2 <= MAX_PASS_LEN) {
+            memcpy(out, word, wlen);
+            out[wlen]     = '0' + (n / 10);
+            out[wlen + 1] = '0' + (n % 10);
+            out[wlen + 2] = '\0';
+        } else { out[0] = '\0'; }
+    } else if (mut_idx < 1110) {
+        /* Append three digits 000-999 */
+        int n = mut_idx - 110;
+        if (wlen + 3 <= MAX_PASS_LEN) {
+            memcpy(out, word, wlen);
+            out[wlen]     = '0' + (n / 100);
+            out[wlen + 1] = '0' + ((n / 10) % 10);
+            out[wlen + 2] = '0' + (n % 10);
+            out[wlen + 3] = '\0';
+        } else { out[0] = '\0'; }
+    } else if (mut_idx < 1187) {
+        /* Append years 1950-2026 (77 years) */
+        int year = 1950 + (mut_idx - 1110);
+        if (wlen + 4 <= MAX_PASS_LEN) {
+            memcpy(out, word, wlen);
+            snprintf(out + wlen, MAX_PASS_LEN + 1 - wlen, "%04d", year);
+        } else { out[0] = '\0'; }
+    } else if (mut_idx < 1197) {
+        /* Append common suffixes */
+        int si = mut_idx - 1187;
+        const char *suffix = mutate_suffixes[si];
+        size_t slen = strlen(suffix);
+        if (wlen + slen <= MAX_PASS_LEN) {
+            memcpy(out, word, wlen);
+            memcpy(out + wlen, suffix, slen);
+            out[wlen + slen] = '\0';
+        } else { out[0] = '\0'; }
+    } else if (mut_idx < 1206) {
+        /* Prepend digits 1-9 */
+        int d = mut_idx - 1197 + 1;
+        if (wlen + 1 <= MAX_PASS_LEN) {
+            out[0] = '0' + d;
+            memcpy(out + 1, word, wlen);
+            out[wlen + 1] = '\0';
+        } else { out[0] = '\0'; }
+    } else if (mut_idx == 1206) {
+        /* Capitalize first letter */
+        memcpy(out, word, wlen + 1);
+        if (wlen > 0) out[0] = toupper((unsigned char)out[0]);
+    } else if (mut_idx == 1207) {
+        /* Capitalize all letters */
+        for (size_t i = 0; i < wlen; i++)
+            out[i] = toupper((unsigned char)word[i]);
+        out[wlen] = '\0';
+    } else if (mut_idx == 1208) {
+        /* Reverse the word */
+        for (size_t i = 0; i < wlen; i++)
+            out[i] = word[wlen - 1 - i];
+        out[wlen] = '\0';
+    } else if (mut_idx == 1209) {
+        /* Double the word */
+        if (wlen * 2 <= MAX_PASS_LEN) {
+            memcpy(out, word, wlen);
+            memcpy(out + wlen, word, wlen);
+            out[wlen * 2] = '\0';
+        } else { out[0] = '\0'; }
+    } else {
+        out[0] = '\0';
+    }
+}
+
+static void *mutate_worker(void *arg)
+{
+    (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    long total = atomic_load(&g_total);
+    long local_count = 0;
+    char pass[MAX_PASS_LEN * 2 + 2];
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+        if (start >= total) break;
+        long end = start + CPU_WORK_CHUNK;
+        if (end > total) end = total;
+
+        for (long i = start; i < end && !atomic_load_explicit(&g_found, memory_order_relaxed); i++) {
+            long word_idx = i / MUTATE_NMUTATIONS;
+            int  mut_idx  = (int)(i % MUTATE_NMUTATIONS);
+            mutate_index_to_pass(word_idx, mut_idx, pass);
+
+            if (++local_count >= TESTED_BATCH) {
+                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+                local_count = 0;
+            }
+
+            if (pass[0] && test_password_fast(pass)) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pass, MAX_PASS_LEN);
+                break;
+            }
+        }
+    }
+    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    free(arg);
+    return NULL;
+}
+
+static void *gpu_sha256_mutate_worker(void *arg)
+{
+    (void)arg;
+    long total = atomic_load(&g_total);
+
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN * 2 + 2));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
+        if (start >= total) break;
+        long end = start + GPU_BATCH_SIZE;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            long idx = start + i;
+            long word_idx = idx / MUTATE_NMUTATIONS;
+            int  mut_idx  = (int)(idx % MUTATE_NMUTATIONS);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
+            mutate_index_to_pass(word_idx, mut_idx, pw);
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    free(arg);
+    return NULL;
+}
+
+static void *gpu_r6_mutate_worker(void *arg)
+{
+    (void)arg;
+    long total = atomic_load(&g_total);
+    int batch = metal_r6_max_batch(g_r6_ctx);
+    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
+
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= total) break;
+        long end = start + batch;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            long idx = start + i;
+            long word_idx = idx / MUTATE_NMUTATIONS;
+            int  mut_idx  = (int)(idx % MUTATE_NMUTATIONS);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
+            mutate_index_to_pass(word_idx, mut_idx, pw);
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
+ * L33tspeak substitutions attack
+ * Substitution map: a→@, a→4, e→3, i→1, i→!, o→0, s→$, s→5, t→7, l→1, b→8, g→9
+ * ================================================================ */
+
+typedef struct {
+    char from;
+    char to;
+} LeetSub;
+
+static const LeetSub g_leet_subs[] = {
+    {'a', '@'}, {'a', '4'}, {'e', '3'}, {'i', '1'}, {'i', '!'},
+    {'o', '0'}, {'s', '$'}, {'s', '5'}, {'t', '7'}, {'l', '1'},
+    {'b', '8'}, {'g', '9'},
+};
+#define LEET_NSUBS 12
+
+/* Precomputed per-word leet info */
+typedef struct {
+    long cumul_offset;  /* cumulative variants from prior words */
+    int  nsub_pos;      /* number of substitutable positions (capped at 16) */
+    int  sub_pos[16];   /* positions within the word */
+    int  sub_idx[16];   /* index into g_leet_subs for each position */
+    int  nsubs_at[16];  /* number of possible substitutions at each position */
+    int  sub_start[16]; /* starting index in g_leet_subs for each position */
+} LeetWordInfo;
+
+static LeetWordInfo *g_leet_info = NULL;
+static long g_leet_total = 0;
+
+static void leet_precompute(void)
+{
+    g_leet_info = calloc((size_t)g_nwords, sizeof(LeetWordInfo));
+    if (!g_leet_info) return;
+
+    long cumul = 0;
+    for (long w = 0; w < g_nwords; w++) {
+        g_leet_info[w].cumul_offset = cumul;
+        const char *word = g_words[w];
+        size_t wlen = strlen(word);
+        int npos = 0;
+
+        for (size_t j = 0; j < wlen && j < MAX_PASS_LEN; j++) {
+            char lc = tolower((unsigned char)word[j]);
+            /* Count how many subs apply to this char */
+            int nsubs = 0;
+            int first_sub = -1;
+            for (int s = 0; s < LEET_NSUBS; s++) {
+                if (g_leet_subs[s].from == lc) {
+                    if (first_sub < 0) first_sub = s;
+                    nsubs++;
+                }
+            }
+            if (nsubs > 0 && npos < 16) {
+                g_leet_info[w].sub_pos[npos] = (int)j;
+                g_leet_info[w].nsubs_at[npos] = nsubs;
+                g_leet_info[w].sub_start[npos] = first_sub;
+                npos++;
+            }
+        }
+        g_leet_info[w].nsub_pos = npos;
+
+        /* Compute variants: product of (nsubs_at[i] + 1) for each position
+         * (the +1 is for keeping the original char) */
+        long nvariants = 1;
+        for (int p = 0; p < npos; p++) {
+            nvariants *= (g_leet_info[w].nsubs_at[p] + 1);
+            if (nvariants > 65536) { nvariants = 65536; break; }
+        }
+        cumul += nvariants;
+    }
+    g_leet_total = cumul;
+}
+
+/* Decode flat index into word_idx + variant */
+static void leet_index_to_pass(long idx, char *out)
+{
+    /* Binary search for word */
+    long lo = 0, hi = g_nwords - 1;
+    while (lo < hi) {
+        long mid = (lo + hi + 1) / 2;
+        if (g_leet_info[mid].cumul_offset <= idx) lo = mid;
+        else hi = mid - 1;
+    }
+    long word_idx = lo;
+    long var_idx = idx - g_leet_info[word_idx].cumul_offset;
+
+    const char *word = g_words[word_idx];
+    size_t wlen = strlen(word);
+    if (wlen > MAX_PASS_LEN) wlen = MAX_PASS_LEN;
+    memcpy(out, word, wlen);
+    out[wlen] = '\0';
+
+    int npos = g_leet_info[word_idx].nsub_pos;
+    /* Decompose var_idx into per-position choice using mixed-radix */
+    for (int p = 0; p < npos; p++) {
+        int nchoices = g_leet_info[word_idx].nsubs_at[p] + 1; /* +1 for original */
+        int choice = (int)(var_idx % nchoices);
+        var_idx /= nchoices;
+        if (choice > 0) {
+            /* choice 1..nsubs → apply substitution */
+            int si = g_leet_info[word_idx].sub_start[p] + (choice - 1);
+            int pos = g_leet_info[word_idx].sub_pos[p];
+            out[pos] = g_leet_subs[si].to;
+        }
+    }
+}
+
+static void *leet_worker(void *arg)
+{
+    (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    long total = atomic_load(&g_total);
+    long local_count = 0;
+    char pass[MAX_PASS_LEN + 1];
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+        if (start >= total) break;
+        long end = start + CPU_WORK_CHUNK;
+        if (end > total) end = total;
+
+        for (long i = start; i < end && !atomic_load_explicit(&g_found, memory_order_relaxed); i++) {
+            leet_index_to_pass(i, pass);
+
+            if (++local_count >= TESTED_BATCH) {
+                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+                local_count = 0;
+            }
+
+            if (test_password_fast(pass)) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pass, MAX_PASS_LEN);
+                break;
+            }
+        }
+    }
+    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    free(arg);
+    return NULL;
+}
+
+static void *gpu_sha256_leet_worker(void *arg)
+{
+    (void)arg;
+    long total = atomic_load(&g_total);
+
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN + 1));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
+        if (start >= total) break;
+        long end = start + GPU_BATCH_SIZE;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
+            leet_index_to_pass(start + i, pw);
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    free(arg);
+    return NULL;
+}
+
+static void *gpu_r6_leet_worker(void *arg)
+{
+    (void)arg;
+    long total = atomic_load(&g_total);
+    int batch = metal_r6_max_batch(g_r6_ctx);
+    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
+
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN + 1));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= total) break;
+        long end = start + batch;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
+            leet_index_to_pass(start + i, pw);
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
+ * Mask+rules hybrid attack: apply rules to mask-generated candidates
+ * ================================================================ */
+static void *mask_rule_worker(void *arg)
+{
+    (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    long total = g_mask_keyspace * g_nrules;
+    long local_count = 0;
+    char base[MAX_PASS_LEN + 1];
+    char pass[MAX_PASS_LEN * 2 + 2];
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+        if (start >= total) break;
+        long end = start + CPU_WORK_CHUNK;
+        if (end > total) end = total;
+
+        for (long idx = start; idx < end && !atomic_load_explicit(&g_found, memory_order_relaxed); idx++) {
+            long mask_idx = idx / g_nrules;
+            int  rule_idx = (int)(idx % g_nrules);
+            mask_index_to_pass(mask_idx, 0, base);
+            apply_rule(base, rule_idx, pass);
+
+            if (++local_count >= TESTED_BATCH) {
+                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+                local_count = 0;
+            }
+
+            if (pass[0] && test_password_fast(pass)) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pass, MAX_PASS_LEN);
+                break;
+            }
+        }
+    }
+    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    free(arg);
+    return NULL;
+}
+
+/* GPU mask+rules worker for R5 */
+static void *gpu_sha256_mask_rule_worker(void *arg)
+{
+    (void)arg;
+    long total = g_mask_keyspace * g_nrules;
+
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN * 2 + 2));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
+        if (start >= total) break;
+        long end = start + GPU_BATCH_SIZE;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            long idx = start + i;
+            long mask_idx = idx / g_nrules;
+            int  rule_idx = (int)(idx % g_nrules);
+            char base[MAX_PASS_LEN + 1];
+            mask_index_to_pass(mask_idx, 0, base);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
+            apply_rule(base, rule_idx, pw);
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_sha256_submit_async(g_sha256_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        sha256_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    free(arg);
+    return NULL;
+}
+
+/* GPU mask+rules worker for R6 */
+static void *gpu_r6_mask_rule_worker(void *arg)
+{
+    (void)arg;
+    long total = g_mask_keyspace * g_nrules;
+    int batch = metal_r6_max_batch(g_r6_ctx);
+    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
+
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0, pending_buf = 0;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, batch);
+        if (start >= total) break;
+        long end = start + batch;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            long idx = start + i;
+            long mask_idx = idx / g_nrules;
+            int  rule_idx = (int)(idx % g_nrules);
+            char base[MAX_PASS_LEN + 1];
+            mask_index_to_pass(mask_idx, 0, base);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
+            apply_rule(base, rule_idx, pw);
+            pw_ptrs[cur_buf][i] = pw;
+        }
+
+        if (pending_handle) {
+            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+            pending_handle = NULL;
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+    if (pending_handle) {
+        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+    }
+done:
+    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
     free(arg);
     return NULL;
 }
@@ -3765,7 +5186,7 @@ static PasswordHints interactive_interview(void)
     PasswordHints h = {0};
     h.min_len = 1;
     h.max_len = 8;
-    strcpy(h.charset, DEFAULT_CHARSET);
+    snprintf(h.charset, sizeof(h.charset), "%s", DEFAULT_CHARSET);
 
     char buf[256];
 
@@ -3786,13 +5207,13 @@ static PasswordHints interactive_interview(void)
     read_line(buf, sizeof(buf));
 
     if (buf[0] == '1') {
-        strcpy(h.charset, "0123456789");
+        snprintf(h.charset, sizeof(h.charset), "%s", "0123456789");
     } else if (buf[0] == '2') {
-        strcpy(h.charset, "abcdefghijklmnopqrstuvwxyz0123456789");
+        snprintf(h.charset, sizeof(h.charset), "%s", "abcdefghijklmnopqrstuvwxyz0123456789");
     } else if (buf[0] == '3') {
-        strcpy(h.charset, DEFAULT_CHARSET);
+        snprintf(h.charset, sizeof(h.charset), "%s", DEFAULT_CHARSET);
     } else if (buf[0] == '4') {
-        strcpy(h.charset, DEFAULT_CHARSET "!@#$%^&*()-_=+[]{}|;:',.<>?/`~");
+        snprintf(h.charset, sizeof(h.charset), "%s", DEFAULT_CHARSET "!@#$%^&*()-_=+[]{}|;:',.<>?/`~");
     } else if (buf[0] == '5') {
         fprintf(stderr, "Enter charset: ");
         read_line(buf, sizeof(buf));
@@ -3907,7 +5328,15 @@ static void usage(const char *p)
         "  --keywalk                   fingerprint attack with keyboard walks\n"
         "  --prince-words              use PRINCE 2-word combos for ?w in masks (use with -d)\n"
         "  --incremental / -I          incremental probability mode (requires -M <model>)\n"
-        "  --gpu-batch <N>             override GPU batch size\n",
+        "  --gpu-batch <N>             override GPU batch size\n"
+        "  --pot-file <path>           use custom pot file path\n"
+        "  --progress-file <path>      write JSON progress to file (atomic updates)\n"
+        "  --combinator <wordlist2>    combinator attack: dict1 x dict2 (use with -d)\n"
+        "  --toggle                    toggle-case walk: all case variations of dict words\n"
+        "  --dates                     date-based password attack (MMDDYYYY, YYYYMMDD, etc.)\n"
+        "  --date-range YYYY-YYYY      year range for --dates (default: 1940-2026)\n"
+        "  --mutate                    smart mutations of dict words (use with -d)\n"
+        "  --leet                      l33tspeak substitutions of dict words (use with -d)\n",
         p, p, p, p, p, p, p);
     exit(1);
 }
@@ -3959,6 +5388,14 @@ int main(int argc, char *argv[])
         {"prince-words",     no_argument,       NULL, 0x110},
         {"incremental",      no_argument,       NULL, 0x111},
         {"gpu-batch",        required_argument, NULL, 0x112},
+        {"pot-file",         required_argument, NULL, 0x113},
+        {"progress-file",    required_argument, NULL, 0x114},
+        {"combinator",       required_argument, NULL, 0x115},
+        {"toggle",           no_argument,       NULL, 0x116},
+        {"dates",            no_argument,       NULL, 0x117},
+        {"date-range",       required_argument, NULL, 0x118},
+        {"mutate",           no_argument,       NULL, 0x119},
+        {"leet",             no_argument,       NULL, 0x11A},
         {NULL, 0, NULL, 0}
     };
 
@@ -3969,9 +5406,9 @@ int main(int argc, char *argv[])
             case 'f': pdf_path    = optarg;       break;
             case 'd': dict_path   = optarg;       break;
             case 'b': brute       = 1;            break;
-            case 'l': max_len     = atoi(optarg); break;
+            case 'l': max_len     = safe_atoi(optarg, 1, 127, "-l"); break;
             case 'c': charset     = optarg;       break;
-            case 't': nthreads    = atoi(optarg); break;
+            case 't': nthreads    = safe_atoi(optarg, 1, 256, "-t"); break;
             case 'G': no_gpu      = 1;            break;
             case 'r': resume      = 1;            break;
             case 'i': interactive = 1;            break;
@@ -3986,7 +5423,7 @@ int main(int argc, char *argv[])
                           g_hybrid_mask_mode = 1;
                           strncpy(g_hybrid_mask_str, optarg, sizeof(g_hybrid_mask_str) - 1);
                       } else {
-                          g_hybrid_suffix_len = atoi(optarg);
+                          g_hybrid_suffix_len = safe_atoi(optarg, 1, 32, "-H");
                       }
                       break;
             case 'B': g_benchmark_mode = 1;       break;
@@ -4004,11 +5441,11 @@ int main(int argc, char *argv[])
             case 'M': markov_model_path = optarg; break;
             case 0x100: markov_train_wordlist = optarg; break;
             case 0x101: markov_train_output   = optarg; break;
-            case 0x102: markov_threshold      = atoi(optarg); break;
+            case 0x102: markov_threshold      = safe_atoi(optarg, 1, 256, "--markov-threshold"); break;
             case 0x103: generate_pattern      = optarg; break;
             case 0x104: combine_mode          = 1; break;
-            case 0x105: markov_generate_n     = atoi(optarg); break;
-            case 0x106: g_max_rounds         = atoi(optarg); break;
+            case 0x105: markov_generate_n     = safe_atoi(optarg, 1, 100000000, "--markov-generate"); break;
+            case 0x106: g_max_rounds         = safe_atoi(optarg, 1, 100000, "--max-rounds"); break;
             case 0x107: g_prince_mode        = 1;            break;
             case 0x108: g_fingerprint_mode   = 1;            break;
             case 0x109: g_rule_dedup         = 1;            break;
@@ -4021,7 +5458,26 @@ int main(int argc, char *argv[])
             case 0x110: g_prince_words      = 1;            break;
             case 0x111: g_incremental_mode  = 1;            break;
             case 'I':   g_incremental_mode  = 1;            break;
-            case 0x112: g_gpu_batch         = atoi(optarg); break;
+            case 0x112: g_gpu_batch         = safe_atoi(optarg, 1, 1048576, "--gpu-batch"); break;
+            case 0x113: g_custom_pot_path   = optarg;       break;
+            case 0x114: g_progress_file     = optarg;       break;
+            case 0x115: g_dict2_path        = optarg;       break;
+            case 0x116: g_toggle_mode       = 1;            break;
+            case 0x117: g_dates_mode       = 1;            break;
+            case 0x118: {
+                /* Parse YYYY-YYYY range */
+                char *dash = strchr(optarg, '-');
+                if (!dash) { fprintf(stderr, "--date-range requires YYYY-YYYY format\n"); exit(1); }
+                *dash = '\0';
+                g_date_year_start = safe_atoi(optarg, 1900, 2100, "--date-range start");
+                g_date_year_end   = safe_atoi(dash + 1, 1900, 2100, "--date-range end");
+                if (g_date_year_start > g_date_year_end) {
+                    fprintf(stderr, "--date-range: start year must be <= end year\n"); exit(1);
+                }
+                break;
+            }
+            case 0x119: g_mutate_mode      = 1;            break;
+            case 0x11A: g_leet_mode        = 1;            break;
             default:  usage(argv[0]);
         }
     }
@@ -4246,7 +5702,7 @@ int main(int argc, char *argv[])
     }
 
     /* ── Validate new mode combinations ──────────────────────────── */
-    if (g_rule_mode && !dict_path) {
+    if (g_rule_mode && !dict_path && !g_mask_mode) {
         fprintf(stderr, "-R requires -d <wordlist>\n");
         usage(argv[0]);
     }
@@ -4328,8 +5784,13 @@ int main(int argc, char *argv[])
 
     if (!brute && !dict_path && !g_mask_mode && !g_benchmark_mode &&
         !g_auto_mode && !g_prince_mode && !g_fingerprint_mode &&
-        !g_incremental_mode && !resume) {
-        fprintf(stderr, "-d, -b, -m, -A, -B, --prince, --fingerprint, or --incremental required\n");
+        !g_incremental_mode && !g_dates_mode && !g_mutate_mode &&
+        !g_leet_mode && !resume) {
+        fprintf(stderr, "-d, -b, -m, -A, -B, --prince, --fingerprint, --incremental, --dates, --mutate, or --leet required\n");
+        usage(argv[0]);
+    }
+    if ((g_mutate_mode || g_leet_mode) && !dict_path) {
+        fprintf(stderr, "--mutate and --leet require -d <wordlist>\n");
         usage(argv[0]);
     }
     if (nthreads > MAX_THREADS) nthreads = MAX_THREADS;
@@ -4423,15 +5884,17 @@ int main(int argc, char *argv[])
         g_gpu_ctx = metal_keygen_init(&g_enc_params, NULL);
         select_best_engine(nthreads);
     } else if (g_fast_crypto && !no_gpu && g_enc_params.revision == 5) {
-        /* R5: full SHA-256 verification on GPU (user password) */
-        /* check_owner: 0=user, 1=owner. For BOTH mode, start with user pass. */
-        int check_owner = (g_password_mode == PW_MODE_OWNER) ? 1 : 0;
+        /* R5: full SHA-256 verification on GPU */
+        /* check_owner: 0=user, 1=owner, 2=both */
+        int check_owner = (g_password_mode == PW_MODE_OWNER) ? 1 :
+                           (g_password_mode == PW_MODE_BOTH) ? 2 : 0;
         g_sha256_ctx = metal_sha256_init(&g_enc_params, check_owner, NULL);
         if (g_sha256_ctx)
             g_use_gpu = 1;
     } else if (g_fast_crypto && !no_gpu && g_enc_params.revision == 6) {
         /* R6: full Algorithm 2.B verification on GPU */
-        int check_owner = (g_password_mode == PW_MODE_OWNER) ? 1 : 0;
+        int check_owner = (g_password_mode == PW_MODE_OWNER) ? 1 :
+                           (g_password_mode == PW_MODE_BOTH) ? 2 : 0;
         g_r6_ctx = metal_r6_init(&g_enc_params, check_owner, NULL);
         if (g_r6_ctx) {
             g_use_gpu = 1;
@@ -4568,8 +6031,13 @@ int main(int argc, char *argv[])
     }
 
     /* ── Register signal handler for graceful shutdown ────────── */
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     /* ── Start progress thread ─────────────────────────────────── */
     pthread_t prog;
@@ -4836,7 +6304,7 @@ int main(int argc, char *argv[])
     }
 
     /* ── Mask attack ──────────────────────────────────────────── */
-    if (g_mask_mode) {
+    if (g_mask_mode && !g_rule_mode) {
         g_is_brute = 1;
         g_attack_mode = ATTACK_MASK;
 
@@ -4998,6 +6466,139 @@ int main(int argc, char *argv[])
         free(g_words);
     }
 
+    /* ── Toggle-case walk ────────────────────────────────────────── */
+    else if (g_toggle_mode && dict_path) {
+        g_is_brute = 0;
+        g_attack_mode = ATTACK_DICT;
+        if (!g_words && !load_wordlist(dict_path)) {
+            atomic_store(&g_found, 1);
+            pthread_join(prog, NULL);
+            return 1;
+        }
+
+        /* Compute total variants */
+        long toggle_total = 0;
+        for (long w = 0; w < g_nwords; w++) {
+            size_t wlen = strlen(g_words[w]);
+            int na = 0;
+            for (size_t j = 0; j < wlen && j < MAX_PASS_LEN; j++)
+                if (isalpha((unsigned char)g_words[w][j])) na++;
+            if (na > 16) na = 16;
+            toggle_total += (1L << na);
+        }
+
+        fprintf(stderr, "Mode   : toggle-case (%ld words, %ld variants)\n\n",
+                g_nwords, toggle_total);
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, toggle_total);
+        atomic_store(&g_next_idx, 0);
+        spawned = 0;
+
+        if (g_use_gpu && g_sha256_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_sha256_toggle_worker, malloc(1));
+        }
+        for (int t = 0; t < nthreads; t++) {
+            void *a = malloc(1);
+            pthread_create(&threads[spawned++], NULL, toggle_worker, a);
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+
+        for (long i = 0; i < g_nwords; i++) free(g_words[i]);
+        free(g_words);
+    }
+
+    /* ── Combinator attack (dict1 x dict2) ────────────────────── */
+    else if (g_dict2_path && dict_path) {
+        g_is_brute = 0;
+        g_attack_mode = ATTACK_COMBINATOR;
+        if (!g_words && !load_wordlist(dict_path)) {
+            atomic_store(&g_found, 1);
+            pthread_join(prog, NULL);
+            return 1;
+        }
+
+        /* Load second wordlist */
+        FILE *f2 = fopen(g_dict2_path, "r");
+        if (!f2) {
+            fprintf(stderr, "Cannot open second wordlist: %s\n", g_dict2_path);
+            atomic_store(&g_found, 1);
+            pthread_join(prog, NULL);
+            return 1;
+        }
+        long cap2 = 10000;
+        g_words2 = malloc(sizeof(char *) * cap2);
+        g_nwords2 = 0;
+        char ln2[MAX_PASS_LEN + 4];
+        while (fgets(ln2, sizeof(ln2), f2)) {
+            size_t len2 = strlen(ln2);
+            while (len2 && (ln2[len2-1] == '\n' || ln2[len2-1] == '\r')) ln2[--len2] = '\0';
+            if (!len2) continue;
+            if (g_nwords2 >= cap2) {
+                cap2 *= 2;
+                g_words2 = realloc(g_words2, sizeof(char *) * cap2);
+            }
+            g_words2[g_nwords2++] = strdup(ln2);
+        }
+        fclose(f2);
+
+        long combo_total = g_nwords * g_nwords2;
+        fprintf(stderr, "Mode   : combinator (%ld x %ld = %ld combos)\n\n",
+                g_nwords, g_nwords2, combo_total);
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, combo_total);
+        atomic_store(&g_next_idx, 0);
+        spawned = 0;
+
+        if (g_use_gpu && g_sha256_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_sha256_combinator_worker, malloc(1));
+        } else if (g_use_gpu && g_r6_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_r6_combinator_worker, malloc(1));
+        }
+        for (int t = 0; t < nthreads; t++) {
+            void *a = malloc(1);
+            pthread_create(&threads[spawned++], NULL, combinator_worker, a);
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+
+        for (long i = 0; i < g_nwords; i++) free(g_words[i]);
+        free(g_words);
+        for (long i = 0; i < g_nwords2; i++) free(g_words2[i]);
+        free(g_words2);
+    }
+
+    /* ── Mask+rules hybrid attack ─────────────────────────────── */
+    else if (g_mask_mode && g_rule_mode) {
+        g_is_brute = 0;
+        g_attack_mode = ATTACK_MASK_RULE;
+
+        if (!g_rules_file)
+            init_rules();
+        else
+            load_rules_file(g_rules_file);
+
+        long total = g_mask_keyspace * g_nrules;
+        fprintf(stderr, "Mode   : mask+rules (\"%s\" x %d rules, keyspace %ld)\n\n",
+                g_mask_str, g_nrules, total);
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, total);
+        atomic_store(&g_next_idx, 0);
+        spawned = 0;
+
+        if (g_use_gpu && g_sha256_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_sha256_mask_rule_worker, malloc(1));
+        } else if (g_use_gpu && g_r6_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_r6_mask_rule_worker, malloc(1));
+        }
+        for (int t = 0; t < nthreads; t++) {
+            void *a = malloc(1);
+            pthread_create(&threads[spawned++], NULL, mask_rule_worker, a);
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+    }
+
     /* ── PRINCE attack (word combinations) ──────────────────────── */
     else if (g_prince_mode && dict_path) {
         g_is_brute = 0;
@@ -5053,14 +6654,26 @@ int main(int argc, char *argv[])
     /* ── Incremental (Markov probability order) attack ─────────── */
     else if (g_incremental_mode && g_markov) {
         g_is_brute = 1;
-        g_attack_mode = ATTACK_BRUTE;
+        g_attack_mode = ATTACK_INCREMENTAL;
 
         int effective_cs = g_markov->threshold < g_markov->charset_size
                          ? g_markov->threshold : g_markov->charset_size;
-        fprintf(stderr, "Mode   : incremental (Markov, len 1-%d, %d chars/pos)\n\n",
-                MAX_PASS_LEN, effective_cs);
 
-        atomic_store(&g_tested, 0);
+        /* Try to resume from incremental checkpoint */
+        char incr_path[1040];
+        snprintf(incr_path, sizeof(incr_path), "%s.incr", g_ckpt_path);
+        int resumed = 0;
+        if (resume && g_ckpt_path[0]) {
+            resumed = incr_heap_load(incr_path);
+            if (resumed)
+                fprintf(stderr, "Mode   : incremental (Markov, len 1-%d, %d chars/pos) [resuming, %ld tested]\n\n",
+                        MAX_PASS_LEN, effective_cs, atomic_load(&g_tested));
+        }
+        if (!resumed) {
+            atomic_store(&g_tested, 0);
+            fprintf(stderr, "Mode   : incremental (Markov, len 1-%d, %d chars/pos)\n\n",
+                    MAX_PASS_LEN, effective_cs);
+        }
         atomic_store(&g_total, 0); /* unknown total — incremental */
 
         /* Reset ring buffer state */
@@ -5088,6 +6701,127 @@ int main(int argc, char *argv[])
         pthread_cond_signal(&g_incr_not_full);
         pthread_mutex_unlock(&g_incr_mutex);
         pthread_join(producer, NULL);
+
+        /* Save incremental state for resume (if not found) */
+        if (!g_password[0] && g_ckpt_path[0])
+            incr_heap_save(incr_path);
+
+        /* Free global heap */
+        if (g_incr_heap) {
+            heap_free(g_incr_heap);
+            free(g_incr_heap);
+            g_incr_heap = NULL;
+        }
+    }
+
+    /* ── Date-based attack ────────────────────────────────────── */
+    else if (g_dates_mode) {
+        g_is_brute = 1;
+        g_attack_mode = ATTACK_DATES;
+
+        long dates_total = dates_compute_keyspace();
+        char nbuf[32];
+        fmt_num(dates_total, nbuf, sizeof(nbuf));
+        fprintf(stderr, "Mode   : dates (%d-%d, %s candidates)\n\n",
+                g_date_year_start, g_date_year_end, nbuf);
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, dates_total);
+        atomic_store(&g_next_idx, 0);
+        spawned = 0;
+
+        if (g_use_gpu && g_sha256_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_sha256_dates_worker, malloc(1));
+        } else if (g_use_gpu && g_r6_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_r6_dates_worker, malloc(1));
+        }
+        for (int t = 0; t < nthreads; t++) {
+            void *a = malloc(1);
+            pthread_create(&threads[spawned++], NULL, dates_worker, a);
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+    }
+
+    /* ── Smart mutations attack ───────────────────────────────── */
+    else if (g_mutate_mode && dict_path) {
+        g_is_brute = 0;
+        g_attack_mode = ATTACK_MUTATE;
+        if (!g_words && !load_wordlist(dict_path)) {
+            atomic_store(&g_found, 1);
+            pthread_join(prog, NULL);
+            return 1;
+        }
+
+        long mutate_total = g_nwords * MUTATE_NMUTATIONS;
+        char nbuf[32];
+        fmt_num(mutate_total, nbuf, sizeof(nbuf));
+        fprintf(stderr, "Mode   : mutate (%ld words x %d mutations = %s candidates)\n\n",
+                g_nwords, MUTATE_NMUTATIONS, nbuf);
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, mutate_total);
+        atomic_store(&g_next_idx, 0);
+        spawned = 0;
+
+        if (g_use_gpu && g_sha256_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_sha256_mutate_worker, malloc(1));
+        } else if (g_use_gpu && g_r6_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_r6_mutate_worker, malloc(1));
+        }
+        for (int t = 0; t < nthreads; t++) {
+            void *a = malloc(1);
+            pthread_create(&threads[spawned++], NULL, mutate_worker, a);
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+
+        for (long i = 0; i < g_nwords; i++) free(g_words[i]);
+        free(g_words);
+    }
+
+    /* ── L33tspeak substitutions attack ───────────────────────── */
+    else if (g_leet_mode && dict_path) {
+        g_is_brute = 0;
+        g_attack_mode = ATTACK_LEET;
+        if (!g_words && !load_wordlist(dict_path)) {
+            atomic_store(&g_found, 1);
+            pthread_join(prog, NULL);
+            return 1;
+        }
+
+        /* Precompute leet substitution info per word */
+        leet_precompute();
+        if (!g_leet_info) {
+            fprintf(stderr, "Failed to allocate leet info\n");
+            atomic_store(&g_found, 1);
+            pthread_join(prog, NULL);
+            return 1;
+        }
+
+        char nbuf[32];
+        fmt_num(g_leet_total, nbuf, sizeof(nbuf));
+        fprintf(stderr, "Mode   : leet (%ld words, %s variants)\n\n",
+                g_nwords, nbuf);
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, g_leet_total);
+        atomic_store(&g_next_idx, 0);
+        spawned = 0;
+
+        if (g_use_gpu && g_sha256_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_sha256_leet_worker, malloc(1));
+        } else if (g_use_gpu && g_r6_ctx) {
+            pthread_create(&threads[spawned++], NULL, gpu_r6_leet_worker, malloc(1));
+        }
+        for (int t = 0; t < nthreads; t++) {
+            void *a = malloc(1);
+            pthread_create(&threads[spawned++], NULL, leet_worker, a);
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+
+        free(g_leet_info);
+        g_leet_info = NULL;
+        for (long i = 0; i < g_nwords; i++) free(g_words[i]);
+        free(g_words);
     }
 
     /* ── Dictionary attack ─────────────────────────────────────── */
@@ -5215,9 +6949,10 @@ auto_done:
 
     /* Mode name for JSON output */
     static const char *mode_names[] = {
-        "brute", "dict", "mask", "rule", "hybrid", "auto", "prince", "fingerprint"
+        "brute", "dict", "mask", "rule", "hybrid", "auto", "prince", "fingerprint",
+        "combinator", "mask_rule", "incremental", "dates", "mutate", "leet"
     };
-    const char *cur_mode_name = (g_attack_mode >= 0 && g_attack_mode <= 7)
+    const char *cur_mode_name = (g_attack_mode >= 0 && g_attack_mode <= 13)
                                 ? mode_names[g_attack_mode] : "unknown";
     long final_tested = atomic_load(&g_tested);
     long final_elapsed = (long)(time(NULL) - g_start_time);

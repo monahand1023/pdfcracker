@@ -95,6 +95,26 @@ int metal_sha256_verify_batch_ex(MetalSHA256Context *ctx,
                                   int *match_type);
 
 /*
+ * Async R5 SHA-256 pipeline (double-dispatch):
+ * Submit a batch without waiting for completion.
+ * Returns an opaque handle (command buffer) for later waiting.
+ */
+void *metal_sha256_submit_async(MetalSHA256Context *ctx, const char **passwords, int count);
+
+/*
+ * Wait for an async R5 batch to complete and check results.
+ * Returns index of first match, or -1 if none.
+ */
+int metal_sha256_wait_results(MetalSHA256Context *ctx, void *handle, int count);
+
+/*
+ * Wait for async R5 batch with match type output.
+ * match_type (if non-NULL) is set to 1 for user match, 2 for owner match.
+ */
+int metal_sha256_wait_results_ex(MetalSHA256Context *ctx, void *handle, int count,
+                                  int *match_type);
+
+/*
  * Free all Metal resources for the SHA-256 pipeline.
  */
 void metal_sha256_free(MetalSHA256Context *ctx);
