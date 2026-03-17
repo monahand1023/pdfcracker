@@ -21,6 +21,7 @@
 #include "protocol.h"
 #include "pdf_encrypt.h"
 #include "metal_keygen.h"
+#include "rc4_inline.h"
 #include <CoreGraphics/CoreGraphics.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -35,7 +36,6 @@
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <CommonCrypto/CommonDigest.h>
-#include <CommonCrypto/CommonCryptor.h>
 
 /* Batch size for atomic counter updates — avoids cache-line thrashing */
 #define TESTED_BATCH 256
@@ -432,24 +432,21 @@ static int benchmark_gpu(void)
         for (int i = 0; i < n; i++) {
             const uint8_t *key = keys + i * key_bytes;
             if (g_enc_params.revision == 2) {
-                uint8_t u[32]; size_t ol = 32;
-                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0, key, key_bytes,
-                        NULL, PDF_PASSWORD_PADDING, 32, u, 32, &ol);
+                uint8_t u[32];
+                rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, u, 32);
             } else {
                 CC_MD5_CTX md5; CC_MD5_Init(&md5);
                 CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, 32);
                 CC_MD5_Update(&md5, g_enc_params.file_id,
                               (CC_LONG)g_enc_params.file_id_len);
                 uint8_t h[16]; CC_MD5_Final(h, &md5);
-                uint8_t enc[16]; size_t ol = 16;
-                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0, key, key_bytes,
-                        NULL, h, 16, enc, 16, &ol);
+                uint8_t enc[16];
+                rc4_encrypt_16(key, key_bytes, h, enc);
                 for (int r = 1; r <= 19; r++) {
                     uint8_t mk[16];
                     for (int j = 0; j < key_bytes; j++) mk[j] = key[j] ^ (uint8_t)r;
-                    uint8_t tmp[16]; ol = 16;
-                    CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0, mk, key_bytes,
-                            NULL, enc, 16, tmp, 16, &ol);
+                    uint8_t tmp[16];
+                    rc4_encrypt_16(mk, key_bytes, enc, tmp);
                     memcpy(enc, tmp, 16);
                 }
             }
@@ -484,15 +481,22 @@ static int benchmark_gpu(void)
 static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
                            int count, int key_bytes)
 {
+    /* Pre-compute MD5(padding+fileID) for R3/R4 — same for all passwords */
+    uint8_t base_hash[16];
+    if (g_enc_params.revision >= 3) {
+        CC_MD5_CTX md5;
+        CC_MD5_Init(&md5);
+        CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, 32);
+        CC_MD5_Update(&md5, g_enc_params.file_id,
+                      (CC_LONG)g_enc_params.file_id_len);
+        CC_MD5_Final(base_hash, &md5);
+    }
+
     for (int i = 0; i < count; i++) {
         const uint8_t *key = keys + i * key_bytes;
         if (g_enc_params.revision == 2) {
             uint8_t computed_u[32];
-            size_t out_len = 32;
-            CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                    key, (size_t)key_bytes, NULL,
-                    PDF_PASSWORD_PADDING, 32,
-                    computed_u, 32, &out_len);
+            rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, computed_u, 32);
             if (memcmp(computed_u, g_enc_params.u_value, 32) == 0) {
                 if (!atomic_exchange(&g_chunk_found, 1))
                     strncpy(g_chunk_pass, passwords[i], MAX_PASS_LEN);
@@ -500,27 +504,18 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
                 return 1;
             }
         } else {
-            CC_MD5_CTX md5;
-            CC_MD5_Init(&md5);
-            CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, 32);
-            CC_MD5_Update(&md5, g_enc_params.file_id,
-                          (CC_LONG)g_enc_params.file_id_len);
-            uint8_t hash[16];
-            CC_MD5_Final(hash, &md5);
             uint8_t encrypted[16];
-            size_t out_len = 16;
-            CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                    key, (size_t)key_bytes, NULL,
-                    hash, 16, encrypted, 16, &out_len);
+            rc4_encrypt_16(key, key_bytes, base_hash, encrypted);
+
+            /* Early first-byte exit: skip 19 RC4 passes if mismatch */
+            if (encrypted[0] != g_enc_params.u_value[0]) continue;
+
             for (int r = 1; r <= 19; r++) {
                 uint8_t mod_key[16];
                 for (int j = 0; j < key_bytes; j++)
                     mod_key[j] = key[j] ^ (uint8_t)r;
                 uint8_t temp[16];
-                out_len = 16;
-                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                        mod_key, (size_t)key_bytes, NULL,
-                        encrypted, 16, temp, 16, &out_len);
+                rc4_encrypt_16(mod_key, key_bytes, encrypted, temp);
                 memcpy(encrypted, temp, 16);
             }
             if (memcmp(encrypted, g_enc_params.u_value, 16) == 0) {

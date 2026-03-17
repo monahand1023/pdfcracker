@@ -27,6 +27,9 @@
 #include <CommonCrypto/CommonCryptor.h>
 #pragma clang diagnostic pop
 
+/* Inline RC4 — replaces CCCrypt for small inputs (16/32 bytes) */
+#include "rc4_inline.h"
+
 /* NEON SIMD acceleration for SHA-256/384/512 and AES-128-CBC (R6 path) */
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_SHA2)
 #include "sha256_simd.h"
@@ -566,12 +569,7 @@ static void compute_u_r2(const uint8_t *key, int key_len,
                          uint8_t *u_out)
 {
     /* RC4-encrypt the 32-byte padding string with the key */
-    size_t out_len = 32;
-    CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-            key, (size_t)key_len,
-            NULL, /* no IV for RC4 */
-            PDF_PASSWORD_PADDING, 32,
-            u_out, 32, &out_len);
+    rc4_encrypt(key, key_len, PDF_PASSWORD_PADDING, u_out, 32);
 }
 
 /* ================================================================
@@ -591,25 +589,16 @@ static void compute_u_r3(const PDFEncryptParams *params,
     CC_MD5_Final(hash, &md5);
 
     /* (b) RC4-encrypt the 16-byte hash with the key */
-    size_t out_len = 16;
     uint8_t encrypted[16];
-    CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-            key, (size_t)key_len,
-            NULL, hash, 16,
-            encrypted, 16, &out_len);
+    rc4_encrypt_16(key, key_len, hash, encrypted);
 
     /* (c) 19 additional RC4 passes with XOR-modified keys */
     for (int i = 1; i <= 19; i++) {
         uint8_t mod_key[16];
         for (int j = 0; j < key_len; j++)
             mod_key[j] = key[j] ^ (uint8_t)i;
-
         uint8_t temp[16];
-        out_len = 16;
-        CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                mod_key, (size_t)key_len,
-                NULL, encrypted, 16,
-                temp, 16, &out_len);
+        rc4_encrypt_16(mod_key, key_len, encrypted, temp);
         memcpy(encrypted, temp, 16);
     }
 
@@ -925,12 +914,8 @@ int pdf_verify_owner_password(const PDFEncryptParams *params, const char *passwo
     uint8_t user_pass[32];
 
     if (params->revision == 2) {
-        /* Single RC4 decryption */
-        size_t out_len = 32;
-        CCCrypt(kCCDecrypt, kCCAlgorithmRC4, 0,
-                key, (size_t)key_bytes,
-                NULL, params->o_value, 32,
-                user_pass, 32, &out_len);
+        /* Single RC4 decryption (RC4 is symmetric: encrypt == decrypt) */
+        rc4_encrypt(key, key_bytes, params->o_value, user_pass, 32);
     } else {
         /* R3/R4: 20 RC4 passes in reverse (19 down to 0) */
         memcpy(user_pass, params->o_value, 32);
@@ -938,13 +923,8 @@ int pdf_verify_owner_password(const PDFEncryptParams *params, const char *passwo
             uint8_t mod_key[16];
             for (int j = 0; j < key_bytes; j++)
                 mod_key[j] = key[j] ^ (uint8_t)i;
-
             uint8_t temp[32];
-            size_t out_len = 32;
-            CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                    mod_key, (size_t)key_bytes,
-                    NULL, user_pass, 32,
-                    temp, 32, &out_len);
+            rc4_encrypt(mod_key, key_bytes, user_pass, temp, 32);
             memcpy(user_pass, temp, 32);
         }
     }
@@ -1066,11 +1046,7 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
         /* Algorithm 4: RC4-encrypt padding, compare 32 bytes */
         for (int i = 0; i < 4; i++) {
             uint8_t computed_u[32];
-            size_t out_len = 32;
-            CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                    keys[i], (size_t)key_bytes,
-                    NULL, PDF_PASSWORD_PADDING, 32,
-                    computed_u, 32, &out_len);
+            rc4_encrypt(keys[i], key_bytes, PDF_PASSWORD_PADDING, computed_u, 32);
             if (memcmp(computed_u, params->u_value, 32) == 0)
                 result |= (1 << i);
         }
@@ -1086,22 +1062,17 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
 
         for (int i = 0; i < 4; i++) {
             uint8_t encrypted[16];
-            size_t out_len = 16;
-            CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                    keys[i], (size_t)key_bytes,
-                    NULL, base_hash, 16,
-                    encrypted, 16, &out_len);
+            rc4_encrypt_16(keys[i], key_bytes, base_hash, encrypted);
+
+            /* Early first-byte exit: skip 19 RC4 passes if first byte wrong */
+            if (encrypted[0] != params->u_value[0]) continue;
 
             for (int r = 1; r <= 19; r++) {
                 uint8_t mod_key[16];
                 for (int j = 0; j < key_bytes; j++)
                     mod_key[j] = keys[i][j] ^ (uint8_t)r;
                 uint8_t temp[16];
-                out_len = 16;
-                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                        mod_key, (size_t)key_bytes,
-                        NULL, encrypted, 16,
-                        temp, 16, &out_len);
+                rc4_encrypt_16(mod_key, key_bytes, encrypted, temp);
                 memcpy(encrypted, temp, 16);
             }
 
@@ -1173,12 +1144,8 @@ int pdf_verify_owner_batch4(const PDFEncryptParams *params,
         uint8_t user_pass[32];
 
         if (params->revision == 2) {
-            /* Single RC4 decryption */
-            size_t out_len = 32;
-            CCCrypt(kCCDecrypt, kCCAlgorithmRC4, 0,
-                    keys[i], (size_t)key_bytes,
-                    NULL, params->o_value, 32,
-                    user_pass, 32, &out_len);
+            /* Single RC4 decryption (RC4 is symmetric) */
+            rc4_encrypt(keys[i], key_bytes, params->o_value, user_pass, 32);
         } else {
             /* R3/R4: 20 RC4 passes in reverse (19 down to 0) */
             memcpy(user_pass, params->o_value, 32);
@@ -1187,11 +1154,7 @@ int pdf_verify_owner_batch4(const PDFEncryptParams *params,
                 for (int j = 0; j < key_bytes; j++)
                     mod_key[j] = keys[i][j] ^ (uint8_t)r;
                 uint8_t temp[32];
-                size_t out_len = 32;
-                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                        mod_key, (size_t)key_bytes,
-                        NULL, user_pass, 32,
-                        temp, 32, &out_len);
+                rc4_encrypt(mod_key, key_bytes, user_pass, temp, 32);
                 memcpy(user_pass, temp, 32);
             }
         }

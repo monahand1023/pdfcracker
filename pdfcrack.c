@@ -45,11 +45,11 @@
 #include "pdf_encrypt.h"
 #include "metal_keygen.h"
 #include "md5_simd.h"
+#include "rc4_inline.h"
 
 /* Suppress deprecated warnings for CC_MD5 used in RC4 verify */
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <CommonCrypto/CommonDigest.h>
-#include <CommonCrypto/CommonCryptor.h>
 
 /* Batch size for atomic counter updates — avoids cache-line thrashing */
 #define TESTED_BATCH 256
@@ -64,10 +64,10 @@
 /* ── async-safe interrupt flag ────────────────────────────────── */
 static volatile sig_atomic_t g_interrupted = 0;
 
-/* ── shared state ─────────────────────────────────────────────── */
-static atomic_int  g_found   = 0;
+/* ── shared state (cache-line aligned to avoid false sharing) ──── */
+static atomic_int  g_found   __attribute__((aligned(64))) = 0;
 static char        g_password[MAX_PASS_LEN + 1] = {0};
-static atomic_long g_tested  = 0;
+static atomic_long g_tested  __attribute__((aligned(64))) = 0;
 static atomic_long g_total   = 0;   /* 0 = unknown */
 
 /* ── overall progress (brute-force across all lengths) ─────────── */
@@ -92,7 +92,7 @@ static MetalKeygenContext *g_gpu_ctx     = NULL;
 static MetalSHA256Context *g_sha256_ctx __attribute__((unused)) = NULL;  /* R5 SHA-256 GPU pipeline */
 static MetalR6Context     *g_r6_ctx    __attribute__((unused)) = NULL;  /* R6 GPU pipeline */
 static int                 g_use_gpu    = 0;
-static atomic_long         g_next_idx   = 0; /* shared work counter for GPU+CPU */
+static atomic_long         g_next_idx   __attribute__((aligned(64))) = 0; /* shared work counter for GPU+CPU */
 
 /* ── NEON SIMD batch mode (R2-R4 only) ────────────────────────── */
 static int                 g_use_neon  = 0;
@@ -1198,6 +1198,37 @@ static void index_to_pass(long idx, int length, char *out)
         pos += g_suffix_len;
     }
     out[pos] = '\0';
+}
+
+/* Next-character LUT: g_next_char[c] = next charset char after c,
+ * or 0 if c is the last char (signals carry). Rebuilt when charset changes. */
+static char g_next_char[256];
+static const char *g_next_char_for = NULL;  /* tracks which charset the LUT was built for */
+
+static void build_next_char_lut(void)
+{
+    memset(g_next_char, 0, sizeof(g_next_char));
+    for (int i = 0; i < g_cs_len - 1; i++)
+        g_next_char[(unsigned char)g_charset[i]] = g_charset[i + 1];
+    /* Last char maps to 0 (carry sentinel) */
+    g_next_char[(unsigned char)g_charset[g_cs_len - 1]] = 0;
+    g_next_char_for = g_charset;
+}
+
+/* Increment password in-place (odometer-style) using LUT.
+ * Returns 0 on success, 1 on overflow (all digits wrapped). */
+static inline int inc_pass(char *out, int length)
+{
+    int start = g_prefix_len;
+    for (int i = start + length - 1; i >= start; i--) {
+        char next = g_next_char[(unsigned char)out[i]];
+        if (next) {
+            out[i] = next;
+            return 0;
+        }
+        out[i] = g_charset[0];  /* wrap, carry */
+    }
+    return 1;  /* overflow */
 }
 
 static long count_for_length(int len)
@@ -2378,6 +2409,7 @@ static void *brute_worker(void *arg)
 
     char pass[MAX_PASS_LEN + 1];
     long local_count = 0;
+    int use_inc = (g_idx_to_pass == index_to_pass && g_next_char_for == g_charset);
 
     if (a->use_shared) {
         /* Shared work counter mode — grab CPU_WORK_CHUNK at a time */
@@ -2390,11 +2422,17 @@ static void *brute_worker(void *arg)
             long chunk_end = chunk_start + CPU_WORK_CHUNK;
             if (chunk_end > a->end) chunk_end = a->end;
 
+            g_idx_to_pass(chunk_start, a->length, pass);
             for (long i = chunk_start; i < chunk_end; i++) {
                 if (__builtin_expect(atomic_load_explicit(&g_found,
                                      memory_order_relaxed), 0))
                     break;
-                g_idx_to_pass(i, a->length, pass);
+                if (i != chunk_start) {
+                    if (use_inc)
+                        inc_pass(pass, a->length);
+                    else
+                        g_idx_to_pass(i, a->length, pass);
+                }
                 if (++local_count == TESTED_BATCH) {
                     atomic_fetch_add_explicit(&g_tested, local_count,
                                               memory_order_relaxed);
@@ -2410,11 +2448,17 @@ static void *brute_worker(void *arg)
         }
     } else {
         /* Pre-partitioned range mode (CPU-only) */
+        g_idx_to_pass(a->start, a->length, pass);
         for (long i = a->start; i < a->end; i++) {
             if (__builtin_expect(atomic_load_explicit(&g_found,
                                  memory_order_relaxed), 0))
                 break;
-            g_idx_to_pass(i, a->length, pass);
+            if (i != a->start) {
+                if (use_inc)
+                    inc_pass(pass, a->length);
+                else
+                    g_idx_to_pass(i, a->length, pass);
+            }
             if (++local_count == TESTED_BATCH) {
                 atomic_fetch_add_explicit(&g_tested, local_count,
                                           memory_order_relaxed);
@@ -2449,6 +2493,7 @@ static void *brute_worker_neon(void *arg)
     BruteArg *a = (BruteArg *)arg;
     char pass[4][MAX_PASS_LEN + 1];
     long local_count = 0;
+    int use_inc = (g_idx_to_pass == index_to_pass && g_next_char_for == g_charset);
 
     if (a->use_shared) {
         /* Shared work counter mode — grab CPU_WORK_CHUNK at a time,
@@ -2463,15 +2508,30 @@ static void *brute_worker_neon(void *arg)
             if (chunk_end > a->end) chunk_end = a->end;
 
             long i = chunk_start;
+            int first_in_chunk = 1;
             /* Process groups of 4 */
             for (; i + 3 < chunk_end; i += 4) {
                 if (__builtin_expect(atomic_load_explicit(&g_found,
                                      memory_order_relaxed), 0))
                     break;
-                g_idx_to_pass(i + 0, a->length, pass[0]);
-                g_idx_to_pass(i + 1, a->length, pass[1]);
-                g_idx_to_pass(i + 2, a->length, pass[2]);
-                g_idx_to_pass(i + 3, a->length, pass[3]);
+                if (use_inc && !first_in_chunk) {
+                    /* pass[3] has the last password from previous group,
+                     * increment it 4 times to get the next group */
+                    memcpy(pass[0], pass[3], MAX_PASS_LEN + 1);
+                    inc_pass(pass[0], a->length);
+                    memcpy(pass[1], pass[0], MAX_PASS_LEN + 1);
+                    inc_pass(pass[1], a->length);
+                    memcpy(pass[2], pass[1], MAX_PASS_LEN + 1);
+                    inc_pass(pass[2], a->length);
+                    memcpy(pass[3], pass[2], MAX_PASS_LEN + 1);
+                    inc_pass(pass[3], a->length);
+                } else {
+                    g_idx_to_pass(i + 0, a->length, pass[0]);
+                    g_idx_to_pass(i + 1, a->length, pass[1]);
+                    g_idx_to_pass(i + 2, a->length, pass[2]);
+                    g_idx_to_pass(i + 3, a->length, pass[3]);
+                    first_in_chunk = 0;
+                }
 
                 const char *pw[4] = { pass[0], pass[1], pass[2], pass[3] };
                 int pwlen[4] = {
@@ -2539,14 +2599,27 @@ static void *brute_worker_neon(void *arg)
     } else {
         /* Pre-partitioned range mode (CPU-only) */
         long i = a->start;
+        int first_group = 1;
         for (; i + 3 < a->end; i += 4) {
             if (__builtin_expect(atomic_load_explicit(&g_found,
                                  memory_order_relaxed), 0))
                 break;
-            g_idx_to_pass(i + 0, a->length, pass[0]);
-            g_idx_to_pass(i + 1, a->length, pass[1]);
-            g_idx_to_pass(i + 2, a->length, pass[2]);
-            g_idx_to_pass(i + 3, a->length, pass[3]);
+            if (use_inc && !first_group) {
+                memcpy(pass[0], pass[3], MAX_PASS_LEN + 1);
+                inc_pass(pass[0], a->length);
+                memcpy(pass[1], pass[0], MAX_PASS_LEN + 1);
+                inc_pass(pass[1], a->length);
+                memcpy(pass[2], pass[1], MAX_PASS_LEN + 1);
+                inc_pass(pass[2], a->length);
+                memcpy(pass[3], pass[2], MAX_PASS_LEN + 1);
+                inc_pass(pass[3], a->length);
+            } else {
+                g_idx_to_pass(i + 0, a->length, pass[0]);
+                g_idx_to_pass(i + 1, a->length, pass[1]);
+                g_idx_to_pass(i + 2, a->length, pass[2]);
+                g_idx_to_pass(i + 3, a->length, pass[3]);
+                first_group = 0;
+            }
 
             const char *pw[4] = { pass[0], pass[1], pass[2], pass[3] };
             int pwlen[4] = {
@@ -2659,24 +2732,21 @@ static double benchmark_gpu_rate(void)
         for (int i = 0; i < n; i++) {
             const uint8_t *key = keys + i * key_bytes;
             if (g_enc_params.revision == 2) {
-                uint8_t u[32]; size_t ol = 32;
-                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0, key, key_bytes,
-                        NULL, PDF_PASSWORD_PADDING, 32, u, 32, &ol);
+                uint8_t u[32];
+                rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, u, 32);
             } else {
                 CC_MD5_CTX md5; CC_MD5_Init(&md5);
                 CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, 32);
                 CC_MD5_Update(&md5, g_enc_params.file_id,
                               (CC_LONG)g_enc_params.file_id_len);
                 uint8_t h[16]; CC_MD5_Final(h, &md5);
-                uint8_t enc[16]; size_t ol = 16;
-                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0, key, key_bytes,
-                        NULL, h, 16, enc, 16, &ol);
+                uint8_t enc[16];
+                rc4_encrypt_16(key, key_bytes, h, enc);
                 for (int r = 1; r <= 19; r++) {
                     uint8_t mk[16];
                     for (int j = 0; j < key_bytes; j++) mk[j] = key[j] ^ (uint8_t)r;
-                    uint8_t tmp[16]; ol = 16;
-                    CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0, mk, key_bytes,
-                            NULL, enc, 16, tmp, 16, &ol);
+                    uint8_t tmp[16];
+                    rc4_encrypt_16(mk, key_bytes, enc, tmp);
                     memcpy(enc, tmp, 16);
                 }
             }
@@ -2818,31 +2888,24 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
         if (g_enc_params.revision == 2) {
             /* Algorithm 4: RC4-encrypt padding, compare all 32 bytes of U */
             uint8_t computed_u[32];
-            size_t out_len = 32;
-            CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                    key, (size_t)key_bytes, NULL,
-                    PDF_PASSWORD_PADDING, 32,
-                    computed_u, 32, &out_len);
+            rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, computed_u, 32);
             if (memcmp(computed_u, g_enc_params.u_value, 32) == 0)
                 user_match = 1;
         } else {
             /* Algorithm 5: RC4 with pre-computed MD5(padding+fileID),
              * 20 RC4 passes, compare 16 bytes */
             uint8_t encrypted[16];
-            size_t out_len = 16;
-            CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                    key, (size_t)key_bytes, NULL,
-                    base_hash, 16, encrypted, 16, &out_len);
+            rc4_encrypt_16(key, key_bytes, base_hash, encrypted);
+
+            /* Early first-byte exit: skip 19 RC4 passes if mismatch */
+            if (encrypted[0] != g_enc_params.u_value[0]) continue;
 
             for (int r = 1; r <= 19; r++) {
                 uint8_t mod_key[16];
                 for (int j = 0; j < key_bytes; j++)
                     mod_key[j] = key[j] ^ (uint8_t)r;
                 uint8_t temp[16];
-                out_len = 16;
-                CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
-                        mod_key, (size_t)key_bytes, NULL,
-                        encrypted, 16, temp, 16, &out_len);
+                rc4_encrypt_16(mod_key, key_bytes, encrypted, temp);
                 memcpy(encrypted, temp, 16);
             }
 
@@ -5151,6 +5214,7 @@ static int run_fingerprint_attack(int nthreads, pthread_t *threads, int *spawned
         void (*saved_fn)(long, int, char *) = g_idx_to_pass;
         g_charset = "0123456789";
         g_cs_len = 10;
+        build_next_char_lut();
         g_idx_to_pass = index_to_pass;
 
         for (int len = 1; len <= 6 && !atomic_load(&g_found); len++) {
@@ -5221,6 +5285,7 @@ static void run_benchmark(int nthreads)
     int saved_cs_len = g_cs_len;
     g_charset = "abcdefghij";
     g_cs_len  = 10;
+    build_next_char_lut();
     void (*saved_fn)(long, int, char *) = g_idx_to_pass;
     g_idx_to_pass = index_to_pass;
 
@@ -5925,6 +5990,7 @@ static int run_smart_attack(int nthreads, pthread_t *threads, int *spawned_out)
         void (*saved_fn)(long, int, char *) = g_idx_to_pass;
         g_charset = "0123456789";
         g_cs_len = 10;
+        build_next_char_lut();
         g_idx_to_pass = index_to_pass;
 
         for (int len = 1; len <= 8 && !atomic_load(&g_found); len++) {
@@ -5959,6 +6025,7 @@ static int run_smart_attack(int nthreads, pthread_t *threads, int *spawned_out)
         void (*saved_fn)(long, int, char *) = g_idx_to_pass;
         g_charset = "abcdefghijklmnopqrstuvwxyz";
         g_cs_len = 26;
+        build_next_char_lut();
         g_idx_to_pass = index_to_pass;
 
         for (int len = 1; len <= 6 && !atomic_load(&g_found); len++) {
@@ -6656,6 +6723,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Error: charset is empty\n");
         return 1;
     }
+    build_next_char_lut();
     g_nthreads = nthreads;
 
     /* Load Markov model if specified */
@@ -7006,6 +7074,7 @@ int main(int argc, char *argv[])
             int saved_cs_len = g_cs_len;
             g_charset = FREQ_CHARSET;
             g_cs_len  = (int)strlen(FREQ_CHARSET);
+            build_next_char_lut();
             g_idx_to_pass = index_to_pass;
             g_is_brute = 1;
 
