@@ -56,7 +56,7 @@ _Static_assert(sizeof(long) >= 8, "64-bit long required");
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 /* ── Protocol version ────────────────────────────────────────── */
-#define PROTO_VERSION       3
+#define PROTO_VERSION       4
 
 /* ── Password mode ──────────────────────────────────────────── */
 #define PW_MODE_BOTH        0
@@ -71,6 +71,11 @@ _Static_assert(sizeof(long) >= 8, "64-bit long required");
 #define DEFAULT_CHUNK_BRUTE 500000L
 #define DEFAULT_CHUNK_DICT  5000L
 #define TARGET_SECS         30.0
+
+/* ── R6-specific chunk sizing (slower per-password, smaller chunks) ── */
+#define DEFAULT_CHUNK_BRUTE_R6  50000L   /* ~3s at 18K/s */
+#define MIN_CHUNK_BRUTE_R6      1000L
+#define MAX_CHUNK_BRUTE_R6      500000L
 
 /* ── Lease deadlines ─────────────────────────────────────────── */
 #define MIN_LEASE_SECS      120

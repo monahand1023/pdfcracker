@@ -702,6 +702,164 @@ int metal_r6_max_batch(MetalR6Context *ctx)
     return ctx ? ctx->max_batch : 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * Async R6 pipeline (double-dispatch for pipelining)
+ * ═══════════════════════════════════════════════════════════════ */
+
+void *metal_r6_submit_async(MetalR6Context *ctx, const char **passwords, int count)
+{
+    if (!ctx || count <= 0) return NULL;
+    if (count > ctx->max_batch) count = ctx->max_batch;
+
+    @autoreleasepool {
+        int buf = ctx->current_buf;
+        ctx->current_buf ^= 1;
+
+        uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
+        uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
+
+        memset(pw_data, 0, (size_t)count * 128);
+        for (int i = 0; i < count; i++) {
+            size_t plen = strlen(passwords[i]);
+            if (plen > 127) plen = 127;
+            memcpy(pw_data + (size_t)i * 128, passwords[i], plen);
+            len_data[i] = (uint8_t)plen;
+        }
+
+        memset([ctx->results_buf[buf] contents], 0, (size_t)count);
+
+        id<MTLCommandBuffer> cmdBuf = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+
+        [encoder setComputePipelineState:ctx->pipeline];
+        [encoder setBuffer:ctx->pw_buf[buf]      offset:0 atIndex:0];
+        [encoder setBuffer:ctx->len_buf[buf]     offset:0 atIndex:1];
+        [encoder setBuffer:ctx->params_buf       offset:0 atIndex:2];
+        [encoder setBuffer:ctx->results_buf[buf] offset:0 atIndex:3];
+        [encoder setBuffer:ctx->scratch_buf[buf] offset:0 atIndex:4];
+
+        NSUInteger threadWidth = ctx->pipeline.maxTotalThreadsPerThreadgroup;
+        if (threadWidth > 64) threadWidth = 64;
+        MTLSize gridSize  = MTLSizeMake((NSUInteger)count, 1, 1);
+        MTLSize groupSize = MTLSizeMake(threadWidth, 1, 1);
+
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
+        [encoder endEncoding];
+
+        [cmdBuf commit];
+
+        /* Return command buffer as opaque handle — retain so it survives autorelease */
+        return (__bridge_retained void *)cmdBuf;
+    }
+}
+
+int metal_r6_wait_results(MetalR6Context *ctx, void *handle, int count)
+{
+    if (!ctx || !handle) return -1;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuf = (__bridge_transfer id<MTLCommandBuffer>)handle;
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.error) {
+            fprintf(stderr, "Metal R6 async: compute error: %s\n",
+                    [[cmdBuf.error localizedDescription] UTF8String]);
+            return -1;
+        }
+
+        /* Results are in the OTHER buffer (we toggled current_buf in submit) */
+        int results_buf = ctx->current_buf; /* after toggle, this points to the one we just used */
+        /* Actually, we toggled current_buf at submit time. The buffer we used was
+         * (current_buf ^ 1) at this point. Let's track it properly:
+         * At submit: buf = old current_buf, then current_buf ^= 1
+         * So now current_buf = old ^ 1, meaning the buffer we submitted to = current_buf ^ 1 */
+        results_buf = ctx->current_buf ^ 1;
+
+        uint8_t *results = (uint8_t *)[ctx->results_buf[results_buf] contents];
+        for (int i = 0; i < count; i++) {
+            if (results[i]) return i;
+        }
+        return -1;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * R6 sub-batch verification (early termination)
+ * ═══════════════════════════════════════════════════════════════ */
+
+int metal_r6_verify_batch_sub(MetalR6Context *ctx,
+                               const char **passwords, int count,
+                               int sub_size)
+{
+    if (!ctx || count <= 0) return -1;
+    if (count > ctx->max_batch) count = ctx->max_batch;
+    if (sub_size <= 0 || sub_size >= count) {
+        /* Fall back to full batch */
+        return metal_r6_verify_batch(ctx, passwords, count);
+    }
+
+    @autoreleasepool {
+        int buf = ctx->current_buf;
+        ctx->current_buf ^= 1;
+
+        /* Pack all passwords into the buffer upfront */
+        uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
+        uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
+
+        memset(pw_data, 0, (size_t)count * 128);
+        for (int i = 0; i < count; i++) {
+            size_t plen = strlen(passwords[i]);
+            if (plen > 127) plen = 127;
+            memcpy(pw_data + (size_t)i * 128, passwords[i], plen);
+            len_data[i] = (uint8_t)plen;
+        }
+
+        memset([ctx->results_buf[buf] contents], 0, (size_t)count);
+
+        /* Dispatch sub-batches */
+        NSUInteger threadWidth = ctx->pipeline.maxTotalThreadsPerThreadgroup;
+        if (threadWidth > 64) threadWidth = 64;
+
+        for (int offset = 0; offset < count; offset += sub_size) {
+            int sub_count = count - offset;
+            if (sub_count > sub_size) sub_count = sub_size;
+
+            id<MTLCommandBuffer> cmdBuf = [ctx->queue commandBuffer];
+            id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+
+            [encoder setComputePipelineState:ctx->pipeline];
+            [encoder setBuffer:ctx->pw_buf[buf]      offset:(NSUInteger)offset * 128 atIndex:0];
+            [encoder setBuffer:ctx->len_buf[buf]     offset:(NSUInteger)offset       atIndex:1];
+            [encoder setBuffer:ctx->params_buf       offset:0 atIndex:2];
+            [encoder setBuffer:ctx->results_buf[buf] offset:(NSUInteger)offset       atIndex:3];
+            [encoder setBuffer:ctx->scratch_buf[buf] offset:(NSUInteger)offset * R6_SCRATCH_SIZE atIndex:4];
+
+            MTLSize gridSize  = MTLSizeMake((NSUInteger)sub_count, 1, 1);
+            MTLSize groupSize = MTLSizeMake(threadWidth, 1, 1);
+
+            [encoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
+            [encoder endEncoding];
+
+            [cmdBuf commit];
+            [cmdBuf waitUntilCompleted];
+
+            if (cmdBuf.error) {
+                fprintf(stderr, "Metal R6 sub-batch: compute error: %s\n",
+                        [[cmdBuf.error localizedDescription] UTF8String]);
+                return -1;
+            }
+
+            /* Check results for this sub-batch */
+            uint8_t *results = (uint8_t *)[ctx->results_buf[buf] contents];
+            for (int i = offset; i < offset + sub_count; i++) {
+                if (results[i]) return i;
+            }
+        }
+
+        return -1;
+    }
+}
+
 void metal_r6_free(MetalR6Context *ctx)
 {
     if (!ctx) return;

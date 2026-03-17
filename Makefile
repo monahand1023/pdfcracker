@@ -28,8 +28,8 @@ metal_keygen.o: metal_keygen.m metal_keygen.h pdf_encrypt.h
 pdfcrack: pdfcrack.c pdf_encrypt.o saslprep.o metal_keygen.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ pdfcrack.c pdf_encrypt.o saslprep.o metal_keygen.o
 
-server: server.c protocol.h
-	$(CC) $(CFLAGS) $(LIBS) -o $@ server.c
+server: server.c protocol.h pdf_encrypt.o saslprep.o pdf_encrypt.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ server.c pdf_encrypt.o saslprep.o
 
 client: client.c pdf_encrypt.o saslprep.o metal_keygen.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ client.c pdf_encrypt.o saslprep.o metal_keygen.o

@@ -115,7 +115,7 @@ static int  g_prefix_len = 0;
 static int  g_suffix_len = 0;
 
 /* ── Mask attack ─────────────────────────────────────────────── */
-typedef struct { char *chars; int nchars; } MaskPos;
+typedef struct { char *chars; int nchars; int is_word; } MaskPos;
 static MaskPos  g_mask[MAX_PASS_LEN];
 static int      g_mask_len   = 0;
 static long     g_mask_keyspace = 0;
@@ -127,22 +127,40 @@ static char *g_custom_charset[4] = { NULL, NULL, NULL, NULL };
 static char  g_custom_charset_str[4][256] = {{0}}; /* for checkpoint */
 
 /* ── Rule-based mutations ────────────────────────────────────── */
-#define MAX_RULES 64
+#define MAX_RULES 4096
+#define MAX_OPS_PER_RULE 8
 typedef enum {
-    RULE_NOOP,        /* : (as-is) */
-    RULE_LOWER,       /* l */
-    RULE_UPPER,       /* u */
-    RULE_CAPITALIZE,  /* c */
-    RULE_REVERSE,     /* r */
-    RULE_DUPLICATE,   /* d */
-    RULE_APPEND_CHAR, /* $X */
-    RULE_PREPEND_CHAR,/* ^X */
-    RULE_CAP_APPEND,  /* cX (capitalize + append) */
+    RULE_NOOP,           /* : (as-is) */
+    RULE_LOWER,          /* l */
+    RULE_UPPER,          /* u */
+    RULE_CAPITALIZE,     /* c */
+    RULE_REVERSE,        /* r */
+    RULE_DUPLICATE,      /* d */
+    RULE_APPEND_CHAR,    /* $X */
+    RULE_PREPEND_CHAR,   /* ^X */
+    RULE_CAP_APPEND,     /* cX (capitalize + append) — built-in only */
+    RULE_TOGGLE_AT,      /* TN: toggle case at position N */
+    RULE_INSERT_AT,      /* iNX: insert char X at position N */
+    RULE_OVERWRITE_AT,   /* oNX: overwrite position N with X */
+    RULE_DELETE_AT,      /* DN: delete char at position N */
+    RULE_TRUNCATE_LEFT,  /* [N: remove first N chars */
+    RULE_TRUNCATE_RIGHT, /* ]N: keep only first N chars */
+    RULE_REPLACE,        /* sXY: replace all X with Y */
+    RULE_PURGE,          /* @X: remove all X */
+    RULE_DUPLICATE_N,    /* pN: repeat word N times */
+    RULE_DUP_FIRST_N,    /* yN: duplicate first N chars, prepend */
+    RULE_DUP_LAST_N,     /* YN: duplicate last N chars, append */
+    RULE_SWAP,           /* *NM: swap positions N and M */
+    RULE_LEET,           /* common l33t substitutions */
 } RuleType;
-typedef struct { RuleType type; char ch; } Rule;
+typedef struct {
+    int nops;
+    struct { RuleType type; char ch; char ch2; int pos; } ops[MAX_OPS_PER_RULE];
+} Rule;
 static Rule g_rules[MAX_RULES];
 static int  g_nrules = 0;
 static int  g_rule_mode = 0;
+static const char *g_rules_file = NULL;
 
 /* ── Hybrid attack ───────────────────────────────────────────── */
 static int  g_hybrid_mode = 0;
@@ -834,10 +852,22 @@ static int parse_mask_into(const char *mask, MaskPos *target, int *out_len, long
     const char *p = mask;
     while (*p && *out_len < MAX_PASS_LEN) {
         MaskPos *mp = &target[*out_len];
+        mp->is_word = 0;
         if (*p == '?' && *(p + 1)) {
             char code = *(p + 1);
             p += 2;
             switch (code) {
+                case 'w': {
+                    /* Word placeholder — expands to dictionary words */
+                    if (g_nwords <= 0) {
+                        fprintf(stderr, "?w requires -d <wordlist>\n");
+                        return 0;
+                    }
+                    mp->is_word = 1;
+                    mp->nchars = (int)g_nwords;
+                    mp->chars = NULL;
+                    break;
+                }
                 case 'l': {
                     mp->nchars = 26;
                     mp->chars = malloc(27);
@@ -954,6 +984,8 @@ static int parse_mask(const char *mask)
     return parse_mask_into(mask, g_mask, &g_mask_len, &g_mask_keyspace);
 }
 
+static int g_mask_has_words = 0;  /* 1 if mask contains ?w */
+
 static void mask_index_to_pass(long idx, int length, char *out)
 {
     (void)length; /* mask length is fixed */
@@ -964,104 +996,354 @@ static void mask_index_to_pass(long idx, int length, char *out)
     out[g_mask_len] = '\0';
 }
 
+/* Combo mode: mask with ?w word placeholders. Variable-length output. */
+static void combo_index_to_pass(long idx, int length, char *out)
+{
+    (void)length;
+    /* Decompose index into per-position indices (right-to-left) */
+    int indices[MAX_PASS_LEN];
+    for (int i = g_mask_len - 1; i >= 0; i--) {
+        indices[i] = (int)(idx % g_mask[i].nchars);
+        idx /= g_mask[i].nchars;
+    }
+    /* Build password */
+    int pos = 0;
+    for (int i = 0; i < g_mask_len; i++) {
+        if (g_mask[i].is_word) {
+            const char *word = g_words[indices[i]];
+            size_t wlen = strlen(word);
+            if (pos + (int)wlen > MAX_PASS_LEN) wlen = (size_t)(MAX_PASS_LEN - pos);
+            memcpy(out + pos, word, wlen);
+            pos += (int)wlen;
+        } else {
+            if (pos < MAX_PASS_LEN)
+                out[pos++] = g_mask[i].chars[indices[i]];
+        }
+    }
+    out[pos] = '\0';
+}
+
 /* ================================================================
  * Rule-based mutations
  * ================================================================ */
+/* Helper to add a single-op rule */
+static void add_rule_1(RuleType type, char ch, char ch2, int pos)
+{
+    if (g_nrules >= MAX_RULES) return;
+    Rule *r = &g_rules[g_nrules++];
+    r->nops = 1;
+    r->ops[0] = (typeof(r->ops[0])){ .type = type, .ch = ch, .ch2 = ch2, .pos = pos };
+}
+
+/* Helper to add a two-op rule */
+static void add_rule_2(RuleType t1, char c1, char c1b, int p1,
+                       RuleType t2, char c2, char c2b, int p2)
+{
+    if (g_nrules >= MAX_RULES) return;
+    Rule *r = &g_rules[g_nrules++];
+    r->nops = 2;
+    r->ops[0] = (typeof(r->ops[0])){ .type = t1, .ch = c1, .ch2 = c1b, .pos = p1 };
+    r->ops[1] = (typeof(r->ops[1])){ .type = t2, .ch = c2, .ch2 = c2b, .pos = p2 };
+}
+
+/* Parse a hashcat-style rule char, returning number of chars consumed.
+ * Appends op to rule->ops[rule->nops] and increments nops. */
+static int parse_rule_op(const char *p, Rule *rule)
+{
+    if (rule->nops >= MAX_OPS_PER_RULE) return 0;
+    typeof(rule->ops[0]) *op = &rule->ops[rule->nops];
+    memset(op, 0, sizeof(*op));
+
+    switch (*p) {
+        case ':': op->type = RULE_NOOP; rule->nops++; return 1;
+        case 'l': op->type = RULE_LOWER; rule->nops++; return 1;
+        case 'u': op->type = RULE_UPPER; rule->nops++; return 1;
+        case 'c': op->type = RULE_CAPITALIZE; rule->nops++; return 1;
+        case 'r': op->type = RULE_REVERSE; rule->nops++; return 1;
+        case 'd': op->type = RULE_DUPLICATE; rule->nops++; return 1;
+        case '$':
+            if (!*(p+1)) return 0;
+            op->type = RULE_APPEND_CHAR; op->ch = *(p+1);
+            rule->nops++; return 2;
+        case '^':
+            if (!*(p+1)) return 0;
+            op->type = RULE_PREPEND_CHAR; op->ch = *(p+1);
+            rule->nops++; return 2;
+        case 'T':
+            if (!*(p+1)) return 0;
+            op->type = RULE_TOGGLE_AT;
+            op->pos = (*(p+1) >= '0' && *(p+1) <= '9') ? *(p+1) - '0' : 0;
+            rule->nops++; return 2;
+        case 'i':
+            if (!*(p+1) || !*(p+2)) return 0;
+            op->type = RULE_INSERT_AT;
+            op->pos = (*(p+1) >= '0' && *(p+1) <= '9') ? *(p+1) - '0' : 0;
+            op->ch = *(p+2);
+            rule->nops++; return 3;
+        case 'o':
+            if (!*(p+1) || !*(p+2)) return 0;
+            op->type = RULE_OVERWRITE_AT;
+            op->pos = (*(p+1) >= '0' && *(p+1) <= '9') ? *(p+1) - '0' : 0;
+            op->ch = *(p+2);
+            rule->nops++; return 3;
+        case 'D':
+            if (!*(p+1)) return 0;
+            op->type = RULE_DELETE_AT;
+            op->pos = (*(p+1) >= '0' && *(p+1) <= '9') ? *(p+1) - '0' : 0;
+            rule->nops++; return 2;
+        case '[':
+            if (!*(p+1)) return 0;
+            op->type = RULE_TRUNCATE_LEFT;
+            op->pos = (*(p+1) >= '0' && *(p+1) <= '9') ? *(p+1) - '0' : 1;
+            rule->nops++; return 2;
+        case ']':
+            if (!*(p+1)) return 0;
+            op->type = RULE_TRUNCATE_RIGHT;
+            op->pos = (*(p+1) >= '0' && *(p+1) <= '9') ? *(p+1) - '0' : 1;
+            rule->nops++; return 2;
+        case 's':
+            if (!*(p+1) || !*(p+2)) return 0;
+            op->type = RULE_REPLACE; op->ch = *(p+1); op->ch2 = *(p+2);
+            rule->nops++; return 3;
+        case '@':
+            if (!*(p+1)) return 0;
+            op->type = RULE_PURGE; op->ch = *(p+1);
+            rule->nops++; return 2;
+        case 'p':
+            if (!*(p+1)) return 0;
+            op->type = RULE_DUPLICATE_N;
+            op->pos = (*(p+1) >= '0' && *(p+1) <= '9') ? *(p+1) - '0' : 1;
+            rule->nops++; return 2;
+        case 'y':
+            if (!*(p+1)) return 0;
+            op->type = RULE_DUP_FIRST_N;
+            op->pos = (*(p+1) >= '0' && *(p+1) <= '9') ? *(p+1) - '0' : 1;
+            rule->nops++; return 2;
+        case 'Y':
+            if (!*(p+1)) return 0;
+            op->type = RULE_DUP_LAST_N;
+            op->pos = (*(p+1) >= '0' && *(p+1) <= '9') ? *(p+1) - '0' : 1;
+            rule->nops++; return 2;
+        case '*':
+            if (!*(p+1) || !*(p+2)) return 0;
+            op->type = RULE_SWAP;
+            op->pos = (*(p+1) >= '0' && *(p+1) <= '9') ? *(p+1) - '0' : 0;
+            op->ch = *(p+2);  /* second position stored in ch */
+            rule->nops++; return 3;
+        case 'L': /* Leet speak */
+            op->type = RULE_LEET;
+            rule->nops++; return 1;
+        default:
+            return 0;
+    }
+}
+
+/* Load rules from a file (one rule per line, hashcat-compatible) */
+static int load_rules_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); return 0; }
+
+    char line[256];
+    g_nrules = 0;
+    while (fgets(line, sizeof(line), f) && g_nrules < MAX_RULES) {
+        size_t len = strlen(line);
+        while (len && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+        if (!len || line[0] == '#') continue;
+
+        Rule *r = &g_rules[g_nrules];
+        memset(r, 0, sizeof(*r));
+        const char *p = line;
+        int ok = 1;
+        while (*p && r->nops < MAX_OPS_PER_RULE) {
+            int consumed = parse_rule_op(p, r);
+            if (consumed <= 0) { ok = 0; break; }
+            p += consumed;
+        }
+        if (ok && r->nops > 0) g_nrules++;
+    }
+    fclose(f);
+    fprintf(stderr, "Loaded %d rules from %s\n", g_nrules, path);
+    return 1;
+}
+
 static void init_rules(void)
 {
     g_nrules = 0;
     /* : (as-is) */
-    g_rules[g_nrules++] = (Rule){ RULE_NOOP, 0 };
+    add_rule_1(RULE_NOOP, 0, 0, 0);
     /* l (lowercase) */
-    g_rules[g_nrules++] = (Rule){ RULE_LOWER, 0 };
+    add_rule_1(RULE_LOWER, 0, 0, 0);
     /* u (uppercase) */
-    g_rules[g_nrules++] = (Rule){ RULE_UPPER, 0 };
+    add_rule_1(RULE_UPPER, 0, 0, 0);
     /* c (capitalize first) */
-    g_rules[g_nrules++] = (Rule){ RULE_CAPITALIZE, 0 };
+    add_rule_1(RULE_CAPITALIZE, 0, 0, 0);
     /* r (reverse) */
-    g_rules[g_nrules++] = (Rule){ RULE_REVERSE, 0 };
+    add_rule_1(RULE_REVERSE, 0, 0, 0);
     /* d (duplicate) */
-    g_rules[g_nrules++] = (Rule){ RULE_DUPLICATE, 0 };
+    add_rule_1(RULE_DUPLICATE, 0, 0, 0);
     /* $0 through $9 (append digit) */
     for (int i = 0; i <= 9; i++)
-        g_rules[g_nrules++] = (Rule){ RULE_APPEND_CHAR, (char)('0' + i) };
+        add_rule_1(RULE_APPEND_CHAR, (char)('0' + i), 0, 0);
     /* ^1 through ^9 (prepend digit) */
     for (int i = 1; i <= 9; i++)
-        g_rules[g_nrules++] = (Rule){ RULE_PREPEND_CHAR, (char)('0' + i) };
+        add_rule_1(RULE_PREPEND_CHAR, (char)('0' + i), 0, 0);
     /* c$1 through c$9 (capitalize + append digit) */
     for (int i = 1; i <= 9; i++)
-        g_rules[g_nrules++] = (Rule){ RULE_CAP_APPEND, (char)('0' + i) };
+        add_rule_2(RULE_CAPITALIZE, 0, 0, 0,
+                   RULE_APPEND_CHAR, (char)('0' + i), 0, 0);
+}
+
+/* Apply a single rule op in-place on buf[0..len-1]. Returns new length. */
+static size_t apply_one_op(char *buf, size_t len, const typeof(((Rule *)0)->ops[0]) *op)
+{
+    switch (op->type) {
+        case RULE_NOOP:
+            break;
+        case RULE_LOWER:
+            for (size_t i = 0; i < len; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
+            break;
+        case RULE_UPPER:
+            for (size_t i = 0; i < len; i++) buf[i] = (char)toupper((unsigned char)buf[i]);
+            break;
+        case RULE_CAPITALIZE:
+            if (len > 0) buf[0] = (char)toupper((unsigned char)buf[0]);
+            for (size_t i = 1; i < len; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
+            break;
+        case RULE_REVERSE: {
+            for (size_t i = 0; i < len / 2; i++) {
+                char tmp = buf[i]; buf[i] = buf[len - 1 - i]; buf[len - 1 - i] = tmp;
+            }
+            break;
+        }
+        case RULE_DUPLICATE:
+            if (len * 2 <= MAX_PASS_LEN) {
+                memcpy(buf + len, buf, len);
+                len *= 2;
+            }
+            break;
+        case RULE_APPEND_CHAR:
+            if (len < MAX_PASS_LEN) buf[len++] = op->ch;
+            break;
+        case RULE_PREPEND_CHAR:
+            if (len < MAX_PASS_LEN) {
+                memmove(buf + 1, buf, len);
+                buf[0] = op->ch;
+                len++;
+            }
+            break;
+        case RULE_CAP_APPEND:
+            if (len > 0) buf[0] = (char)toupper((unsigned char)buf[0]);
+            for (size_t i = 1; i < len; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
+            if (len < MAX_PASS_LEN) buf[len++] = op->ch;
+            break;
+        case RULE_TOGGLE_AT:
+            if ((size_t)op->pos < len) {
+                unsigned char c = (unsigned char)buf[op->pos];
+                buf[op->pos] = (char)(islower(c) ? toupper(c) : tolower(c));
+            }
+            break;
+        case RULE_INSERT_AT:
+            if ((size_t)op->pos <= len && len < MAX_PASS_LEN) {
+                memmove(buf + op->pos + 1, buf + op->pos, len - (size_t)op->pos);
+                buf[op->pos] = op->ch;
+                len++;
+            }
+            break;
+        case RULE_OVERWRITE_AT:
+            if ((size_t)op->pos < len)
+                buf[op->pos] = op->ch;
+            break;
+        case RULE_DELETE_AT:
+            if ((size_t)op->pos < len) {
+                memmove(buf + op->pos, buf + op->pos + 1, len - (size_t)op->pos - 1);
+                len--;
+            }
+            break;
+        case RULE_TRUNCATE_LEFT: {
+            int n = op->pos;
+            if ((size_t)n >= len) { len = 0; }
+            else { memmove(buf, buf + n, len - (size_t)n); len -= (size_t)n; }
+            break;
+        }
+        case RULE_TRUNCATE_RIGHT:
+            if ((size_t)op->pos < len) len = (size_t)op->pos;
+            break;
+        case RULE_REPLACE: {
+            for (size_t i = 0; i < len; i++)
+                if (buf[i] == op->ch) buf[i] = op->ch2;
+            break;
+        }
+        case RULE_PURGE: {
+            size_t w = 0;
+            for (size_t i = 0; i < len; i++)
+                if (buf[i] != op->ch) buf[w++] = buf[i];
+            len = w;
+            break;
+        }
+        case RULE_DUPLICATE_N: {
+            int n = op->pos;
+            if (n > 0 && len * (size_t)(n + 1) <= MAX_PASS_LEN) {
+                size_t orig = len;
+                for (int j = 0; j < n; j++) {
+                    memcpy(buf + len, buf, orig);
+                    len += orig;
+                }
+            }
+            break;
+        }
+        case RULE_DUP_FIRST_N: {
+            int n = op->pos;
+            if (n > 0 && (size_t)n <= len && len + (size_t)n <= MAX_PASS_LEN) {
+                memmove(buf + n, buf, len);
+                memcpy(buf, buf + n, (size_t)n); /* copy from original position */
+                len += (size_t)n;
+            }
+            break;
+        }
+        case RULE_DUP_LAST_N: {
+            int n = op->pos;
+            if (n > 0 && (size_t)n <= len && len + (size_t)n <= MAX_PASS_LEN) {
+                memcpy(buf + len, buf + len - (size_t)n, (size_t)n);
+                len += (size_t)n;
+            }
+            break;
+        }
+        case RULE_SWAP: {
+            size_t p1 = (size_t)op->pos;
+            size_t p2 = (size_t)(unsigned char)op->ch;
+            if (op->ch >= '0' && op->ch <= '9') p2 = (size_t)(op->ch - '0');
+            if (p1 < len && p2 < len) {
+                char tmp = buf[p1]; buf[p1] = buf[p2]; buf[p2] = tmp;
+            }
+            break;
+        }
+        case RULE_LEET: {
+            static const char from[] = "aeiostAEIOST";
+            static const char to[]   = "@310$7@310$7";
+            for (size_t i = 0; i < len; i++) {
+                const char *f = strchr(from, buf[i]);
+                if (f) buf[i] = to[f - from];
+            }
+            break;
+        }
+    }
+    return len;
 }
 
 static void apply_rule(const char *word, int rule_idx, char *out)
 {
     size_t len = strlen(word);
     if (len > MAX_PASS_LEN) len = MAX_PASS_LEN;
-    const Rule *r = &g_rules[rule_idx];
+    memcpy(out, word, len);
+    out[len] = '\0';
 
-    switch (r->type) {
-        case RULE_NOOP:
-            memcpy(out, word, len);
-            out[len] = '\0';
-            break;
-        case RULE_LOWER:
-            for (size_t i = 0; i < len; i++) out[i] = (char)tolower((unsigned char)word[i]);
-            out[len] = '\0';
-            break;
-        case RULE_UPPER:
-            for (size_t i = 0; i < len; i++) out[i] = (char)toupper((unsigned char)word[i]);
-            out[len] = '\0';
-            break;
-        case RULE_CAPITALIZE:
-            if (len > 0) out[0] = (char)toupper((unsigned char)word[0]);
-            for (size_t i = 1; i < len; i++) out[i] = (char)tolower((unsigned char)word[i]);
-            out[len] = '\0';
-            break;
-        case RULE_REVERSE:
-            for (size_t i = 0; i < len; i++) out[i] = word[len - 1 - i];
-            out[len] = '\0';
-            break;
-        case RULE_DUPLICATE:
-            if (len * 2 > MAX_PASS_LEN) {
-                memcpy(out, word, len);
-                out[len] = '\0';
-            } else {
-                memcpy(out, word, len);
-                memcpy(out + len, word, len);
-                out[len * 2] = '\0';
-            }
-            break;
-        case RULE_APPEND_CHAR:
-            if (len < MAX_PASS_LEN) {
-                memcpy(out, word, len);
-                out[len] = r->ch;
-                out[len + 1] = '\0';
-            } else {
-                memcpy(out, word, len);
-                out[len] = '\0';
-            }
-            break;
-        case RULE_PREPEND_CHAR:
-            if (len < MAX_PASS_LEN) {
-                out[0] = r->ch;
-                memcpy(out + 1, word, len);
-                out[len + 1] = '\0';
-            } else {
-                memcpy(out, word, len);
-                out[len] = '\0';
-            }
-            break;
-        case RULE_CAP_APPEND:
-            if (len > 0) out[0] = (char)toupper((unsigned char)word[0]);
-            for (size_t i = 1; i < len; i++) out[i] = (char)tolower((unsigned char)word[i]);
-            if (len < MAX_PASS_LEN) {
-                out[len] = r->ch;
-                out[len + 1] = '\0';
-            } else {
-                out[len] = '\0';
-            }
-            break;
+    const Rule *r = &g_rules[rule_idx];
+    for (int i = 0; i < r->nops; i++) {
+        len = apply_one_op(out, len, &r->ops[i]);
     }
+    out[len] = '\0';
 }
 
 /* ================================================================
@@ -2060,10 +2342,19 @@ static void *gpu_r6_brute_worker(void *arg)
     GPUBruteArg *a = (GPUBruteArg *)arg;
     int batch = metal_r6_max_batch(g_r6_ctx);
 
-    const char **pw_ptrs = malloc(sizeof(char *) * batch);
-    char *pw_storage = malloc((size_t)batch * (MAX_PASS_LEN + 1));
+    /* Double-buffered password arrays for pipelining */
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN + 1));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
 
-    if (!pw_ptrs || !pw_storage) goto done;
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, batch);
@@ -2072,24 +2363,46 @@ static void *gpu_r6_brute_worker(void *arg)
         if (end > a->total) end = a->total;
         int count = (int)(end - start);
 
+        /* Prepare passwords on current buffer */
         for (int i = 0; i < count; i++) {
-            char *pw = pw_storage + i * (MAX_PASS_LEN + 1);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
             g_idx_to_pass(start + i, a->length, pw);
-            pw_ptrs[i] = pw;
+            pw_ptrs[cur_buf][i] = pw;
         }
 
-        int match = metal_r6_verify_batch(g_r6_ctx, pw_ptrs, count);
+        /* Wait for previous batch if any */
+        if (pending_handle) {
+            int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
+            pending_handle = NULL;
+            if (match >= 0) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
+            }
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+
+        /* Submit current batch asynchronously */
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    /* Wait for final batch */
+    if (pending_handle) {
+        int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
         if (match >= 0) {
             if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+                strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
         }
-
-        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
 done:
-    free(pw_ptrs);
-    free(pw_storage);
+    for (int b = 0; b < 2; b++) {
+        free(pw_ptrs[b]);
+        free(pw_storage[b]);
+    }
     free(arg);
     return NULL;
 }
@@ -2099,8 +2412,16 @@ static void *gpu_r6_dict_worker(void *arg)
     (void)arg;
     int batch = metal_r6_max_batch(g_r6_ctx);
 
-    const char **pw_ptrs = malloc(sizeof(char *) * batch);
-    if (!pw_ptrs) goto done;
+    const char **pw_ptrs[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        if (!pw_ptrs[b]) goto done;
+    }
+
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, batch);
@@ -2110,20 +2431,35 @@ static void *gpu_r6_dict_worker(void *arg)
         int count = (int)(end - start);
 
         for (int i = 0; i < count; i++)
-            pw_ptrs[i] = g_words[start + i];
+            pw_ptrs[cur_buf][i] = g_words[start + i];
 
-        int match = metal_r6_verify_batch(g_r6_ctx,
-                                           (const char **)pw_ptrs, count);
-        if (match >= 0) {
-            if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+        if (pending_handle) {
+            int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
+            pending_handle = NULL;
+            if (match >= 0) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
+            }
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
-        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
+        if (match >= 0) {
+            if (!atomic_exchange(&g_found, 1))
+                strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
+        }
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
 done:
-    free(pw_ptrs);
+    for (int b = 0; b < 2; b++) free(pw_ptrs[b]);
     free(arg);
     return NULL;
 }
@@ -2134,10 +2470,18 @@ static void *gpu_r6_rule_worker(void *arg)
     long total = g_nwords * g_nrules;
     int batch = metal_r6_max_batch(g_r6_ctx);
 
-    const char **pw_ptrs = malloc(sizeof(char *) * batch);
-    char *pw_storage = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
 
-    if (!pw_ptrs || !pw_storage) goto done;
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, batch);
@@ -2150,23 +2494,41 @@ static void *gpu_r6_rule_worker(void *arg)
             long idx = start + i;
             long word_idx = idx / g_nrules;
             int  rule_idx = (int)(idx % g_nrules);
-            char *pw = pw_storage + i * (MAX_PASS_LEN * 2 + 2);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
             apply_rule(g_words[word_idx], rule_idx, pw);
-            pw_ptrs[i] = pw;
+            pw_ptrs[cur_buf][i] = pw;
         }
 
-        int match = metal_r6_verify_batch(g_r6_ctx, pw_ptrs, count);
+        if (pending_handle) {
+            int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
+            pending_handle = NULL;
+            if (match >= 0) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
+            }
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
         if (match >= 0) {
             if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+                strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
         }
-
-        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
 done:
-    free(pw_ptrs);
-    free(pw_storage);
+    for (int b = 0; b < 2; b++) {
+        free(pw_ptrs[b]);
+        free(pw_storage[b]);
+    }
     free(arg);
     return NULL;
 }
@@ -2177,10 +2539,18 @@ static void *gpu_r6_hybrid_worker(void *arg)
     long total = g_nwords * g_hybrid_suffix_keyspace;
     int batch = metal_r6_max_batch(g_r6_ctx);
 
-    const char **pw_ptrs = malloc(sizeof(char *) * batch);
-    char *pw_storage = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * batch);
+        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
+        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
+    }
 
-    if (!pw_ptrs || !pw_storage) goto done;
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, batch);
@@ -2193,23 +2563,41 @@ static void *gpu_r6_hybrid_worker(void *arg)
             long idx = start + i;
             long word_idx = idx / g_hybrid_suffix_keyspace;
             long suffix_idx = idx % g_hybrid_suffix_keyspace;
-            char *pw = pw_storage + i * (MAX_PASS_LEN * 2 + 2);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
             hybrid_gen_pass(word_idx, suffix_idx, pw);
-            pw_ptrs[i] = pw;
+            pw_ptrs[cur_buf][i] = pw;
         }
 
-        int match = metal_r6_verify_batch(g_r6_ctx, pw_ptrs, count);
+        if (pending_handle) {
+            int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
+            pending_handle = NULL;
+            if (match >= 0) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
+            }
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
+
+        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
+
+    if (pending_handle) {
+        int match = metal_r6_wait_results(g_r6_ctx, pending_handle, pending_count);
         if (match >= 0) {
             if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw_ptrs[match], MAX_PASS_LEN);
+                strncpy(g_password, pw_ptrs[pending_buf][match], MAX_PASS_LEN);
         }
-
-        atomic_fetch_add_explicit(&g_tested, (long)count, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
 done:
-    free(pw_ptrs);
-    free(pw_storage);
+    for (int b = 0; b < 2; b++) {
+        free(pw_ptrs[b]);
+        free(pw_storage[b]);
+    }
     free(arg);
     return NULL;
 }
@@ -2320,6 +2708,44 @@ static void run_benchmark(int nthreads)
         long gpu_tested = atomic_load(&g_tested);
         double gpu_rate = gpu_secs > 0 ? (double)gpu_tested / gpu_secs : 0;
         fprintf(stderr, "  GPU         : %.0f passwords/sec\n", gpu_rate);
+
+        /* ── GPU+CPU cooperative benchmark ─────────────────────── */
+        atomic_store(&g_found, 0);
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_next_idx, 0);
+        spawned = 0;
+
+        GPUBruteArg *ga2 = malloc(sizeof(GPUBruteArg));
+        *ga2 = (GPUBruteArg){ .length = 7, .total = bench_total };
+        void *(*gpu_worker2)(void *) = gpu_brute_worker;
+        if (g_r6_ctx)          gpu_worker2 = gpu_r6_brute_worker;
+        else if (g_sha256_ctx) gpu_worker2 = gpu_sha256_brute_worker;
+        pthread_create(&thr[spawned++], NULL, gpu_worker2, ga2);
+
+        for (int t = 0; t < nthreads && spawned < MAX_THREADS; t++) {
+            BruteArg *a = malloc(sizeof(BruteArg));
+            *a = (BruteArg){ .id = t, .length = 7,
+                             .start = 0, .end = bench_total, .use_shared = 1 };
+            pthread_create(&thr[spawned++], NULL, brute_worker, a);
+        }
+
+        t0 = mach_absolute_time();
+        for (;;) {
+            struct timespec sl = {0, 100000000L};
+            nanosleep(&sl, NULL);
+            t1 = mach_absolute_time();
+            double elapsed = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+            if (elapsed >= BENCH_SECS) break;
+        }
+        atomic_store(&g_found, 1);
+        for (int t = 0; t < spawned; t++) pthread_join(thr[t], NULL);
+
+        t1 = mach_absolute_time();
+        double coop_secs = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+        long coop_tested = atomic_load(&g_tested);
+        double coop_rate = coop_secs > 0 ? (double)coop_tested / coop_secs : 0;
+        fprintf(stderr, "  GPU+CPU     : %.0f passwords/sec (cooperative, %d threads)\n",
+                coop_rate, nthreads);
     } else {
         fprintf(stderr, "  GPU         : not available\n");
     }
@@ -2525,13 +2951,15 @@ static void usage(const char *p)
         "  -i  interactive mode (ask about password)\n"
         "  -m  mask attack (e.g. \"?u?u?u?d?d?d\" = 3 upper + 3 digits)\n"
         "        ?l=lowercase ?u=uppercase ?d=digit ?s=special ?a=all\n"
-        "        ?h=hex-lower ?H=hex-upper ?1..?4=custom charset\n"
+        "        ?h=hex-lower ?H=hex-upper ?w=dict word ?1..?4=custom charset\n"
         "        [a-f]=inline range, other characters are literal\n"
         "  -1  custom charset 1 (e.g. -1 abc)\n"
         "  -2  custom charset 2\n"
         "  -3  custom charset 3\n"
         "  -4  custom charset 4\n"
-        "  -R  rule-based mutations (use with -d, applies built-in rules)\n"
+        "  -R [file]  rule-based mutations (use with -d; file=rules file, omit for built-in)\n"
+        "        rules file: one rule per line, hashcat-compatible op codes, # for comments\n"
+        "        ops: l u c r d $X ^X TN iNX oNX DN [N ]N sXY @X pN yN YN *NM L(leet)\n"
         "  -H  hybrid attack (use with -d, e.g. -H 3 or -H \"?d?d?d?s\")\n"
         "        argument is max suffix length\n"
         "  -A  auto mode: chains dict -> rules -> freq brute 1-6 -> brute 7-max\n"
@@ -2588,7 +3016,7 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "f:d:bl:c:t:Grim:RH:BFAOU1:2:3:4:M:",
+    while ((opt = getopt_long(argc, argv, "f:d:bl:c:t:Grim:R::H:BFAOU1:2:3:4:M:",
                               long_opts, NULL)) != -1) {
         switch (opt) {
             case 'f': pdf_path    = optarg;       break;
@@ -2603,7 +3031,9 @@ int main(int argc, char *argv[])
             case 'm': mask_str    = optarg; g_mask_mode = 1;
                       strncpy(g_mask_str, optarg, sizeof(g_mask_str) - 1);
                       break;
-            case 'R': g_rule_mode = 1;            break;
+            case 'R': g_rule_mode = 1;
+                      if (optarg) g_rules_file = optarg;
+                      break;
             case 'H': g_hybrid_mode = 1;
                       if (strchr(optarg, '?') || strchr(optarg, '[')) {
                           g_hybrid_mask_mode = 1;
@@ -2872,6 +3302,14 @@ int main(int argc, char *argv[])
 
     /* -m: mask attack implies brute-force-like mode */
     if (g_mask_mode) {
+        /* If mask contains ?w, load wordlist first for combo mode */
+        if (strstr(mask_str, "?w")) {
+            if (!dict_path) {
+                fprintf(stderr, "?w in mask requires -d <wordlist>\n");
+                return 1;
+            }
+            if (!load_wordlist(dict_path)) return 1;
+        }
         if (!parse_mask(mask_str)) {
             fprintf(stderr, "Invalid mask: %s\n", mask_str);
             return 1;
@@ -2938,7 +3376,16 @@ int main(int argc, char *argv[])
     if (g_markov)
         g_idx_to_pass = markov_index_to_pass;
     else
-        g_idx_to_pass = g_mask_mode ? mask_index_to_pass : index_to_pass;
+        if (g_mask_mode) {
+            /* Check if mask has any ?w word positions */
+            g_mask_has_words = 0;
+            for (int i = 0; i < g_mask_len; i++) {
+                if (g_mask[i].is_word) { g_mask_has_words = 1; break; }
+            }
+            g_idx_to_pass = g_mask_has_words ? combo_index_to_pass : mask_index_to_pass;
+        } else {
+            g_idx_to_pass = index_to_pass;
+        }
 
     /* ── Try fast crypto path (direct MD5+RC4) ─────────────────── */
     g_enc_params = pdf_parse_encrypt_file(pdf_path);
@@ -3059,7 +3506,11 @@ int main(int argc, char *argv[])
                         fprintf(stderr, "Cannot parse saved mask: %s\n", g_mask_str);
                         return 1;
                     }
-                    g_idx_to_pass = mask_index_to_pass;
+                    g_mask_has_words = 0;
+                    for (int mi = 0; mi < g_mask_len; mi++) {
+                        if (g_mask[mi].is_word) { g_mask_has_words = 1; break; }
+                    }
+                    g_idx_to_pass = g_mask_has_words ? combo_index_to_pass : mask_index_to_pass;
                 }
             }
 
@@ -3172,7 +3623,8 @@ int main(int argc, char *argv[])
             auto_phases++;
             g_auto_phase = auto_phases;
             if (resume_phase <= auto_phases) {
-                init_rules();
+                if (g_rules_file) load_rules_file(g_rules_file);
+                else init_rules();
                 long rule_total = g_nwords * g_nrules;
                 long rule_start = (resume_phase == auto_phases) ? resume_auto_idx : 0;
                 fprintf(stderr,
@@ -3418,7 +3870,8 @@ int main(int argc, char *argv[])
             pthread_join(prog, NULL);
             return 1;
         }
-        init_rules();
+        if (g_rules_file) load_rules_file(g_rules_file);
+        else init_rules();
         long total = g_nwords * g_nrules;
         long rule_start = 0;
         if (resume && ck.valid && ck.attack_mode == ATTACK_RULE)

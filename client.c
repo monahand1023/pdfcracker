@@ -918,10 +918,31 @@ static int run_session(const char *host, int port)
         close(fd); g_server_fd = -1; return 1;
     }
 
-    /* ── Receive PDF ───────────────────────────────────────────── */
+    /* ── Receive optional protocol messages (PWMODE, etc.) then PDF ── */
     if (sock_readline(fd, line, sizeof(line)) < 0) {
         close(fd); g_server_fd = -1; return 1;
     }
+
+    /* Handle PWMODE if present (v4 protocol) */
+    if (strncmp(line, "PWMODE ", 7) == 0) {
+        if (strcmp(line + 7, "user") == 0) g_password_mode = PW_MODE_USER;
+        else if (strcmp(line + 7, "owner") == 0) g_password_mode = PW_MODE_OWNER;
+        else g_password_mode = PW_MODE_BOTH;
+        fprintf(stderr, "Password mode: %s\n", line + 7);
+        /* Read the next line (should be PDF) */
+        if (sock_readline(fd, line, sizeof(line)) < 0) {
+            close(fd); g_server_fd = -1; return 1;
+        }
+    }
+
+    /* Skip any other unknown protocol lines until we get PDF */
+    while (strncmp(line, "PDF ", 4) != 0) {
+        fprintf(stderr, "Ignoring unknown config line: %s\n", line);
+        if (sock_readline(fd, line, sizeof(line)) < 0) {
+            close(fd); g_server_fd = -1; return 1;
+        }
+    }
+
     long pdf_size = 0;
     if (sscanf(line, "PDF %ld", &pdf_size) != 1 || pdf_size <= 0) {
         fprintf(stderr, "Bad PDF header: %s\n", line);

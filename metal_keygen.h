@@ -121,4 +121,27 @@ int metal_r6_max_batch(MetalR6Context *ctx);
  */
 void metal_r6_free(MetalR6Context *ctx);
 
+/*
+ * Async R6 pipeline (double-dispatch):
+ * Submit a batch without waiting for completion.
+ * Returns an opaque handle (command buffer) for later waiting.
+ */
+void *metal_r6_submit_async(MetalR6Context *ctx, const char **passwords, int count);
+
+/*
+ * Wait for an async R6 batch to complete and check results.
+ * Returns index of first match, or -1 if none.
+ * The handle is the value returned by metal_r6_submit_async.
+ */
+int metal_r6_wait_results(MetalR6Context *ctx, void *handle, int count);
+
+/*
+ * R6 sub-batch verification: dispatches in sub-batches of sub_size,
+ * checking results between each for early termination.
+ * Returns index of first match, or -1 if none.
+ */
+int metal_r6_verify_batch_sub(MetalR6Context *ctx,
+                               const char **passwords, int count,
+                               int sub_size);
+
 #endif /* METAL_KEYGEN_H */

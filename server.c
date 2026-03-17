@@ -16,6 +16,7 @@
  */
 
 #include "protocol.h"
+#include "pdf_encrypt.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -97,6 +98,7 @@ static int   g_auto_phase        = 0;
 static char  g_mask_pattern[256] = {0};
 static int   g_hybrid_suffix_len = 0;
 static int   g_freq_mode         = 0;
+static int   g_pdf_revision      = 0;  /* PDF encryption revision (0=unknown, 6=R6) */
 
 /* Work cursor (protected by g_work_lock) */
 static pthread_mutex_t g_work_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -461,9 +463,16 @@ static uint64_t assign_work(ClientInfo *ci, int *is_brute,
         /* Generate new chunk from cursor */
         long csz = ci->chunk_size;
         if (g_brute) {
-            if (csz <= 0) csz = DEFAULT_CHUNK_BRUTE;
-            if (csz < MIN_CHUNK_BRUTE) csz = MIN_CHUNK_BRUTE;
-            if (csz > MAX_CHUNK_BRUTE) csz = MAX_CHUNK_BRUTE;
+            /* R6-aware defaults: smaller chunks for slow-per-password R6 */
+            if (g_pdf_revision == 6) {
+                if (csz <= 0) csz = DEFAULT_CHUNK_BRUTE_R6;
+                if (csz < MIN_CHUNK_BRUTE_R6) csz = MIN_CHUNK_BRUTE_R6;
+                if (csz > MAX_CHUNK_BRUTE_R6) csz = MAX_CHUNK_BRUTE_R6;
+            } else {
+                if (csz <= 0) csz = DEFAULT_CHUNK_BRUTE;
+                if (csz < MIN_CHUNK_BRUTE) csz = MIN_CHUNK_BRUTE;
+                if (csz > MAX_CHUNK_BRUTE) csz = MAX_CHUNK_BRUTE;
+            }
             int len;
             long start, end;
             if (next_brute_chunk(csz, &len, &start, &end)) {
@@ -877,8 +886,8 @@ static void *client_handler(void *arg)
         goto done;
     }
 
-    if (proto_ver != PROTO_VERSION) {
-        fprintf(stderr, "[%s] protocol version mismatch: got %d, want %d\n",
+    if (proto_ver != PROTO_VERSION && proto_ver != 3) {
+        fprintf(stderr, "[%s] protocol version mismatch: got %d, want %d (or 3)\n",
                 ip_str, proto_ver, PROTO_VERSION);
         sock_printf(fd, "ERROR protocol version mismatch");
         goto done;
@@ -934,6 +943,14 @@ static void *client_handler(void *arg)
         sock_printf(fd, "CONFIG DICT %d", g_password_mode);
     }
 
+    /* Send PWMODE (v4 protocol — older clients will ignore unknown lines) */
+    {
+        const char *pw_str = "both";
+        if (g_password_mode == PW_MODE_USER) pw_str = "user";
+        else if (g_password_mode == PW_MODE_OWNER) pw_str = "owner";
+        sock_printf(fd, "PWMODE %s", pw_str);
+    }
+
     /* ── Send PDF ──────────────────────────────────────────────── */
     sock_printf(fd, "PDF %ld", g_pdf_size);
     if (write_exact(fd, g_pdf_data, (size_t)g_pdf_size) < 0) {
@@ -968,8 +985,13 @@ static void *client_handler(void *arg)
                 ci->speed = (double)tested / elapsed;
                 long new_size = (long)(ci->speed * TARGET_SECS);
                 if (g_brute) {
-                    if (new_size < MIN_CHUNK_BRUTE) new_size = MIN_CHUNK_BRUTE;
-                    if (new_size > MAX_CHUNK_BRUTE) new_size = MAX_CHUNK_BRUTE;
+                    if (g_pdf_revision == 6) {
+                        if (new_size < MIN_CHUNK_BRUTE_R6) new_size = MIN_CHUNK_BRUTE_R6;
+                        if (new_size > MAX_CHUNK_BRUTE_R6) new_size = MAX_CHUNK_BRUTE_R6;
+                    } else {
+                        if (new_size < MIN_CHUNK_BRUTE) new_size = MIN_CHUNK_BRUTE;
+                        if (new_size > MAX_CHUNK_BRUTE) new_size = MAX_CHUNK_BRUTE;
+                    }
                 } else {
                     if (new_size < MIN_CHUNK_DICT) new_size = MIN_CHUNK_DICT;
                     if (new_size > MAX_CHUNK_DICT) new_size = MAX_CHUNK_DICT;
@@ -1241,6 +1263,8 @@ static void save_checkpoint(void)
         fprintf(f, "hybrid_suffix_len %d\n", g_hybrid_suffix_len);
     if (g_freq_mode)
         fprintf(f, "freq_mode 1\n");
+    if (g_pdf_revision > 0)
+        fprintf(f, "revision %d\n", g_pdf_revision);
 
     /* Lock order: g_lease_lock first, then g_work_lock (matches reaper) */
     pthread_mutex_lock(&g_lease_lock);
@@ -1339,6 +1363,10 @@ static int restore_checkpoint(const char *path)
             sscanf(val, "%d", &g_hybrid_suffix_len);
         } else if (strcmp(key, "freq_mode") == 0) {
             sscanf(val, "%d", &g_freq_mode);
+        } else if (strcmp(key, "revision") == 0) {
+            int rev = 0;
+            sscanf(val, "%d", &rev);
+            if (rev > 0 && g_pdf_revision == 0) g_pdf_revision = rev;
         } else if (strcmp(key, "lease") == 0) {
             /* Push all saved leases into requeue */
             unsigned long long lid = 0;
@@ -1622,6 +1650,16 @@ int main(int argc, char *argv[])
     if (!load_pdf(pdf_path)) return 1;
     fprintf(stderr, "PDF loaded: %s (%ld bytes)\n", pdf_path, g_pdf_size);
     compute_pdf_hash();
+
+    /* ── Detect PDF encryption revision ────────────────────────── */
+    {
+        PDFEncryptParams enc = pdf_parse_encrypt_file(pdf_path);
+        if (enc.valid) {
+            g_pdf_revision = enc.revision;
+            fprintf(stderr, "Encrypt: R%d (%d-bit key)\n",
+                    enc.revision, enc.key_length);
+        }
+    }
 
     /* ── Setup mode ────────────────────────────────────────────── */
     g_brute   = brute;
