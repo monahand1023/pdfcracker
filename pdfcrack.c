@@ -2827,31 +2827,37 @@ static void select_best_engine(int nthreads)
             scalar, neon, gpu);
 
     /* Estimate total throughput for each strategy:
-     * - GPU mode:  GPU pipeline + nthreads * scalar  (CPU does RC4 only)
-     * - NEON mode: nthreads * neon_per_core
-     * - Scalar:    nthreads * scalar_per_core
+     * - Combined: GPU pipeline + nthreads * neon  (best of both)
+     * - NEON:     nthreads * neon_per_core
+     * - GPU+scalar: GPU pipeline + nthreads * scalar
+     * - Scalar:   nthreads * scalar_per_core
      *
-     * For R2-R4, NEON gives ~4x per-core improvement because it runs
-     * 4 independent MD5 computations per core.  GPU does MD5 on chip
-     * but RC4 verification creates a CPU bottleneck, so it typically
-     * loses to NEON on Apple Silicon. */
-    double gpu_total  = gpu + (double)nthreads * scalar;
-    double neon_total = (double)nthreads * neon;
-    double cpu_total  = (double)nthreads * scalar;
+     * GPU and NEON use independent hardware (Metal compute vs CPU SIMD),
+     * so running both simultaneously gives free extra throughput.
+     * Both pull from the same atomic work counter — no conflicts. */
+    double neon_total    = (double)nthreads * neon;
+    double combined      = gpu + neon_total;  /* GPU + all NEON cores */
+    double gpu_scalar    = gpu + (double)nthreads * scalar;
+    double cpu_total     = (double)nthreads * scalar;
 
-    if (neon >= scalar && neon_total >= gpu_total) {
-        /* NEON wins — disable GPU, enable NEON */
+    if (neon >= scalar && gpu > 0 && combined > neon_total * 1.02) {
+        /* GPU+NEON combined — use both simultaneously */
+        g_use_gpu  = 1;
+        g_use_neon = 1;
+        fprintf(stderr, " — GPU+NEON selected (%.0f/s est.)\n", combined);
+    } else if (neon >= scalar && neon_total >= gpu_scalar) {
+        /* NEON alone is sufficient */
         g_use_neon = 1;
         g_use_gpu  = 0;
         if (g_gpu_ctx) { metal_keygen_free(g_gpu_ctx); g_gpu_ctx = NULL; }
         fprintf(stderr, " — NEON selected (%.0f/s est.)\n", neon_total);
-    } else if (gpu_total > cpu_total && gpu > scalar * 0.5) {
-        /* GPU wins */
+    } else if (gpu_scalar > cpu_total && gpu > scalar * 0.5) {
+        /* GPU + scalar CPU */
         g_use_gpu  = 1;
         g_use_neon = 0;
-        fprintf(stderr, " — GPU selected (%.0f/s est.)\n", gpu_total);
+        fprintf(stderr, " — GPU selected (%.0f/s est.)\n", gpu_scalar);
     } else {
-        /* Scalar CPU wins (shouldn't happen in practice) */
+        /* Scalar CPU only (shouldn't happen in practice) */
         g_use_gpu  = 0;
         g_use_neon = 0;
         if (g_gpu_ctx) { metal_keygen_free(g_gpu_ctx); g_gpu_ctx = NULL; }
@@ -7113,13 +7119,8 @@ int main(int argc, char *argv[])
                     *ga = (GPUBruteArg){ .length = len, .total = total };
                     pthread_create(&threads[spawned++], NULL,
                             g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
-                    for (int t = 0; t < nthreads; t++) {
-                        BruteArg *a = malloc(sizeof(BruteArg));
-                        *a = (BruteArg){ .id = t, .length = len,
-                                         .start = 0, .end = total, .use_shared = 1 };
-                        pthread_create(&threads[spawned++], NULL, brute_worker, a);
-                    }
-                } else {
+                }
+                {
                     void *(*worker_fn)(void *) = brute_worker;
 #ifdef __ARM_NEON
                     if (g_use_neon)
@@ -7188,13 +7189,8 @@ int main(int argc, char *argv[])
                     *ga = (GPUBruteArg){ .length = len, .total = total };
                     pthread_create(&threads[spawned++], NULL,
                             g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
-                    for (int t = 0; t < nthreads; t++) {
-                        BruteArg *a = malloc(sizeof(BruteArg));
-                        *a = (BruteArg){ .id = t, .length = len,
-                                         .start = 0, .end = total, .use_shared = 1 };
-                        pthread_create(&threads[spawned++], NULL, brute_worker, a);
-                    }
-                } else {
+                }
+                {
                     void *(*worker_fn)(void *) = brute_worker;
 #ifdef __ARM_NEON
                     if (g_use_neon)
@@ -7239,14 +7235,8 @@ int main(int argc, char *argv[])
             *ga = (GPUBruteArg){ .length = g_mask_len, .total = total };
             pthread_create(&threads[spawned++], NULL,
                             g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
-
-            for (int t = 0; t < nthreads; t++) {
-                BruteArg *a = malloc(sizeof(BruteArg));
-                *a = (BruteArg){ .id = t, .length = g_mask_len,
-                                 .start = 0, .end = total, .use_shared = 1 };
-                pthread_create(&threads[spawned++], NULL, brute_worker, a);
-            }
-        } else {
+        }
+        {
             void *(*worker_fn)(void *) = brute_worker;
 #ifdef __ARM_NEON
             if (g_use_neon)
@@ -7881,26 +7871,17 @@ int main(int argc, char *argv[])
             spawned = 0;
 
             if (g_use_gpu) {
-                /* Shared work counter mode: GPU + CPU all pull from g_next_idx */
                 GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
                 *ga = (GPUBruteArg){ .length = len, .total = total };
                 pthread_create(&threads[spawned++], NULL,
                             g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
-
-                for (int t = 0; t < nthreads; t++) {
-                    BruteArg *a = malloc(sizeof(BruteArg));
-                    *a = (BruteArg){ .id = t, .length = len,
-                                     .start = 0, .end = total, .use_shared = 1 };
-                    pthread_create(&threads[spawned++], NULL, brute_worker, a);
-                }
-            } else {
-                /* Shared work counter mode (CPU-only, incl. NEON) */
+            }
+            {
                 void *(*worker_fn)(void *) = brute_worker;
 #ifdef __ARM_NEON
                 if (g_use_neon)
                     worker_fn = brute_worker_neon;
 #endif
-
                 for (int t = 0; t < nthreads; t++) {
                     BruteArg *a = malloc(sizeof(BruteArg));
                     *a = (BruteArg){ .id = t, .length = len,
