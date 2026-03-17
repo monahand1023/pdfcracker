@@ -426,19 +426,22 @@ MetalSHA256Context *metal_sha256_init(const PDFEncryptParams *params,
                                     length:sizeof(gpu_params)
                                     options:MTLResourceStorageModeShared];
 
+        const char *mode_str = check_owner == 2 ? "both" : (check_owner ? "owner" : "user");
         fprintf(stderr, "Metal SHA-256: initialized on %s (R5 %s, max batch: %d)\n",
                 [[device name] UTF8String],
-                check_owner ? "owner" : "user",
+                mode_str,
                 MAX_BATCH_SIZE);
 
         return ctx;
     }
 }
 
-int metal_sha256_verify_batch(MetalSHA256Context *ctx,
-                               const char **passwords,
-                               int count)
+int metal_sha256_verify_batch_ex(MetalSHA256Context *ctx,
+                                  const char **passwords,
+                                  int count,
+                                  int *match_type)
 {
+    if (match_type) *match_type = 0;
     if (!ctx || count <= 0) return -1;
     if (count > ctx->max_batch) count = ctx->max_batch;
 
@@ -489,15 +492,24 @@ int metal_sha256_verify_batch(MetalSHA256Context *ctx,
             return -1;
         }
 
-        /* Scan results for first match */
+        /* Scan results for first match (1=user, 2=owner) */
         uint8_t *results = (uint8_t *)[ctx->results_buf[buf] contents];
         for (int i = 0; i < count; i++) {
-            if (results[i])
+            if (results[i]) {
+                if (match_type) *match_type = (int)results[i];
                 return i;
+            }
         }
 
         return -1;
     }
+}
+
+int metal_sha256_verify_batch(MetalSHA256Context *ctx,
+                               const char **passwords,
+                               int count)
+{
+    return metal_sha256_verify_batch_ex(ctx, passwords, count, NULL);
 }
 
 void metal_sha256_free(MetalSHA256Context *ctx)
@@ -517,6 +529,12 @@ typedef struct __attribute__((packed)) {
     uint8_t  extra[48];
     uint32_t extra_len;
     uint32_t max_rounds;
+    uint32_t check_both;
+    uint8_t  target_hash2[32];
+    uint8_t  salt2[8];
+    uint8_t  extra2[48];
+    uint32_t extra_len2;
+    uint32_t _pad;
 } PDFR6GPU;
 
 #define R6_MAX_BATCH      8192   /* smaller batches: R6 is very compute-heavy */
@@ -617,15 +635,27 @@ MetalR6Context *metal_r6_init(const PDFEncryptParams *params,
 
         PDFR6GPU gpu_params;
         memset(&gpu_params, 0, sizeof(gpu_params));
-        if (check_owner) {
+        if (check_owner == 2) {
+            /* Dual mode: primary = user, secondary = owner */
+            memcpy(gpu_params.target_hash, params->u_value, 32);
+            memcpy(gpu_params.salt, params->u_value + 32, 8);
+            gpu_params.extra_len = 0;
+            gpu_params.check_both = 1;
+            memcpy(gpu_params.target_hash2, params->o_value, 32);
+            memcpy(gpu_params.salt2, params->o_value + 32, 8);
+            memcpy(gpu_params.extra2, params->u_value, 48);
+            gpu_params.extra_len2 = 48;
+        } else if (check_owner == 1) {
             memcpy(gpu_params.target_hash, params->o_value, 32);
             memcpy(gpu_params.salt, params->o_value + 32, 8);
             memcpy(gpu_params.extra, params->u_value, 48);
             gpu_params.extra_len = 48;
+            gpu_params.check_both = 0;
         } else {
             memcpy(gpu_params.target_hash, params->u_value, 32);
             memcpy(gpu_params.salt, params->u_value + 32, 8);
             gpu_params.extra_len = 0;
+            gpu_params.check_both = 0;
         }
         gpu_params.max_rounds = 200; /* default safety limit */
 
@@ -633,9 +663,10 @@ MetalR6Context *metal_r6_init(const PDFEncryptParams *params,
                                     length:sizeof(gpu_params)
                                     options:MTLResourceStorageModeShared];
 
+        const char *mode_str = check_owner == 2 ? "both" : (check_owner ? "owner" : "user");
         fprintf(stderr, "Metal R6: initialized on %s (%s, max batch: %d)\n",
                 [[device name] UTF8String],
-                check_owner ? "owner" : "user",
+                mode_str,
                 R6_MAX_BATCH);
 
         return ctx;
@@ -651,8 +682,10 @@ void metal_r6_set_max_rounds(MetalR6Context *ctx, int max_rounds)
     }
 }
 
-int metal_r6_verify_batch(MetalR6Context *ctx, const char **passwords, int count)
+int metal_r6_verify_batch_ex(MetalR6Context *ctx, const char **passwords, int count,
+                              int *match_type)
 {
+    if (match_type) *match_type = 0;
     if (!ctx || count <= 0) return -1;
     if (count > ctx->max_batch) count = ctx->max_batch;
 
@@ -702,10 +735,18 @@ int metal_r6_verify_batch(MetalR6Context *ctx, const char **passwords, int count
 
         uint8_t *results = (uint8_t *)[ctx->results_buf[buf] contents];
         for (int i = 0; i < count; i++) {
-            if (results[i]) return i;
+            if (results[i]) {
+                if (match_type) *match_type = (int)results[i];
+                return i;
+            }
         }
         return -1;
     }
+}
+
+int metal_r6_verify_batch(MetalR6Context *ctx, const char **passwords, int count)
+{
+    return metal_r6_verify_batch_ex(ctx, passwords, count, NULL);
 }
 
 int metal_r6_max_batch(MetalR6Context *ctx)
@@ -764,8 +805,10 @@ void *metal_r6_submit_async(MetalR6Context *ctx, const char **passwords, int cou
     }
 }
 
-int metal_r6_wait_results(MetalR6Context *ctx, void *handle, int count)
+int metal_r6_wait_results_ex(MetalR6Context *ctx, void *handle, int count,
+                              int *match_type)
 {
+    if (match_type) *match_type = 0;
     if (!ctx || !handle) return -1;
 
     @autoreleasepool {
@@ -788,25 +831,34 @@ int metal_r6_wait_results(MetalR6Context *ctx, void *handle, int count)
 
         uint8_t *results = (uint8_t *)[ctx->results_buf[results_buf] contents];
         for (int i = 0; i < count; i++) {
-            if (results[i]) return i;
+            if (results[i]) {
+                if (match_type) *match_type = (int)results[i];
+                return i;
+            }
         }
         return -1;
     }
+}
+
+int metal_r6_wait_results(MetalR6Context *ctx, void *handle, int count)
+{
+    return metal_r6_wait_results_ex(ctx, handle, count, NULL);
 }
 
 /* ═══════════════════════════════════════════════════════════════
  * R6 sub-batch verification (early termination)
  * ═══════════════════════════════════════════════════════════════ */
 
-int metal_r6_verify_batch_sub(MetalR6Context *ctx,
-                               const char **passwords, int count,
-                               int sub_size)
+int metal_r6_verify_batch_sub_ex(MetalR6Context *ctx,
+                                  const char **passwords, int count,
+                                  int sub_size, int *match_type)
 {
+    if (match_type) *match_type = 0;
     if (!ctx || count <= 0) return -1;
     if (count > ctx->max_batch) count = ctx->max_batch;
     if (sub_size <= 0 || sub_size >= count) {
         /* Fall back to full batch */
-        return metal_r6_verify_batch(ctx, passwords, count);
+        return metal_r6_verify_batch_ex(ctx, passwords, count, match_type);
     }
 
     @autoreleasepool {
@@ -860,15 +912,25 @@ int metal_r6_verify_batch_sub(MetalR6Context *ctx,
                 return -1;
             }
 
-            /* Check results for this sub-batch */
+            /* Check results for this sub-batch (1=user, 2=owner) */
             uint8_t *results = (uint8_t *)[ctx->results_buf[buf] contents];
             for (int i = offset; i < offset + sub_count; i++) {
-                if (results[i]) return i;
+                if (results[i]) {
+                    if (match_type) *match_type = (int)results[i];
+                    return i;
+                }
             }
         }
 
         return -1;
     }
+}
+
+int metal_r6_verify_batch_sub(MetalR6Context *ctx,
+                               const char **passwords, int count,
+                               int sub_size)
+{
+    return metal_r6_verify_batch_sub_ex(ctx, passwords, count, sub_size, NULL);
 }
 
 void metal_r6_free(MetalR6Context *ctx)

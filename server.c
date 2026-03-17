@@ -142,6 +142,9 @@ static const char *g_pdf_path = NULL;
 /* Listen fd (for shutdown) */
 static int g_listenfd = -1;
 
+/* Web dashboard port (0 = disabled) */
+static int g_web_port = 0;
+
 /* Server binary directory (for serving files over HTTP) */
 static char g_server_dir[PATH_MAX] = ".";
 
@@ -1572,6 +1575,352 @@ static void *progress_thread(void *arg)
 }
 
 /* ================================================================
+ * Web Dashboard — dedicated HTTP server on --web-port
+ * ================================================================ */
+
+/* JSON-escape a string into buf (at most buf_sz-1 chars + NUL) */
+static void web_json_escape(const char *in, char *buf, size_t buf_sz)
+{
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 6 < buf_sz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"')       { buf[j++] = '\\'; buf[j++] = '"'; }
+        else if (c == '\\') { buf[j++] = '\\'; buf[j++] = '\\'; }
+        else if (c < 0x20)  { j += (size_t)snprintf(buf + j, buf_sz - j, "\\u%04x", c); }
+        else                { buf[j++] = (char)c; }
+    }
+    buf[j] = '\0';
+}
+
+static void web_serve_api_status(int fd)
+{
+    double now = mono_time();
+    long tested = atomic_load(&g_total_tested);
+    int found = atomic_load(&g_found);
+    double elapsed = now - g_start_time;
+
+    /* Snapshot password under lock to avoid data race */
+    char pw_copy[MAX_PASS_LEN + 1] = {0};
+    if (found) {
+        pthread_mutex_lock(&g_work_lock);
+        memcpy(pw_copy, g_password, sizeof(pw_copy));
+        pthread_mutex_unlock(&g_work_lock);
+    }
+
+    /* JSON-escape strings that may contain special chars */
+    char pw_escaped[MAX_PASS_LEN * 2 + 1];
+    char cs_escaped[512];
+    web_json_escape(pw_copy, pw_escaped, sizeof(pw_escaped));
+    web_json_escape(g_charset ? g_charset : "", cs_escaped, sizeof(cs_escaped));
+
+    double total_speed = 0;
+    pthread_mutex_lock(&g_clients_lock);
+    for (int i = 0; i < g_nclient_ids; i++) {
+        if (g_clients[i].active)
+            total_speed += g_clients[i].speed;
+    }
+
+    /* Build JSON */
+    char body[16384];
+    int off = 0;
+    off += snprintf(body + off, sizeof(body) - (size_t)off,
+        "{\"mode\":\"%s\","
+        "\"charset\":\"%s\","
+        "\"max_length\":%d,"
+        "\"total_keyspace\":%ld,"
+        "\"total_tested\":%ld,"
+        "\"elapsed_secs\":%.1f,"
+        "\"aggregate_rate\":%.0f,"
+        "\"found\":%s,"
+        "\"password\":%s%s%s,"
+        "\"clients\":[",
+        g_brute ? "brute" : "dict",
+        cs_escaped,
+        g_max_len,
+        g_keyspace,
+        tested,
+        elapsed,
+        total_speed,
+        found ? "true" : "false",
+        found ? "\"" : "null",
+        found ? pw_escaped : "",
+        found ? "\"" : "");
+
+    int first = 1;
+    for (int i = 0; i < g_nclient_ids; i++) {
+        ClientInfo *ci = &g_clients[i];
+        if (ci->slot_free) continue;
+        int ago = ci->active ? (int)(now - ci->last_seen) : -1;
+        const char *status = ci->active ? "working" : "offline";
+        if (!first) {
+            off += snprintf(body + off, sizeof(body) - (size_t)off, ",");
+        }
+        first = 0;
+        off += snprintf(body + off, sizeof(body) - (size_t)off,
+            "{\"id\":\"%s\","
+            "\"ip\":\"%s\","
+            "\"cores\":%d,"
+            "\"speed\":%.0f,"
+            "\"tested\":%ld,"
+            "\"status\":\"%s\","
+            "\"last_heartbeat_ago\":%d}",
+            ci->uuid, ci->ip_str, ci->cores, ci->speed,
+            ci->tested, status, ago);
+    }
+    pthread_mutex_unlock(&g_clients_lock);
+
+    off += snprintf(body + off, sizeof(body) - (size_t)off, "]}");
+
+    dprintf(fd, "HTTP/1.0 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Content-Length: %d\r\n"
+                "\r\n%s", off, body);
+}
+
+static void web_serve_dashboard(int fd)
+{
+    static const char html[] =
+        "<!DOCTYPE html>\n"
+        "<html><head><meta charset='utf-8'>\n"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>\n"
+        "<title>pdfcracker Dashboard</title>\n"
+        "<style>\n"
+        "  * { box-sizing: border-box; margin: 0; padding: 0; }\n"
+        "  body { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;\n"
+        "         background: #1a1a2e; color: #eee; padding: 20px; min-height: 100vh; }\n"
+        "  h1 { font-size: 1.5em; margin-bottom: 18px; color: #7fbaff;\n"
+        "       border-bottom: 1px solid #16213e; padding-bottom: 10px; }\n"
+        "  .card { background: #16213e; border: 1px solid #0f3460;\n"
+        "          border-radius: 8px; padding: 16px; margin-bottom: 16px; }\n"
+        "  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));\n"
+        "           gap: 12px; }\n"
+        "  .stat-label { font-size: 0.7em; color: #8899aa; text-transform: uppercase;\n"
+        "                letter-spacing: 0.05em; }\n"
+        "  .stat-value { font-size: 1.4em; font-weight: 700; color: #f0f0f0; margin-top: 2px; }\n"
+        "  .bar-bg { background: #0f3460; border-radius: 6px; height: 24px;\n"
+        "            margin: 14px 0; overflow: hidden; position: relative; }\n"
+        "  .bar-fg { background: linear-gradient(90deg, #e94560, #ff6b6b);\n"
+        "            height: 100%; border-radius: 6px; transition: width 0.6s ease; }\n"
+        "  .bar-text { position: absolute; top: 0; left: 0; right: 0; height: 100%;\n"
+        "              display: flex; align-items: center; justify-content: center;\n"
+        "              font-size: 0.8em; font-weight: 600; color: #fff; }\n"
+        "  table { width: 100%; border-collapse: collapse; font-size: 0.85em; }\n"
+        "  th { text-align: left; color: #8899aa; font-weight: 500; padding: 8px 10px;\n"
+        "       border-bottom: 1px solid #0f3460; font-size: 0.75em;\n"
+        "       text-transform: uppercase; letter-spacing: 0.05em; }\n"
+        "  td { padding: 8px 10px; border-bottom: 1px solid #16213e; }\n"
+        "  tr:hover td { background: #1a2744; }\n"
+        "  .online { color: #3fb950; font-weight: 600; }\n"
+        "  .offline { color: #f85149; font-weight: 600; }\n"
+        "  .found-banner { background: #238636; color: #fff; padding: 14px 20px;\n"
+        "                  border-radius: 8px; font-size: 1.3em; font-weight: 700;\n"
+        "                  display: none; text-align: center; margin-bottom: 16px;\n"
+        "                  letter-spacing: 0.02em; }\n"
+        "  .mode-info { font-size: 0.85em; color: #8899aa; margin-bottom: 10px; }\n"
+        "  .uuid { font-size: 0.8em; color: #6680aa; font-family: monospace; }\n"
+        "  @media (max-width: 600px) {\n"
+        "    body { padding: 10px; }\n"
+        "    .stats { grid-template-columns: repeat(2, 1fr); gap: 8px; }\n"
+        "    .stat-value { font-size: 1.1em; }\n"
+        "    table { font-size: 0.75em; }\n"
+        "    th, td { padding: 6px 4px; }\n"
+        "  }\n"
+        "</style>\n"
+        "</head><body>\n"
+        "<h1>pdfcracker Dashboard</h1>\n"
+        "<div id='found' class='found-banner'></div>\n"
+        "<div class='card'>\n"
+        "  <div id='mode-info' class='mode-info'></div>\n"
+        "  <div class='bar-bg'>\n"
+        "    <div id='bar' class='bar-fg' style='width:0%'></div>\n"
+        "    <div id='bar-text' class='bar-text'>0%</div>\n"
+        "  </div>\n"
+        "  <div class='stats'>\n"
+        "    <div><div class='stat-label'>Progress</div><div class='stat-value' id='pct'>--</div></div>\n"
+        "    <div><div class='stat-label'>Tested</div><div class='stat-value' id='tested'>--</div></div>\n"
+        "    <div><div class='stat-label'>Speed</div><div class='stat-value' id='speed'>--</div></div>\n"
+        "    <div><div class='stat-label'>ETA</div><div class='stat-value' id='eta'>--</div></div>\n"
+        "    <div><div class='stat-label'>Elapsed</div><div class='stat-value' id='elapsed'>--</div></div>\n"
+        "    <div><div class='stat-label'>Keyspace</div><div class='stat-value' id='keyspace'>--</div></div>\n"
+        "  </div>\n"
+        "</div>\n"
+        "<div class='card'>\n"
+        "  <table><thead><tr>\n"
+        "    <th>ID</th><th>IP</th><th>Cores</th><th>Speed</th>\n"
+        "    <th>Tested</th><th>Status</th><th>Last Heartbeat</th>\n"
+        "  </tr></thead><tbody id='clients'></tbody></table>\n"
+        "</div>\n"
+        "<script>\n"
+        "function fmtNum(n) {\n"
+        "  if (n == null) return '---';\n"
+        "  if (n >= 1e12) return (n/1e12).toFixed(1)+'T';\n"
+        "  if (n >= 1e9) return (n/1e9).toFixed(1)+'G';\n"
+        "  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';\n"
+        "  if (n >= 1e3) return (n/1e3).toFixed(1)+'K';\n"
+        "  return n.toLocaleString();\n"
+        "}\n"
+        "function fmtSpeed(n) {\n"
+        "  if (n == null || n <= 0) return '0/s';\n"
+        "  if (n >= 1e6) return (n/1e6).toFixed(1)+'M/s';\n"
+        "  if (n >= 1e3) return (n/1e3).toFixed(1)+'K/s';\n"
+        "  return Math.round(n)+'/s';\n"
+        "}\n"
+        "function fmtTime(s) {\n"
+        "  if (s == null || s < 0) return '---';\n"
+        "  s = Math.floor(s);\n"
+        "  var h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;\n"
+        "  if (h > 0) return h+'h '+String(m).padStart(2,'0')+'m '+String(sec).padStart(2,'0')+'s';\n"
+        "  if (m > 0) return m+'m '+String(sec).padStart(2,'0')+'s';\n"
+        "  return sec+'s';\n"
+        "}\n"
+        "function shortUuid(u) {\n"
+        "  if (!u || u.length < 8) return u || '---';\n"
+        "  return u.substring(0, 8);\n"
+        "}\n"
+        "async function refresh() {\n"
+        "  try {\n"
+        "    var r = await fetch('/api/status');\n"
+        "    var d = await r.json();\n"
+        "    var pct = d.total_keyspace > 0 ? (d.total_tested / d.total_keyspace * 100) : 0;\n"
+        "    if (pct > 100) pct = 100;\n"
+        "    document.getElementById('pct').textContent = pct.toFixed(2)+'%';\n"
+        "    document.getElementById('bar').style.width = Math.min(pct,100)+'%';\n"
+        "    document.getElementById('bar-text').textContent = pct.toFixed(1)+'%';\n"
+        "    document.getElementById('tested').textContent = fmtNum(d.total_tested);\n"
+        "    document.getElementById('speed').textContent = fmtSpeed(d.aggregate_rate);\n"
+        "    var eta = d.aggregate_rate > 0 && d.total_keyspace > d.total_tested\n"
+        "      ? (d.total_keyspace - d.total_tested) / d.aggregate_rate : -1;\n"
+        "    document.getElementById('eta').textContent = fmtTime(eta);\n"
+        "    document.getElementById('elapsed').textContent = fmtTime(d.elapsed_secs);\n"
+        "    document.getElementById('keyspace').textContent = fmtNum(d.total_keyspace);\n"
+        "    var info = 'Mode: ' + d.mode;\n"
+        "    if (d.mode === 'brute') info += ' | Charset: ' + d.charset + ' | Max length: ' + d.max_length;\n"
+        "    document.getElementById('mode-info').textContent = info;\n"
+        "    if (d.found) {\n"
+        "      var el = document.getElementById('found');\n"
+        "      el.textContent = 'PASSWORD FOUND: ' + d.password;\n"
+        "      el.style.display = 'block';\n"
+        "    }\n"
+        "    var tb = document.getElementById('clients');\n"
+        "    tb.innerHTML = '';\n"
+        "    d.clients.forEach(function(c) {\n"
+        "      var tr = document.createElement('tr');\n"
+        "      var st = c.status === 'working'\n"
+        "        ? '<span class=online>working</span>'\n"
+        "        : '<span class=offline>offline</span>';\n"
+        "      var hb = c.last_heartbeat_ago >= 0 ? c.last_heartbeat_ago+'s ago' : '---';\n"
+        "      tr.innerHTML = '<td><span class=uuid>' + shortUuid(c.id) + '</span></td>'\n"
+        "        + '<td>' + c.ip + '</td>'\n"
+        "        + '<td>' + c.cores + '</td>'\n"
+        "        + '<td>' + fmtSpeed(c.speed) + '</td>'\n"
+        "        + '<td>' + fmtNum(c.tested) + '</td>'\n"
+        "        + '<td>' + st + '</td>'\n"
+        "        + '<td>' + hb + '</td>';\n"
+        "      tb.appendChild(tr);\n"
+        "    });\n"
+        "  } catch(e) {}\n"
+        "}\n"
+        "refresh();\n"
+        "setInterval(refresh, 2000);\n"
+        "</script>\n"
+        "</body></html>\n";
+
+    int body_len = (int)sizeof(html) - 1;
+    dprintf(fd, "HTTP/1.0 200 OK\r\n"
+                "Content-Type: text/html; charset=utf-8\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Content-Length: %d\r\n"
+                "\r\n", body_len);
+    write(fd, html, body_len);
+}
+
+static void *web_server_thread(void *arg)
+{
+    (void)arg;
+
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sfd < 0) { perror("web socket"); return NULL; }
+
+    int yes = 1;
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port   = htons((uint16_t)g_web_port),
+        .sin_addr.s_addr = INADDR_ANY,
+    };
+    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("web bind"); close(sfd); return NULL;
+    }
+    if (listen(sfd, 8) < 0) {
+        perror("web listen"); close(sfd); return NULL;
+    }
+
+    fprintf(stderr, "Web dashboard: http://0.0.0.0:%d\n", g_web_port);
+
+    while (!g_shutdown) {
+        int cfd = accept(sfd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR || g_shutdown) break;
+            continue;
+        }
+
+        /* Read timeout to avoid blocking on bad clients */
+        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        /* Read until \r\n\r\n */
+        char buf[4096];
+        ssize_t total = 0;
+        int header_done = 0;
+        while (total < (ssize_t)sizeof(buf) - 1) {
+            ssize_t r = read(cfd, buf + total, 1);
+            if (r <= 0) break;
+            total += r;
+            if (total >= 4 &&
+                buf[total-4] == '\r' && buf[total-3] == '\n' &&
+                buf[total-2] == '\r' && buf[total-1] == '\n') {
+                header_done = 1;
+                break;
+            }
+        }
+        buf[total] = '\0';
+
+        if (header_done || total > 0) {
+            /* Extract path from "GET /path HTTP/1.x" */
+            char path[256] = "";
+            if (strncmp(buf, "GET ", 4) == 0) {
+                char *p = buf + 4;
+                char *end = strchr(p, ' ');
+                if (!end) end = strchr(p, '\r');
+                if (!end) end = p + strlen(p);
+                size_t len = (size_t)(end - p);
+                if (len >= sizeof(path)) len = sizeof(path) - 1;
+                memcpy(path, p, len);
+                path[len] = '\0';
+            }
+
+            if (strcmp(path, "/") == 0) {
+                web_serve_dashboard(cfd);
+            } else if (strcmp(path, "/api/status") == 0) {
+                web_serve_api_status(cfd);
+            } else {
+                dprintf(cfd, "HTTP/1.0 404 Not Found\r\n"
+                             "Content-Type: text/plain\r\n"
+                             "Access-Control-Allow-Origin: *\r\n"
+                             "Content-Length: 9\r\n"
+                             "\r\nNot Found");
+            }
+        }
+        close(cfd);
+    }
+
+    close(sfd);
+    return NULL;
+}
+
+/* ================================================================
  * Usage
  * ================================================================ */
 static void usage(const char *p)
@@ -1581,6 +1930,8 @@ static void usage(const char *p)
         "  %s -f <pdf> -d <wordlist> [-p <port>]                dictionary\n"
         "  %s -f <pdf> -b [-l <maxlen>] [-c <charset>] [-p <port>]  brute-force\n"
         "  %s -f <pdf> ... -R <ckpt_file>                       restore\n"
+        "\nOptions:\n"
+        "  --web-port N   Start web dashboard on port N (default: disabled)\n"
         "\nStarts cracking locally and listens for remote workers.\n"
         "Other Macs can join with:\n"
         "  bash /tmp/join.sh user@<this-ip> [port]\n",
@@ -1621,6 +1972,17 @@ int main(int argc, char *argv[])
     int         hybrid_suffix  = 0;
     int         freq_mode_flag = 0;
     int         auto_mode_flag = 0;
+
+    /* Manual long option parsing for --web-port */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--web-port") == 0 && i + 1 < argc) {
+            g_web_port = atoi(argv[i + 1]);
+            /* Remove these two args so getopt doesn't choke */
+            for (int j = i; j + 2 < argc; j++) argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;  /* re-check this position */
+        }
+    }
 
     int opt;
     while ((opt = getopt(argc, argv, "f:d:bl:c:p:R:OUm:H:FA")) != -1) {
@@ -1744,6 +2106,13 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "\nListening on port %d\n", port);
     fprintf(stderr, "Other Macs can join:  curl http://<this-ip>:%d/join.sh | bash\n", port);
+
+    /* ── Launch web dashboard if requested ─────────────────────── */
+    if (g_web_port > 0) {
+        pthread_t web_th;
+        pthread_create(&web_th, NULL, web_server_thread, NULL);
+        pthread_detach(web_th);
+    }
 
     /* ── Register Bonjour/mDNS service ────────────────────────── */
     DNSServiceErrorType mdns_err = DNSServiceRegister(

@@ -20,8 +20,8 @@ Optimal configuration for each revision using all available acceleration:
 | R2 | 40-bit RC4 | **15.9M/s** | CPU + NEON SIMD | 4-way parallel MD5 per core |
 | R3 | 128-bit RC4 | **812K/s** | CPU + NEON SIMD | Use `-G` to disable GPU for best speed |
 | R4 | AES-128 | **812K/s** | CPU + NEON SIMD | Same crypto as R3 |
-| R5 | AES-256 / SHA-256 | **104M/s** | CPU + GPU | GPU does full SHA-256 verification |
-| R6 | AES-256 / SHA-256+KDF | **~29K/s** | GPU+CPU cooperative | Metal GPU + 14 CPU threads |
+| R5 | AES-256 / SHA-256 | **72M/s** | GPU | GPU does full SHA-256 verification |
+| R6 | AES-256 / SHA-256+KDF | **~31K/s** | GPU+CPU cooperative | Metal GPU + 14 CPU threads |
 
 ### Optimization History
 
@@ -29,7 +29,7 @@ Optimal configuration for each revision using all available acceleration:
 |----------|----------------------|--------------------|--------------------|-------------------|
 | R2 | 3.5M/s | 3.8M/s (+9%) | **15.9M/s (+318%)** | **4.5x** |
 | R3 | 188K/s | 298K/s (+58%) | **812K/s (+173%)** | **4.3x** |
-| R5 | 20M/s | 20M/s (CPU only) | **104M/s (+420%)** | **5.2x** |
+| R5 | 20M/s | 20M/s (CPU only) | **72M/s (+260%)** | **3.6x** |
 
 ## Engine Comparison
 
@@ -57,9 +57,9 @@ NEON processes 4 passwords per core simultaneously. The GPU MD5 path is slower b
 
 | Engine | Speed |
 |--------|-------|
-| Single core | 7.1M/s |
+| Single core | 6.2M/s |
 | 14 cores | 4.8M/s* |
-| GPU (Metal SHA-256) | **104M/s** |
+| GPU (Metal SHA-256) | **72M/s** |
 
 *Multi-core is slower than single-core for R5 because the SHA-256 check is so fast that thread overhead dominates. GPU is the clear winner — it does the full verification (SHA-256 + compare) entirely on-chip with no CPU round-trip.
 
@@ -70,7 +70,7 @@ NEON processes 4 passwords per core simultaneously. The GPU MD5 path is slower b
 | Single core | 1,120/s |
 | 14 cores | 14,116/s |
 | GPU (Metal SHA-256/384/512 + AES) | 18,009/s |
-| GPU+CPU cooperative | **~29,000/s** |
+| GPU+CPU cooperative | **~31,000/s** |
 
 R6 uses Algorithm 2.B — an iterative KDF with SHA-256/384/512 and AES-CBC that runs 64+ rounds. The GPU kernel implements the full algorithm on-device. CPU and GPU share a work counter for cooperative processing, yielding near-additive throughput. The double-dispatch pipeline overlaps GPU compute with CPU password preparation, and sub-batch dispatching enables early termination on match.
 
@@ -88,23 +88,23 @@ Our direct crypto implementation vs Apple's CGPDFDocument API (which pdfcracker 
 
 ## Time to Crack Estimates (Single M4 Pro)
 
-### R6 AES-256 KDF (~29K/s cooperative GPU+CPU)
+### R6 AES-256 KDF (~31K/s cooperative GPU+CPU)
 
 Full charset (62 characters):
 
 | Max Length | Keyspace | Time |
 |------------|----------|------|
-| 4 | 15M | 8.6 minutes |
-| 5 | 931M | 8.9 hours |
-| 6 | 57.7B | 23 days |
+| 4 | 15M | 8.1 minutes |
+| 5 | 931M | 8.3 hours |
+| 6 | 57.7B | 21.5 days |
 
 Digits only (10 characters):
 
 | Max Length | Keyspace | Time |
 |------------|----------|------|
-| 6 | 1.1M | 38 seconds |
-| 8 | 111M | 1.1 hours |
-| 10 | 11.1B | 4.4 days |
+| 6 | 1.1M | 35 seconds |
+| 8 | 111M | 1.0 hours |
+| 10 | 11.1B | 4.1 days |
 
 ### R3 128-bit (812K/s with NEON, most common revision)
 
@@ -127,17 +127,17 @@ Digits only (10 characters):
 | 10 | 11.1B | 3.8 hours |
 | 12 | 1.1T | 16 days |
 
-### R5 AES-256 (104M/s with GPU)
+### R5 AES-256 (72M/s with GPU)
 
 Full charset:
 
 | Max Length | Keyspace | Time |
 |------------|----------|------|
 | 4 | 15M | instant |
-| 5 | 931M | 9 seconds |
-| 6 | 57.7B | 9 minutes |
-| 7 | 3.5T | 9.4 hours |
-| 8 | 221T | 24 days |
+| 5 | 931M | 13 seconds |
+| 6 | 57.7B | 13 minutes |
+| 7 | 3.5T | 13.5 hours |
+| 8 | 221T | 35 days |
 
 ### Distributed scaling
 
@@ -167,9 +167,10 @@ Deliberately expensive: a loop of SHA-256/384/512 + AES-CBC that runs 64+ rounds
 |-----------|--------------|---------|-------------|
 | NEON SIMD | R2, R3, R4 | ~4x | 4 passwords per core using ARM vector registers |
 | Metal GPU (MD5) | R2, R3, R4 | ~1.3x* | MD5 key derivation on GPU, RC4 on CPU |
-| Metal GPU (SHA-256) | R5 | ~5x | Full verification on GPU, no CPU work |
-| Metal GPU (Algorithm 2.B) | R6 | ~1.3x vs CPU | Full R6 KDF on GPU with double-dispatch pipeline |
-| GPU+CPU cooperative | R5, R6 | ~2x vs GPU | Shared work counter, near-additive throughput |
+| Metal GPU (SHA-256) | R5 | ~12x | Full verification on GPU, no CPU work |
+| Metal GPU (Algorithm 2.B) | R6 | ~1.2x vs CPU | Full R6 KDF on GPU with double-dispatch pipeline |
+| GPU+CPU cooperative | R6 | ~1.7x vs GPU | Shared work counter, near-additive throughput |
+| NEON SHA-256/AES intrinsics | R6 | ~1.5% | Hardware crypto for R6 CPU KDF path |
 | Sub-batch dispatch | R6 | early exit | Split GPU batch for early termination on match |
 | Frequency ordering | All | varies | Try common characters first (`-F` flag) |
 

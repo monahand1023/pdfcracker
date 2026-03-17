@@ -63,7 +63,8 @@ typedef struct MetalSHA256Context MetalSHA256Context;
 
 /*
  * Initialize Metal pipeline for R5 SHA-256 password verification.
- * check_owner: 0 = verify user password, 1 = verify owner password.
+ * check_owner: 0 = verify user password, 1 = verify owner password,
+ *              2 = verify both (user first, then owner if no user match).
  * Returns NULL if Metal is unavailable or setup fails.
  */
 MetalSHA256Context *metal_sha256_init(const PDFEncryptParams *params,
@@ -84,6 +85,16 @@ int metal_sha256_verify_batch(MetalSHA256Context *ctx,
                                int count);
 
 /*
+ * Verify a batch with match type output.
+ * match_type (if non-NULL) is set to 1 for user match, 2 for owner match.
+ * Returns index of first match, or -1 if none.
+ */
+int metal_sha256_verify_batch_ex(MetalSHA256Context *ctx,
+                                  const char **passwords,
+                                  int count,
+                                  int *match_type);
+
+/*
  * Free all Metal resources for the SHA-256 pipeline.
  */
 void metal_sha256_free(MetalSHA256Context *ctx);
@@ -95,7 +106,8 @@ typedef struct MetalR6Context MetalR6Context;
 
 /*
  * Initialize Metal pipeline for R6 password verification (Algorithm 2.B).
- * check_owner: 0 = verify user password, 1 = verify owner password.
+ * check_owner: 0 = verify user password, 1 = verify owner password,
+ *              2 = verify both (user first, then owner if no user match).
  * Returns NULL if Metal is unavailable or setup fails.
  */
 MetalR6Context *metal_r6_init(const PDFEncryptParams *params,
@@ -110,6 +122,16 @@ MetalR6Context *metal_r6_init(const PDFEncryptParams *params,
 int metal_r6_verify_batch(MetalR6Context *ctx,
                            const char **passwords,
                            int count);
+
+/*
+ * Verify a batch with match type output.
+ * match_type (if non-NULL) is set to 1 for user match, 2 for owner match.
+ * Returns index of first match, or -1 if none.
+ */
+int metal_r6_verify_batch_ex(MetalR6Context *ctx,
+                              const char **passwords,
+                              int count,
+                              int *match_type);
 
 /*
  * Get max batch size for R6 context.
@@ -142,6 +164,13 @@ void *metal_r6_submit_async(MetalR6Context *ctx, const char **passwords, int cou
 int metal_r6_wait_results(MetalR6Context *ctx, void *handle, int count);
 
 /*
+ * Wait for async R6 batch with match type output.
+ * match_type (if non-NULL) is set to 1 for user match, 2 for owner match.
+ */
+int metal_r6_wait_results_ex(MetalR6Context *ctx, void *handle, int count,
+                              int *match_type);
+
+/*
  * R6 sub-batch verification: dispatches in sub-batches of sub_size,
  * checking results between each for early termination.
  * Returns index of first match, or -1 if none.
@@ -149,5 +178,13 @@ int metal_r6_wait_results(MetalR6Context *ctx, void *handle, int count);
 int metal_r6_verify_batch_sub(MetalR6Context *ctx,
                                const char **passwords, int count,
                                int sub_size);
+
+/*
+ * R6 sub-batch verification with match type output.
+ * match_type (if non-NULL) is set to 1 for user match, 2 for owner match.
+ */
+int metal_r6_verify_batch_sub_ex(MetalR6Context *ctx,
+                                  const char **passwords, int count,
+                                  int sub_size, int *match_type);
 
 #endif /* METAL_KEYGEN_H */

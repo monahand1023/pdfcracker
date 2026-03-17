@@ -33,11 +33,14 @@
 #include <stdatomic.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>
 #include <sys/qos.h>
 #include <signal.h>
 #include <mach/mach_time.h>
 #include <ctype.h>
 #include <getopt.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include "pdf_encrypt.h"
 #include "metal_keygen.h"
 #include "md5_simd.h"
@@ -180,6 +183,7 @@ static int  g_benchmark_mode = 0;
 /* ── PRINCE attack mode ─────────────────────────────────────── */
 #define ATTACK_PRINCE  6
 static int  g_prince_mode = 0;
+static int  g_prince_words = 0;  /* mask+prince combo: ?w expands to word pairs */
 
 /* ── Fingerprint (smart) attack mode ────────────────────────── */
 #define ATTACK_FINGERPRINT 7
@@ -214,6 +218,45 @@ typedef struct {
     int      threshold;         /* prune branches below this rank */
 } MarkovModel;
 static MarkovModel *g_markov = NULL;
+
+/* -- Pot file -------------------------------------------------- */
+static char g_pot_path[1024] = {0};
+static int  g_show_pot = 0;
+static int  g_no_pot = 0;
+
+/* -- JSON output ----------------------------------------------- */
+static int  g_json_mode = 0;
+static double g_start_time = 0;
+
+/* -- Session management ---------------------------------------- */
+static char g_session_name[256] = {0};
+static int  g_session_list = 0;
+
+/* -- GPU batch size tuning ------------------------------------- */
+static int  g_gpu_batch = GPU_BATCH_SIZE;
+
+/* -- Incremental (probability) mode ---------------------------- */
+#define INCR_RING_SIZE  8192
+#define INCR_HEAP_CAP   (1 << 20)
+typedef struct {
+    int  indices[MAX_PASS_LEN];
+    int  length;
+    double log_prob;
+} IncrEntry;
+typedef struct {
+    IncrEntry *entries;
+    int size;
+    int capacity;
+} IncrHeap;
+static char   g_incr_ring[INCR_RING_SIZE][MAX_PASS_LEN + 1];
+static int    g_incr_head = 0;
+static int    g_incr_tail = 0;
+static int    g_incr_done = 0;
+static pthread_mutex_t g_incr_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_incr_not_full  = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_incr_not_empty = PTHREAD_COND_INITIALIZER;
+static int    g_incremental_mode = 0;
+
 
 /* Train a Markov model from a wordlist and write binary file */
 static void markov_train(const char *wordlist_path, const char *model_path)
@@ -498,6 +541,13 @@ static void ckpt_save(void)
 
     if (g_prefix_len) fprintf(f, "prefix=%s\n", g_prefix);
     if (g_suffix_len) fprintf(f, "suffix=%s\n", g_suffix);
+
+    /* Session and PDF path info */
+    if (g_session_name[0])
+        fprintf(f, "session_name=%s\n", g_session_name);
+    if (g_pdf_path)
+        fprintf(f, "pdf_path=%s\n", g_pdf_path);
+
     fclose(f);
     rename(tmp, g_ckpt_path);  /* atomic replace */
 }
@@ -634,6 +684,20 @@ static void *progress_thread(void *arg)
     while (!atomic_load(&g_found)) {
         struct timespec ts = {0, 500000000L}; /* 0.5s */
         nanosleep(&ts, NULL);
+
+        /* JSON mode: still run for checkpointing but suppress display */
+        if (g_json_mode) {
+            time_t now = time(NULL);
+            if (now - last_ckpt >= CKPT_INTERVAL) {
+                ckpt_save();
+                last_ckpt = now;
+            }
+            if (g_interrupted) {
+                ckpt_save();
+                _exit(1);
+            }
+            continue;
+        }
 
         long cur     = atomic_load(&g_tested);
         long total   = atomic_load(&g_total);
@@ -882,7 +946,10 @@ static int parse_mask_into(const char *mask, MaskPos *target, int *out_len, long
                         return 0;
                     }
                     mp->is_word = 1;
-                    mp->nchars = (int)g_nwords;
+                    if (g_prince_words)
+                        mp->nchars = (int)(g_nwords * g_nwords);
+                    else
+                        mp->nchars = (int)g_nwords;
                     mp->chars = NULL;
                     break;
                 }
@@ -1028,11 +1095,28 @@ static void combo_index_to_pass(long idx, int length, char *out)
     int pos = 0;
     for (int i = 0; i < g_mask_len; i++) {
         if (g_mask[i].is_word) {
-            const char *word = g_words[indices[i]];
-            size_t wlen = strlen(word);
-            if (pos + (int)wlen > MAX_PASS_LEN) wlen = (size_t)(MAX_PASS_LEN - pos);
-            memcpy(out + pos, word, wlen);
-            pos += (int)wlen;
+            if (g_prince_words && g_nwords > 0) {
+                /* PRINCE 2-word combo: word1 = words[idx/nwords], word2 = words[idx%nwords] */
+                long pidx = (long)indices[i];
+                long w1i = pidx / g_nwords;
+                long w2i = pidx % g_nwords;
+                const char *w1 = g_words[w1i];
+                const char *w2 = g_words[w2i];
+                size_t l1 = strlen(w1), l2 = strlen(w2);
+                if (pos + (int)(l1 + l2) > MAX_PASS_LEN) {
+                    l2 = (size_t)(MAX_PASS_LEN - pos) > l1 ? (size_t)(MAX_PASS_LEN - pos) - l1 : 0;
+                    if ((int)l1 > MAX_PASS_LEN - pos) l1 = (size_t)(MAX_PASS_LEN - pos);
+                }
+                memcpy(out + pos, w1, l1);
+                memcpy(out + pos + l1, w2, l2);
+                pos += (int)(l1 + l2);
+            } else {
+                const char *word = g_words[indices[i]];
+                size_t wlen = strlen(word);
+                if (pos + (int)wlen > MAX_PASS_LEN) wlen = (size_t)(MAX_PASS_LEN - pos);
+                memcpy(out + pos, word, wlen);
+                pos += (int)wlen;
+            }
         } else {
             if (pos < MAX_PASS_LEN)
                 out[pos++] = g_mask[i].chars[indices[i]];
@@ -1410,6 +1494,458 @@ static void apply_rule(const char *word, int rule_idx, char *out)
         len = apply_one_op(out, len, &r->ops[i]);
     }
     out[len] = '\0';
+}
+
+/* ================================================================
+ * Pot file helpers — cache cracked passwords
+ * ================================================================ */
+static void pot_init(void)
+{
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/.pdfcracker", home);
+    mkdir(dir, 0755);
+    snprintf(g_pot_path, sizeof(g_pot_path), "%s/pdfcracker.pot", dir);
+}
+
+/* Compute SHA-256 hash of PDF encryption parameters for pot file key */
+static void pot_compute_hash(const PDFEncryptParams *p, char *hex_out)
+{
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    CC_SHA256_Update(&ctx, &p->revision, sizeof(p->revision));
+    CC_SHA256_Update(&ctx, &p->key_length, sizeof(p->key_length));
+    CC_SHA256_Update(&ctx, p->o_value, 48);
+    CC_SHA256_Update(&ctx, p->u_value, 48);
+    CC_SHA256_Update(&ctx, &p->permissions, sizeof(p->permissions));
+    CC_SHA256_Update(&ctx, p->file_id, (CC_LONG)p->file_id_len);
+    uint8_t hash[32];
+    CC_SHA256_Final(hash, &ctx);
+    for (int i = 0; i < 32; i++)
+        sprintf(hex_out + i * 2, "%02x", hash[i]);
+    hex_out[64] = '\0';
+}
+
+/* Check if hash is already in pot file; if so, copy password to pw_out and return 1 */
+static int pot_lookup(const char *hash, char *pw_out, size_t pw_sz)
+{
+    FILE *f = fopen(g_pot_path, "r");
+    if (!f) return 0;
+    char line[1200];
+    size_t hlen = strlen(hash);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, hash, hlen) == 0 && line[hlen] == ':') {
+            const char *pw = line + hlen + 1;
+            size_t plen = strlen(pw);
+            while (plen && (pw[plen-1] == '\n' || pw[plen-1] == '\r'))
+                plen--;
+            if (plen >= pw_sz) plen = pw_sz - 1;
+            memcpy(pw_out, pw, plen);
+            pw_out[plen] = '\0';
+            fclose(f);
+            return 1;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+/* Append hash:password to pot file */
+static void pot_append(const char *hash, const char *password)
+{
+    FILE *f = fopen(g_pot_path, "a");
+    if (!f) return;
+    fprintf(f, "%s:%s\n", hash, password);
+    fclose(f);
+}
+
+/* Show all pot file entries */
+static void pot_show(void)
+{
+    FILE *f = fopen(g_pot_path, "r");
+    if (!f) {
+        fprintf(stderr, "No pot file found at %s\n", g_pot_path);
+        return;
+    }
+    char line[1200];
+    int count = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        char *colon = strchr(line, ':');
+        if (colon) {
+            *colon = '\0';
+            printf("Hash: %s  Password: %s\n", line, colon + 1);
+            count++;
+        }
+    }
+    fclose(f);
+    if (count == 0)
+        printf("Pot file is empty.\n");
+    else
+        printf("\n%d cracked password(s) in pot file.\n", count);
+}
+
+/* ================================================================
+ * JSON output helpers
+ * ================================================================ */
+static void json_escape(const char *in, char *out, size_t out_sz)
+{
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 6 < out_sz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"') { out[j++] = '\\'; out[j++] = '"'; }
+        else if (c == '\\') { out[j++] = '\\'; out[j++] = '\\'; }
+        else if (c == '\n') { out[j++] = '\\'; out[j++] = 'n'; }
+        else if (c == '\r') { out[j++] = '\\'; out[j++] = 'r'; }
+        else if (c == '\t') { out[j++] = '\\'; out[j++] = 't'; }
+        else if (c < 0x20) {
+            j += (size_t)snprintf(out + j, out_sz - j, "\\u%04x", c);
+        }
+        else out[j++] = (char)c;
+    }
+    out[j] = '\0';
+}
+
+/* ================================================================
+ * Session management helpers
+ * ================================================================ */
+static void session_init_dir(void)
+{
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/.pdfcracker", home);
+    mkdir(dir, 0755);
+    snprintf(dir, sizeof(dir), "%s/.pdfcracker/sessions", home);
+    mkdir(dir, 0755);
+}
+
+static void session_set_ckpt_path(const char *name)
+{
+    session_init_dir();
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    snprintf(g_ckpt_path, sizeof(g_ckpt_path),
+             "%s/.pdfcracker/sessions/%s.ckpt", home, name);
+}
+
+static void session_list(void)
+{
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/.pdfcracker/sessions", home);
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "No sessions directory found at %s\n", dir);
+        return;
+    }
+    struct dirent *ent;
+    int count = 0;
+    while ((ent = readdir(d)) != NULL) {
+        size_t nlen = strlen(ent->d_name);
+        if (nlen < 6 || strcmp(ent->d_name + nlen - 5, ".ckpt") != 0)
+            continue;
+        char path[1280];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+
+        /* Extract session name (filename without .ckpt) */
+        char sname[256];
+        size_t copy_len = nlen - 5;
+        if (copy_len >= sizeof(sname)) copy_len = sizeof(sname) - 1;
+        memcpy(sname, ent->d_name, copy_len);
+        sname[copy_len] = '\0';
+
+        char pdf_p[512] = "unknown";
+        char mode[64] = "unknown";
+        long idx = 0;
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\n")] = '\0';
+            if (strncmp(line, "pdf_path=", 9) == 0)
+                strncpy(pdf_p, line + 9, sizeof(pdf_p) - 1);
+            else if (strncmp(line, "attack_mode=", 12) == 0)
+                strncpy(mode, line + 12, sizeof(mode) - 1);
+            else if (strncmp(line, "current_idx=", 12) == 0)
+                idx = atol(line + 12);
+        }
+        fclose(f);
+        printf("  %-20s  mode=%-12s  idx=%-10ld  pdf=%s\n", sname, mode, idx, pdf_p);
+        count++;
+    }
+    closedir(d);
+    if (count == 0)
+        printf("No saved sessions.\n");
+    else
+        printf("\n%d session(s) found.\n", count);
+}
+
+/* ================================================================
+ * Keyboard walk generator for fingerprint attack
+ * ================================================================ */
+static const char kb_grid[4][14] = {
+    "`1234567890-=\0",
+    "qwertyuiop[]\\\0",
+    "asdfghjkl;'\0\0\0",
+    "zxcvbnm,./\0\0\0\0"
+};
+
+typedef struct {
+    int row, col;
+} KBPos;
+
+static KBPos kb_pos_map[128];  /* char -> (row,col), row=-1 if not on grid */
+static int   kb_adj[128][9];   /* adjacency: char -> up to 8 neighbor chars, -1 terminated */
+static int   kb_map_ready = 0;
+
+static void kb_build_map(void)
+{
+    if (kb_map_ready) return;
+    for (int i = 0; i < 128; i++) kb_pos_map[i].row = -1;
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 13; c++) {
+            unsigned char ch = (unsigned char)kb_grid[r][c];
+            if (ch) {
+                kb_pos_map[ch].row = r;
+                kb_pos_map[ch].col = c;
+            }
+        }
+    }
+    /* Build adjacency */
+    for (int ch = 0; ch < 128; ch++) {
+        int ai = 0;
+        if (kb_pos_map[ch].row < 0) {
+            kb_adj[ch][0] = -1;
+            continue;
+        }
+        int r = kb_pos_map[ch].row, cc = kb_pos_map[ch].col;
+        for (int dr = -1; dr <= 1; dr++) {
+            for (int dc = -1; dc <= 1; dc++) {
+                if (dr == 0 && dc == 0) continue;
+                int nr = r + dr, nc = cc + dc;
+                if (nr < 0 || nr >= 4 || nc < 0 || nc >= 13) continue;
+                unsigned char nch = (unsigned char)kb_grid[nr][nc];
+                if (nch)
+                    kb_adj[ch][ai++] = (int)nch;
+            }
+        }
+        kb_adj[ch][ai] = -1;
+    }
+    kb_map_ready = 1;
+}
+
+/* DFS keyboard walk generator */
+static int keywalk_dfs(char *path, int depth, int max_depth,
+                       char walks[][MAX_PASS_LEN + 1], int max_walks, int walk_count)
+{
+    if (depth >= 4 && depth <= max_depth) {
+        if (walk_count < max_walks) {
+            memcpy(walks[walk_count], path, (size_t)depth);
+            walks[walk_count][depth] = '\0';
+            walk_count++;
+        }
+    }
+    if (depth >= max_depth || walk_count >= max_walks)
+        return walk_count;
+
+    int last = (unsigned char)path[depth - 1];
+    if (last >= 128) return walk_count;
+    for (int i = 0; kb_adj[last][i] >= 0; i++) {
+        int next = kb_adj[last][i];
+        path[depth] = (char)next;
+        walk_count = keywalk_dfs(path, depth + 1, max_depth, walks, max_walks, walk_count);
+        if (walk_count >= max_walks) break;
+    }
+    return walk_count;
+}
+
+static int keywalk_generate(char walks[][MAX_PASS_LEN + 1], int max_walks)
+{
+    kb_build_map();
+    int count = 0;
+    char path[MAX_PASS_LEN + 1];
+    for (int ch = 0; ch < 128 && count < max_walks; ch++) {
+        if (kb_pos_map[ch].row < 0) continue;
+        path[0] = (char)ch;
+        count = keywalk_dfs(path, 1, 8, walks, max_walks, count);
+    }
+    return count;
+}
+
+/* ================================================================
+ * Incremental mode: min-heap operations
+ * ================================================================ */
+static void heap_init(IncrHeap *h, int capacity)
+{
+    h->entries = malloc(sizeof(IncrEntry) * (size_t)capacity);
+    h->size = 0;
+    h->capacity = capacity;
+}
+
+static void heap_push(IncrHeap *h, const IncrEntry *e)
+{
+    if (h->size >= h->capacity) return;
+    h->entries[h->size] = *e;
+    int i = h->size;
+    h->size++;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (h->entries[parent].log_prob <= h->entries[i].log_prob) break;
+        IncrEntry tmp = h->entries[parent];
+        h->entries[parent] = h->entries[i];
+        h->entries[i] = tmp;
+        i = parent;
+    }
+}
+
+static IncrEntry heap_pop(IncrHeap *h)
+{
+    IncrEntry top = h->entries[0];
+    h->size--;
+    if (h->size > 0) {
+        h->entries[0] = h->entries[h->size];
+        int i = 0;
+        for (;;) {
+            int left = 2 * i + 1, right = 2 * i + 2, smallest = i;
+            if (left < h->size && h->entries[left].log_prob < h->entries[smallest].log_prob)
+                smallest = left;
+            if (right < h->size && h->entries[right].log_prob < h->entries[smallest].log_prob)
+                smallest = right;
+            if (smallest == i) break;
+            IncrEntry tmp = h->entries[i];
+            h->entries[i] = h->entries[smallest];
+            h->entries[smallest] = tmp;
+            i = smallest;
+        }
+    }
+    return top;
+}
+
+static void heap_free(IncrHeap *h)
+{
+    free(h->entries);
+    h->entries = NULL;
+    h->size = 0;
+}
+
+/* Incremental producer thread */
+static void *incr_producer_thread(void *arg)
+{
+    (void)arg;
+    if (!g_markov) return NULL;
+
+    int cs = g_markov->charset_size;
+    int threshold = g_markov->threshold;
+    int effective_cs = (threshold < cs) ? threshold : cs;
+    if (effective_cs < 1) effective_cs = 1;
+    double log_base = log((double)effective_cs);
+
+    IncrHeap heap;
+    heap_init(&heap, INCR_HEAP_CAP);
+
+    /* Seed with best candidate at each length 1..MAX_PASS_LEN */
+    for (int len = 1; len <= MAX_PASS_LEN; len++) {
+        IncrEntry e;
+        memset(&e, 0, sizeof(e));
+        e.length = len;
+        e.log_prob = (double)len * log_base;
+        heap_push(&heap, &e);
+    }
+
+    while (heap.size > 0 && !atomic_load_explicit(&g_found, memory_order_relaxed) && !g_interrupted) {
+        IncrEntry e = heap_pop(&heap);
+
+        /* Reconstruct index from indices array and generate password */
+        char pass[MAX_PASS_LEN + 1];
+        {
+            long idx = 0;
+            for (int i = 0; i < e.length; i++)
+                idx = idx * effective_cs + e.indices[i];
+            markov_index_to_pass(idx, e.length, pass);
+        }
+
+        /* Push to ring buffer */
+        pthread_mutex_lock(&g_incr_mutex);
+        while (((g_incr_head + 1) % INCR_RING_SIZE) == g_incr_tail &&
+               !atomic_load_explicit(&g_found, memory_order_relaxed)) {
+            pthread_cond_wait(&g_incr_not_full, &g_incr_mutex);
+        }
+        if (atomic_load_explicit(&g_found, memory_order_relaxed)) {
+            pthread_mutex_unlock(&g_incr_mutex);
+            break;
+        }
+        strncpy(g_incr_ring[g_incr_head], pass, MAX_PASS_LEN);
+        g_incr_ring[g_incr_head][MAX_PASS_LEN] = '\0';
+        g_incr_head = (g_incr_head + 1) % INCR_RING_SIZE;
+        pthread_cond_signal(&g_incr_not_empty);
+        pthread_mutex_unlock(&g_incr_mutex);
+
+        /* Generate children: try incrementing each position right-to-left */
+        for (int pos = e.length - 1; pos >= 0; pos--) {
+            if (e.indices[pos] + 1 < effective_cs) {
+                IncrEntry child = e;
+                child.indices[pos]++;
+                child.log_prob += log_base * 0.1;
+                if (heap.size < heap.capacity)
+                    heap_push(&heap, &child);
+                break;
+            }
+        }
+    }
+
+    pthread_mutex_lock(&g_incr_mutex);
+    g_incr_done = 1;
+    pthread_cond_broadcast(&g_incr_not_empty);
+    pthread_mutex_unlock(&g_incr_mutex);
+
+    heap_free(&heap);
+    return NULL;
+}
+
+/* Incremental consumer worker */
+static void *incr_consumer_worker(void *arg)
+{
+    (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    long local_count = 0;
+
+    for (;;) {
+        if (atomic_load_explicit(&g_found, memory_order_relaxed)) break;
+
+        pthread_mutex_lock(&g_incr_mutex);
+        while (g_incr_head == g_incr_tail && !g_incr_done &&
+               !atomic_load_explicit(&g_found, memory_order_relaxed)) {
+            pthread_cond_wait(&g_incr_not_empty, &g_incr_mutex);
+        }
+        if (g_incr_head == g_incr_tail && (g_incr_done ||
+            atomic_load_explicit(&g_found, memory_order_relaxed))) {
+            pthread_mutex_unlock(&g_incr_mutex);
+            break;
+        }
+        char pass[MAX_PASS_LEN + 1];
+        strncpy(pass, g_incr_ring[g_incr_tail], MAX_PASS_LEN);
+        pass[MAX_PASS_LEN] = '\0';
+        g_incr_tail = (g_incr_tail + 1) % INCR_RING_SIZE;
+        pthread_cond_signal(&g_incr_not_full);
+        pthread_mutex_unlock(&g_incr_mutex);
+
+        if (test_password_fast(pass)) {
+            if (!atomic_exchange(&g_found, 1))
+                strncpy(g_password, pass, MAX_PASS_LEN);
+            break;
+        }
+        if (++local_count >= TESTED_BATCH) {
+            atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+            local_count = 0;
+        }
+    }
+    if (local_count > 0)
+        atomic_fetch_add(&g_tested, local_count);
+    free(arg);
+    return NULL;
 }
 
 /* ================================================================
@@ -2410,6 +2946,7 @@ static void *gpu_r6_brute_worker(void *arg)
 {
     GPUBruteArg *a = (GPUBruteArg *)arg;
     int batch = metal_r6_max_batch(g_r6_ctx);
+    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
 
     /* Double-buffered password arrays for pipelining */
     const char **pw_ptrs[2];
@@ -2480,6 +3017,7 @@ static void *gpu_r6_dict_worker(void *arg)
 {
     (void)arg;
     int batch = metal_r6_max_batch(g_r6_ctx);
+    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
 
     const char **pw_ptrs[2];
     for (int b = 0; b < 2; b++) {
@@ -2538,6 +3076,7 @@ static void *gpu_r6_rule_worker(void *arg)
     (void)arg;
     long total = g_nwords * g_nrules;
     int batch = metal_r6_max_batch(g_r6_ctx);
+    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
 
     const char **pw_ptrs[2];
     char *pw_storage[2];
@@ -2607,6 +3146,7 @@ static void *gpu_r6_hybrid_worker(void *arg)
     (void)arg;
     long total = g_nwords * g_hybrid_suffix_keyspace;
     int batch = metal_r6_max_batch(g_r6_ctx);
+    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
 
     const char **pw_ptrs[2];
     char *pw_storage[2];
@@ -2746,6 +3286,47 @@ static void *prince_worker(void *arg)
 }
 
 /* ================================================================
+ * Hybrid PRINCE + rules worker
+ * ================================================================ */
+static void *prince_rule_worker(void *arg)
+{
+    (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    long total = g_prince_total * g_nrules;
+    long local_count = 0;
+    char base[MAX_PASS_LEN * 3 + 1];
+    char pass[MAX_PASS_LEN * 3 + 2];
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+        if (start >= total) break;
+        long end = start + CPU_WORK_CHUNK;
+        if (end > total) end = total;
+
+        for (long idx = start; idx < end && !atomic_load_explicit(&g_found, memory_order_relaxed); idx++) {
+            long prince_idx = idx / g_nrules;
+            int  rule_idx = (int)(idx % g_nrules);
+            prince_index_to_pass(prince_idx, base);
+            if (!base[0]) goto pr_skip;
+            apply_rule(base, rule_idx, pass);
+            if (pass[0] && test_password_fast(pass)) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pass, MAX_PASS_LEN);
+                break;
+            }
+        pr_skip:
+            if (++local_count >= TESTED_BATCH) {
+                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+                local_count = 0;
+            }
+        }
+    }
+    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
  * Fingerprint attack: try common patterns before brute-force
  * - Common passwords (password, 123456, etc.)
  * - Date patterns (MMDDYYYY, YYYYMMDD, DDMMYYYY)
@@ -2775,8 +3356,29 @@ static const char *g_fingerprint_passwords[] = {
 
 static int run_fingerprint_attack(int nthreads, pthread_t *threads, int *spawned_out)
 {
+    /* Keyspace estimate */
+    int n_common = 0;
+    for (int i = 0; g_fingerprint_passwords[i]; i++) n_common++;
+    long date_combos = 0;
+    for (int y = 1950; y <= 2026; y++) {
+        for (int m = 1; m <= 12; m++) {
+            int dim = 31;
+            if (m == 2) dim = (y % 4 == 0) ? 29 : 28;
+            else if (m == 4 || m == 6 || m == 9 || m == 11) dim = 30;
+            date_combos += dim * 4; /* 3 formats + MMDD short */
+        }
+        date_combos++; /* year alone */
+    }
+    long digit_total = 0;
+    for (int l = 1; l <= 6; l++) { long n = 1; for (int i = 0; i < l; i++) n *= 10; digit_total += n; }
+    long keywalk_est = 50000;
+    long fp_total = n_common + date_combos + keywalk_est + digit_total;
+    char s_fp[16];
+    fmt_num(fp_total, s_fp, sizeof(s_fp));
+    fprintf(stderr, "Mode   : fingerprint (common passwords, keywalks, dates, PINs, ~%s candidates)\n", s_fp);
+
     /* Phase 1: try common passwords directly (single-threaded, small list) */
-    fprintf(stderr, "Mode   : fingerprint — Phase 1: common passwords\n");
+    fprintf(stderr, "  Phase 1: common passwords (%d)...\n", n_common);
     for (int i = 0; g_fingerprint_passwords[i] && !atomic_load(&g_found); i++) {
         const char *pw = g_fingerprint_passwords[i];
         if (test_password_fast(pw)) {
@@ -2785,6 +3387,27 @@ static int run_fingerprint_attack(int nthreads, pthread_t *threads, int *spawned
             return 1;
         }
         atomic_fetch_add(&g_tested, 1);
+    }
+    if (atomic_load(&g_found)) return 1;
+
+    /* Phase 1.5: keyboard walks */
+    {
+        fprintf(stderr, "  Phase 1.5: keyboard walks...\n");
+        typedef char KWEntry[MAX_PASS_LEN + 1];
+        KWEntry *kw_walks = malloc(50000 * sizeof(KWEntry));
+        if (kw_walks) {
+            int nwalks = keywalk_generate(kw_walks, 50000);
+            for (int i = 0; i < nwalks && !atomic_load(&g_found); i++) {
+                if (test_password_fast(kw_walks[i])) {
+                    if (!atomic_exchange(&g_found, 1))
+                        strncpy(g_password, kw_walks[i], MAX_PASS_LEN);
+                    free(kw_walks);
+                    return 1;
+                }
+                atomic_fetch_add(&g_tested, 1);
+            }
+            free(kw_walks);
+        }
     }
     if (atomic_load(&g_found)) return 1;
 
@@ -2946,72 +3569,104 @@ static void run_benchmark(int nthreads)
 
     /* ── GPU benchmark ─────────────────────────────────────────── */
     if (g_gpu_ctx || g_sha256_ctx || g_r6_ctx) {
-        atomic_store(&g_found, 0);
-        atomic_store(&g_tested, 0);
-        atomic_store(&g_next_idx, 0);
-        spawned = 0;
+        if (g_sha256_ctx) {
+            /* R5: SHA-256 is so fast the bottleneck is password generation.
+             * Benchmark pure GPU throughput with pre-generated passwords. */
+            int batch = GPU_BATCH_SIZE;
+            const char **pw_ptrs = malloc(sizeof(char *) * (size_t)batch);
+            char *pw_storage = malloc((size_t)batch * (MAX_PASS_LEN + 1));
+            for (int i = 0; i < batch; i++) {
+                char *pw = pw_storage + i * (MAX_PASS_LEN + 1);
+                snprintf(pw, MAX_PASS_LEN + 1, "bench%07d", i);
+                pw_ptrs[i] = pw;
+            }
+            long gpu_count = 0;
+            t0 = mach_absolute_time();
+            for (;;) {
+                metal_sha256_verify_batch(g_sha256_ctx, pw_ptrs, batch);
+                gpu_count += batch;
+                t1 = mach_absolute_time();
+                double elapsed = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+                if (elapsed >= BENCH_SECS) break;
+            }
+            double gpu_secs = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+            double gpu_rate = gpu_secs > 0 ? (double)gpu_count / gpu_secs : 0;
+            fprintf(stderr, "  GPU         : %.0f passwords/sec\n", gpu_rate);
+            free(pw_ptrs);
+            free(pw_storage);
+        } else {
+            /* R2-R4 and R6: use worker thread for end-to-end benchmark */
+            atomic_store(&g_found, 0);
+            atomic_store(&g_tested, 0);
+            atomic_store(&g_next_idx, 0);
+            spawned = 0;
 
-        GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
-        *ga = (GPUBruteArg){ .length = 7, .total = bench_total };
-        void *(*gpu_worker)(void *) = gpu_brute_worker;
-        if (g_r6_ctx)       gpu_worker = gpu_r6_brute_worker;
-        else if (g_sha256_ctx) gpu_worker = gpu_sha256_brute_worker;
-        pthread_create(&thr[spawned++], NULL, gpu_worker, ga);
+            GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
+            *ga = (GPUBruteArg){ .length = 7, .total = bench_total };
+            void *(*gpu_worker)(void *) = gpu_brute_worker;
+            if (g_r6_ctx) gpu_worker = gpu_r6_brute_worker;
+            pthread_create(&thr[spawned++], NULL, gpu_worker, ga);
 
-        t0 = mach_absolute_time();
-        for (;;) {
-            struct timespec sl = {0, 100000000L};
-            nanosleep(&sl, NULL);
+            t0 = mach_absolute_time();
+            for (;;) {
+                struct timespec sl = {0, 100000000L};
+                nanosleep(&sl, NULL);
+                t1 = mach_absolute_time();
+                double elapsed = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+                if (elapsed >= BENCH_SECS) break;
+            }
+            atomic_store(&g_found, 1);
+            for (int t = 0; t < spawned; t++) pthread_join(thr[t], NULL);
+
             t1 = mach_absolute_time();
-            double elapsed = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
-            if (elapsed >= BENCH_SECS) break;
+            double gpu_secs = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+            long gpu_tested = atomic_load(&g_tested);
+            double gpu_rate = gpu_secs > 0 ? (double)gpu_tested / gpu_secs : 0;
+            fprintf(stderr, "  GPU         : %.0f passwords/sec\n", gpu_rate);
         }
-        atomic_store(&g_found, 1);
-        for (int t = 0; t < spawned; t++) pthread_join(thr[t], NULL);
-
-        t1 = mach_absolute_time();
-        double gpu_secs = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
-        long gpu_tested = atomic_load(&g_tested);
-        double gpu_rate = gpu_secs > 0 ? (double)gpu_tested / gpu_secs : 0;
-        fprintf(stderr, "  GPU         : %.0f passwords/sec\n", gpu_rate);
 
         /* ── GPU+CPU cooperative benchmark ─────────────────────── */
-        atomic_store(&g_found, 0);
-        atomic_store(&g_tested, 0);
-        atomic_store(&g_next_idx, 0);
-        spawned = 0;
+        if (g_sha256_ctx) {
+            /* R5: GPU is so fast that CPU threads just add overhead.
+             * Skip cooperative benchmark — GPU alone is optimal. */
+            fprintf(stderr, "  GPU+CPU     : (GPU alone is optimal for R5)\n");
+        } else {
+            atomic_store(&g_found, 0);
+            atomic_store(&g_tested, 0);
+            atomic_store(&g_next_idx, 0);
+            spawned = 0;
 
-        GPUBruteArg *ga2 = malloc(sizeof(GPUBruteArg));
-        *ga2 = (GPUBruteArg){ .length = 7, .total = bench_total };
-        void *(*gpu_worker2)(void *) = gpu_brute_worker;
-        if (g_r6_ctx)          gpu_worker2 = gpu_r6_brute_worker;
-        else if (g_sha256_ctx) gpu_worker2 = gpu_sha256_brute_worker;
-        pthread_create(&thr[spawned++], NULL, gpu_worker2, ga2);
+            GPUBruteArg *ga2 = malloc(sizeof(GPUBruteArg));
+            *ga2 = (GPUBruteArg){ .length = 7, .total = bench_total };
+            void *(*gpu_worker2)(void *) = gpu_brute_worker;
+            if (g_r6_ctx) gpu_worker2 = gpu_r6_brute_worker;
+            pthread_create(&thr[spawned++], NULL, gpu_worker2, ga2);
 
-        for (int t = 0; t < nthreads && spawned < MAX_THREADS; t++) {
-            BruteArg *a = malloc(sizeof(BruteArg));
-            *a = (BruteArg){ .id = t, .length = 7,
-                             .start = 0, .end = bench_total, .use_shared = 1 };
-            pthread_create(&thr[spawned++], NULL, brute_worker, a);
-        }
+            for (int t = 0; t < nthreads && spawned < MAX_THREADS; t++) {
+                BruteArg *a = malloc(sizeof(BruteArg));
+                *a = (BruteArg){ .id = t, .length = 7,
+                                 .start = 0, .end = bench_total, .use_shared = 1 };
+                pthread_create(&thr[spawned++], NULL, brute_worker, a);
+            }
 
-        t0 = mach_absolute_time();
-        for (;;) {
-            struct timespec sl = {0, 100000000L};
-            nanosleep(&sl, NULL);
+            t0 = mach_absolute_time();
+            for (;;) {
+                struct timespec sl = {0, 100000000L};
+                nanosleep(&sl, NULL);
+                t1 = mach_absolute_time();
+                double elapsed = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+                if (elapsed >= BENCH_SECS) break;
+            }
+            atomic_store(&g_found, 1);
+            for (int t = 0; t < spawned; t++) pthread_join(thr[t], NULL);
+
             t1 = mach_absolute_time();
-            double elapsed = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
-            if (elapsed >= BENCH_SECS) break;
+            double coop_secs = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
+            long coop_tested = atomic_load(&g_tested);
+            double coop_rate = coop_secs > 0 ? (double)coop_tested / coop_secs : 0;
+            fprintf(stderr, "  GPU+CPU     : %.0f passwords/sec (cooperative, %d threads)\n",
+                    coop_rate, nthreads);
         }
-        atomic_store(&g_found, 1);
-        for (int t = 0; t < spawned; t++) pthread_join(thr[t], NULL);
-
-        t1 = mach_absolute_time();
-        double coop_secs = (double)(t1 - t0) * tb.numer / tb.denom / 1e9;
-        long coop_tested = atomic_load(&g_tested);
-        double coop_rate = coop_secs > 0 ? (double)coop_tested / coop_secs : 0;
-        fprintf(stderr, "  GPU+CPU     : %.0f passwords/sec (cooperative, %d threads)\n",
-                coop_rate, nthreads);
     } else {
         fprintf(stderr, "  GPU         : not available\n");
     }
@@ -3243,7 +3898,16 @@ static void usage(const char *p)
         "  --prince                    PRINCE attack: combine 2-3 dictionary words (use with -d)\n"
         "  --fingerprint               smart attack: common passwords, dates, PINs first\n"
         "  --max-rounds <N>            R6 GPU max KDF rounds (default 200, min 64)\n"
-        "  --dedup                     skip duplicate candidates in rule-based attacks\n",
+        "  --dedup                     skip duplicate candidates in rule-based attacks\n"
+        "  --show-pot                  display all cracked passwords from pot file and exit\n"
+        "  --no-pot                    skip pot file lookup and don't save results\n"
+        "  --json                      output results as JSON to stdout\n"
+        "  --session <name>            named session for checkpoint management\n"
+        "  --session-list              list all saved sessions and exit\n"
+        "  --keywalk                   fingerprint attack with keyboard walks\n"
+        "  --prince-words              use PRINCE 2-word combos for ?w in masks (use with -d)\n"
+        "  --incremental / -I          incremental probability mode (requires -M <model>)\n"
+        "  --gpu-batch <N>             override GPU batch size\n",
         p, p, p, p, p, p, p);
     exit(1);
 }
@@ -3286,11 +3950,20 @@ int main(int argc, char *argv[])
         {"prince",           no_argument,       NULL, 0x107},
         {"fingerprint",      no_argument,       NULL, 0x108},
         {"dedup",            no_argument,       NULL, 0x109},
+        {"show-pot",         no_argument,       NULL, 0x10A},
+        {"no-pot",           no_argument,       NULL, 0x10B},
+        {"json",             no_argument,       NULL, 0x10C},
+        {"session",          required_argument, NULL, 0x10D},
+        {"session-list",     no_argument,       NULL, 0x10E},
+        {"keywalk",          no_argument,       NULL, 0x10F},
+        {"prince-words",     no_argument,       NULL, 0x110},
+        {"incremental",      no_argument,       NULL, 0x111},
+        {"gpu-batch",        required_argument, NULL, 0x112},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "f:d:bl:c:t:Grim:R::H:BFAOU1:2:3:4:M:",
+    while ((opt = getopt_long(argc, argv, "f:d:bl:c:t:Grim:R::H:BFAOU1:2:3:4:M:I",
                               long_opts, NULL)) != -1) {
         switch (opt) {
             case 'f': pdf_path    = optarg;       break;
@@ -3339,11 +4012,39 @@ int main(int argc, char *argv[])
             case 0x107: g_prince_mode        = 1;            break;
             case 0x108: g_fingerprint_mode   = 1;            break;
             case 0x109: g_rule_dedup         = 1;            break;
+            case 0x10A: g_show_pot          = 1;            break;
+            case 0x10B: g_no_pot            = 1;            break;
+            case 0x10C: g_json_mode         = 1;            break;
+            case 0x10D: strncpy(g_session_name, optarg, sizeof(g_session_name) - 1); g_session_name[sizeof(g_session_name)-1] = 0; break;
+            case 0x10E: g_session_list      = 1;            break;
+            case 0x10F: g_fingerprint_mode  = 1;            break; /* keywalk → fingerprint mode */
+            case 0x110: g_prince_words      = 1;            break;
+            case 0x111: g_incremental_mode  = 1;            break;
+            case 'I':   g_incremental_mode  = 1;            break;
+            case 0x112: g_gpu_batch         = atoi(optarg); break;
             default:  usage(argv[0]);
         }
     }
 
     /* ── Handle standalone utility modes (no PDF needed) ─────── */
+
+    /* Initialize pot file path */
+    pot_init();
+
+    /* --show-pot: print pot file and exit */
+    if (g_show_pot) {
+        pot_show();
+        return 0;
+    }
+
+    /* --session-list: list sessions and exit */
+    if (g_session_list) {
+        session_list();
+        return 0;
+    }
+
+    /* Record start time for JSON output */
+    g_start_time = time(NULL);
 
     /* Markov training mode */
     if (markov_train_wordlist) {
@@ -3619,9 +4320,16 @@ int main(int argc, char *argv[])
         usage(argv[0]);
     }
 
+    /* --incremental requires a Markov model */
+    if (g_incremental_mode && !markov_model_path) {
+        fprintf(stderr, "--incremental requires -M <model>\n");
+        usage(argv[0]);
+    }
+
     if (!brute && !dict_path && !g_mask_mode && !g_benchmark_mode &&
-        !g_auto_mode && !g_prince_mode && !g_fingerprint_mode && !resume) {
-        fprintf(stderr, "-d, -b, -m, -A, -B, --prince, or --fingerprint required\n");
+        !g_auto_mode && !g_prince_mode && !g_fingerprint_mode &&
+        !g_incremental_mode && !resume) {
+        fprintf(stderr, "-d, -b, -m, -A, -B, --prince, --fingerprint, or --incremental required\n");
         usage(argv[0]);
     }
     if (nthreads > MAX_THREADS) nthreads = MAX_THREADS;
@@ -3685,6 +4393,29 @@ int main(int argc, char *argv[])
     } else {
         fprintf(stderr, "Crypto : CGPDFDocument fallback (unsupported encryption)\n");
     }
+
+    /* ── Pot file lookup (after parsing encrypt params) ──────── */
+    if (g_enc_params.valid && !g_no_pot) {
+        char pot_hash[65];
+        pot_compute_hash(&g_enc_params, pot_hash);
+        char cached_pw[MAX_PASS_LEN + 1];
+        if (pot_lookup(pot_hash, cached_pw, sizeof(cached_pw))) {
+            if (g_json_mode) {
+                char esc_pw[256], esc_path[2048];
+                json_escape(cached_pw, esc_pw, sizeof(esc_pw));
+                json_escape(pdf_path, esc_path, sizeof(esc_path));
+                printf("{\"status\":\"found\",\"password\":\"%s\",\"source\":\"pot\",\"pdf\":\"%s\"}\n",
+                       esc_pw, esc_path);
+            } else {
+                printf("Found in pot file: %s\n", cached_pw);
+            }
+            return 0;
+        }
+    }
+
+    /* ── Session checkpoint path override ─────────────────────── */
+    if (g_session_name[0])
+        session_set_ckpt_path(g_session_name);
 
     /* ── Select best acceleration engine ─────────────────────── */
     if (g_fast_crypto && !no_gpu && g_enc_params.revision <= 4) {
@@ -4150,6 +4881,46 @@ int main(int argc, char *argv[])
         for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
     }
 
+    /* ── PRINCE + rules hybrid attack ─────────────────────────── */
+    else if (g_prince_mode && g_rule_mode && dict_path) {
+        g_is_brute = 0;
+        g_attack_mode = ATTACK_PRINCE;
+        if (!g_words && !load_wordlist(dict_path)) {
+            atomic_store(&g_found, 1);
+            pthread_join(prog, NULL);
+            return 1;
+        }
+        if (g_rules_file) load_rules_file(g_rules_file);
+        else init_rules();
+
+        /* Compute PRINCE keyspace */
+        g_prince_2word_total = g_nwords * g_nwords;
+        long prince_3word = g_nwords * g_nwords * g_nwords;
+        if (g_nwords > 10000) {
+            g_prince_max_words = 2;
+            prince_3word = 0;
+        }
+        g_prince_total = g_prince_2word_total + prince_3word;
+        long pr_total = g_prince_total * g_nrules;
+
+        fprintf(stderr, "Mode   : PRINCE + rules (%ld words, %d rules, keyspace %ld)\n\n",
+                g_nwords, g_nrules, pr_total);
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, pr_total);
+        atomic_store(&g_next_idx, 0);
+        spawned = 0;
+
+        for (int t = 0; t < nthreads; t++) {
+            void *a = malloc(1);
+            pthread_create(&threads[spawned++], NULL, prince_rule_worker, a);
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+
+        for (long i = 0; i < g_nwords; i++) free(g_words[i]);
+        free(g_words);
+    }
+
     /* ── Rule-based mutation attack ──────────────────────────── */
     else if (g_rule_mode && dict_path) {
         g_is_brute = 0;
@@ -4273,11 +5044,50 @@ int main(int argc, char *argv[])
         g_is_brute = 1;
         g_attack_mode = ATTACK_FINGERPRINT;
 
-        fprintf(stderr, "Mode   : fingerprint (common passwords, dates, PINs)\n\n");
         atomic_store(&g_tested, 0);
         atomic_store(&g_total, 0); /* unknown total */
 
         run_fingerprint_attack(nthreads, threads, &spawned);
+    }
+
+    /* ── Incremental (Markov probability order) attack ─────────── */
+    else if (g_incremental_mode && g_markov) {
+        g_is_brute = 1;
+        g_attack_mode = ATTACK_BRUTE;
+
+        int effective_cs = g_markov->threshold < g_markov->charset_size
+                         ? g_markov->threshold : g_markov->charset_size;
+        fprintf(stderr, "Mode   : incremental (Markov, len 1-%d, %d chars/pos)\n\n",
+                MAX_PASS_LEN, effective_cs);
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, 0); /* unknown total — incremental */
+
+        /* Reset ring buffer state */
+        g_incr_head = 0;
+        g_incr_tail = 0;
+        g_incr_done = 0;
+
+        /* Spawn producer */
+        pthread_t producer;
+        pthread_create(&producer, NULL, incr_producer_thread, NULL);
+
+        /* Spawn consumer workers */
+        spawned = 0;
+        for (int t = 0; t < nthreads; t++) {
+            void *a = malloc(1);
+            pthread_create(&threads[spawned++], NULL, incr_consumer_worker, a);
+        }
+
+        /* Wait for consumers */
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+
+        /* Signal producer to stop if still running */
+        atomic_store(&g_found, 1);
+        pthread_mutex_lock(&g_incr_mutex);
+        pthread_cond_signal(&g_incr_not_full);
+        pthread_mutex_unlock(&g_incr_mutex);
+        pthread_join(producer, NULL);
     }
 
     /* ── Dictionary attack ─────────────────────────────────────── */
@@ -4398,31 +5208,77 @@ auto_done:
     /* ── Stop progress thread and print result ─────────────────── */
     atomic_store(&g_found, 1); /* ensure progress thread exits */
     pthread_join(prog, NULL);
-    fputs("\n\n", stderr);
+    if (!g_json_mode) fputs("\n\n", stderr);
 
     if (g_gpu_ctx) metal_keygen_free(g_gpu_ctx);
     if (g_sha256_ctx) metal_sha256_free(g_sha256_ctx);
 
+    /* Mode name for JSON output */
+    static const char *mode_names[] = {
+        "brute", "dict", "mask", "rule", "hybrid", "auto", "prince", "fingerprint"
+    };
+    const char *cur_mode_name = (g_attack_mode >= 0 && g_attack_mode <= 7)
+                                ? mode_names[g_attack_mode] : "unknown";
+    long final_tested = atomic_load(&g_tested);
+    long final_elapsed = (long)(time(NULL) - g_start_time);
+    if (final_elapsed < 1) final_elapsed = 1;
+    long final_rate = final_tested / final_elapsed;
+
     /* If interrupted during work, save checkpoint and exit */
     if (g_interrupted) {
         ckpt_save();
-        fprintf(stderr, "Checkpoint saved to %s (use -r to resume)\n", g_ckpt_path);
+        if (g_json_mode) {
+            char esc_ckpt[2048];
+            json_escape(g_ckpt_path, esc_ckpt, sizeof(esc_ckpt));
+            printf("{\"status\":\"interrupted\",\"tested\":%ld,\"checkpoint\":\"%s\"}\n",
+                   final_tested, esc_ckpt);
+        } else {
+            fprintf(stderr, "Checkpoint saved to %s (use -r to resume)\n", g_ckpt_path);
+        }
         return 1;
     }
 
     if (g_password[0]) {
-        if (g_found_type)
-            printf("%s password found: %s\n", g_found_type, g_password);
-        else
-            printf("Password found: %s\n", g_password);
+        /* ── Write to pot file ──────────────────────────────────── */
+        if (g_enc_params.valid && !g_no_pot) {
+            char pot_hash[65];
+            pot_compute_hash(&g_enc_params, pot_hash);
+            pot_append(pot_hash, g_password);
+        }
+
+        if (g_json_mode) {
+            char esc_pw[256], esc_path[2048];
+            json_escape(g_password, esc_pw, sizeof(esc_pw));
+            json_escape(pdf_path, esc_path, sizeof(esc_path));
+            printf("{\"status\":\"found\",\"password\":\"%s\",\"type\":\"%s\","
+                   "\"tested\":%ld,\"elapsed\":%ld,\"rate\":%ld,"
+                   "\"mode\":\"%s\",\"pdf\":\"%s\",\"revision\":%d}\n",
+                   esc_pw, g_found_type ? g_found_type : "Unknown",
+                   final_tested, final_elapsed, final_rate,
+                   cur_mode_name, esc_path, g_enc_params.revision);
+        } else {
+            if (g_found_type)
+                printf("%s password found: %s\n", g_found_type, g_password);
+            else
+                printf("Password found: %s\n", g_password);
+        }
         ckpt_delete();  /* success — remove checkpoint */
         return 0;
     }
 
     /* Save final checkpoint before exiting (exhausted or interrupted) */
     ckpt_save();
-    fprintf(stderr, "Checkpoint saved to %s (use -r to resume)\n", g_ckpt_path);
 
-    printf("Password not found.\n");
+    if (g_json_mode) {
+        char esc_path[2048];
+        json_escape(pdf_path, esc_path, sizeof(esc_path));
+        printf("{\"status\":\"exhausted\",\"tested\":%ld,\"elapsed\":%ld,"
+               "\"rate\":%ld,\"mode\":\"%s\",\"pdf\":\"%s\"}\n",
+               final_tested, final_elapsed, final_rate,
+               cur_mode_name, esc_path);
+    } else {
+        fprintf(stderr, "Checkpoint saved to %s (use -r to resume)\n", g_ckpt_path);
+        printf("Password not found.\n");
+    }
     return 1;
 }

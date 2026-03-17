@@ -1,0 +1,180 @@
+#!/bin/bash
+# test_integration.sh — End-to-end tests for pdfcracker
+set -o pipefail
+
+# Always run from the script's directory
+cd "$(dirname "$0")" || exit 1
+
+PASS=0
+FAIL=0
+PDFCRACK=./pdfcrack
+TMPDIR=$(mktemp -d)
+trap "rm -rf $TMPDIR" EXIT
+
+run_test() {
+    local name="$1"
+    local expected="$2"
+    shift 2
+    local output
+    output=$(timeout 60 "$@" 2>/dev/null) || true
+    if echo "$output" | grep -qF "$expected"; then
+        echo "  [PASS] $name"
+        PASS=$((PASS + 1))
+    else
+        echo "  [FAIL] $name (expected: $expected)"
+        echo "         got: $(echo "$output" | head -1)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_test_stderr() {
+    # Like run_test but checks stderr instead of stdout
+    local name="$1"
+    local expected="$2"
+    shift 2
+    local output
+    output=$(timeout 60 "$@" 2>&1 >/dev/null) || true
+    if echo "$output" | grep -qF "$expected"; then
+        echo "  [PASS] $name"
+        PASS=$((PASS + 1))
+    else
+        echo "  [FAIL] $name (expected: $expected)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_test_timeout() {
+    # Like run_test but with a custom timeout
+    local name="$1"
+    local expected="$2"
+    local tmout="$3"
+    shift 3
+    local output
+    output=$(timeout "$tmout" "$@" 2>/dev/null) || true
+    if echo "$output" | grep -qF "$expected"; then
+        echo "  [PASS] $name"
+        PASS=$((PASS + 1))
+    else
+        echo "  [FAIL] $name (expected: $expected)"
+        echo "         got: $(echo "$output" | head -1)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# Verify binary exists
+if [ ! -x "$PDFCRACK" ]; then
+    echo "ERROR: $PDFCRACK not found or not executable. Run 'make' first."
+    exit 1
+fi
+
+echo "=== pdfcracker integration tests ==="
+
+# --- 1. Dictionary R3 ---
+echo "test123" > "$TMPDIR/dict_r3.txt"
+run_test "Dictionary R3" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_r3.txt" --no-pot
+
+# --- 2. Dictionary R6 ---
+echo "user_r6" > "$TMPDIR/dict_r6.txt"
+run_test_timeout "Dictionary R6" "user_r6" 120 \
+    $PDFCRACK -f test_pikepdf_r6.pdf -d "$TMPDIR/dict_r6.txt" --no-pot
+
+# --- 3. Brute-force R2 ---
+run_test "Brute-force R2 (minimal charset)" "pass40" \
+    $PDFCRACK -f test_r2_40bit.pdf -b -l 6 -c "pasw04" --no-pot
+
+# --- 4. Mask literal ---
+run_test "Mask literal" "passaes" \
+    $PDFCRACK -f test_r4_aes128.pdf -m "passaes" --no-pot
+
+# --- 5. Mask with charsets ---
+run_test "Mask with charsets" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -m "test?d?d?d" --no-pot
+
+# --- 6. Rules attack ---
+echo "TEST123" > "$TMPDIR/dict_rules.txt"
+echo "l" > "$TMPDIR/rules.txt"
+run_test "Rules attack (lowercase)" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_rules.txt" -R "$TMPDIR/rules.txt" --no-pot
+
+# --- 7. Hybrid attack ---
+echo "test" > "$TMPDIR/dict_hybrid.txt"
+run_test "Hybrid attack (dict+suffix)" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_hybrid.txt" -H 3 -c 0123456789 --no-pot
+
+# --- 8. PRINCE attack ---
+printf "test\n123\n" > "$TMPDIR/dict_prince.txt"
+run_test "PRINCE attack" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_prince.txt" --prince --no-pot
+
+# --- 9. Fingerprint ---
+run_test "Fingerprint attack" "test123" \
+    $PDFCRACK -f test_encrypted.pdf --fingerprint --no-pot
+
+# --- 10. Owner password ---
+echo "owner40" > "$TMPDIR/dict_owner.txt"
+run_test "Owner password (-O)" "owner40" \
+    $PDFCRACK -f test_r2_40bit.pdf -d "$TMPDIR/dict_owner.txt" -O --no-pot
+
+# --- 11. User only ---
+echo "test123" > "$TMPDIR/dict_user.txt"
+run_test "User only (-U)" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_user.txt" -U --no-pot
+
+# --- 12. Benchmark mode ---
+run_test_stderr "Benchmark mode" "Single-core" \
+    $PDFCRACK -f test_encrypted.pdf -B --no-pot
+
+# --- 13. Rule dedup ---
+echo "TEST123" > "$TMPDIR/dict_dedup.txt"
+echo "l" > "$TMPDIR/rules_dedup.txt"
+run_test "Rule dedup (--dedup)" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_dedup.txt" -R "$TMPDIR/rules_dedup.txt" --dedup --no-pot
+
+# --- 14. Max rounds R6 ---
+echo "user_r6" > "$TMPDIR/dict_maxrounds.txt"
+run_test_timeout "Max rounds R6 (--max-rounds 100)" "user_r6" 120 \
+    $PDFCRACK -f test_pikepdf_r6.pdf -d "$TMPDIR/dict_maxrounds.txt" --max-rounds 100 --no-pot
+
+# --- 15. Not found ---
+echo "wrongpassword" > "$TMPDIR/dict_notfound.txt"
+run_test "Not found" "Password not found" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_notfound.txt" --no-pot
+
+# --- 16. Checkpoint/resume ---
+echo "checkpoint test..."
+rm -f test_r4_aes128.ckpt
+$PDFCRACK -f test_r4_aes128.pdf -b -l 8 --no-pot &
+PID=$!
+sleep 2
+kill -INT $PID 2>/dev/null
+wait $PID 2>/dev/null
+if [ -f test_r4_aes128.ckpt ]; then
+    echo "  [PASS] checkpoint created"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] checkpoint not created"
+    FAIL=$((FAIL + 1))
+fi
+rm -f test_r4_aes128.ckpt
+
+# --- 17. Pot file ---
+# Clear pot file, crack, then verify pot lookup
+rm -f ~/.pdfcracker/pdfcracker.pot
+echo "test123" > "$TMPDIR/dict_pot.txt"
+$PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_pot.txt" >/dev/null 2>&1
+run_test "Pot file lookup" "Found in pot file: test123" \
+    $PDFCRACK -f test_encrypted.pdf -b -l 1
+
+# --- 18. JSON output ---
+run_test "JSON output" '"status":"found"' \
+    $PDFCRACK -f test_encrypted.pdf --fingerprint --json
+
+echo ""
+echo "=== Summary ==="
+echo "Total: $PASS passed, $FAIL failed"
+if [ "$FAIL" -gt 0 ]; then
+    exit 1
+else
+    exit 0
+fi

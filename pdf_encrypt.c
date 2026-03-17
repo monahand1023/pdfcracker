@@ -27,6 +27,14 @@
 #include <CommonCrypto/CommonCryptor.h>
 #pragma clang diagnostic pop
 
+/* NEON SIMD acceleration for SHA-256/384/512 and AES-128-CBC (R6 path) */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_SHA2)
+#include "sha256_simd.h"
+#endif
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_CRYPTO)
+#include "aes_simd.h"
+#endif
+
 /* ================================================================
  * Helper: scan for a string in PDF data (backward or forward)
  * ================================================================ */
@@ -621,22 +629,37 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
 {
     /* Step a: SHA-256(password + salt + extra) */
     uint8_t hash[64]; /* large enough for SHA-512 */
-    CC_SHA256_CTX sha256;
-    CC_SHA256_Init(&sha256);
-    CC_SHA256_Update(&sha256, password, (CC_LONG)pw_len);
-    CC_SHA256_Update(&sha256, salt, 8);
-    if (extra_len > 0)
-        CC_SHA256_Update(&sha256, extra, (CC_LONG)extra_len);
-    CC_SHA256_Final(hash, &sha256);
+
+    /* Build initial input for SHA-256 */
+    uint8_t init_buf[127 + 8 + 48]; /* max: 127 pw + 8 salt + 48 extra */
+    size_t init_len = 0;
+    memcpy(init_buf, password, pw_len);
+    init_len += pw_len;
+    memcpy(init_buf + init_len, salt, 8);
+    init_len += 8;
+    if (extra_len > 0) {
+        memcpy(init_buf + init_len, extra, (size_t)extra_len);
+        init_len += (size_t)extra_len;
+    }
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_SHA2)
+    sha256_hash_neon(init_buf, init_len, hash);
+#else
+    CC_SHA256(init_buf, (CC_LONG)init_len, hash);
+#endif
 
     int hash_len = 32; /* starts as SHA-256 */
 
     /* Step b-e: iterate until round >= 64 and last byte condition met */
     unsigned round = 0;
-    uint8_t K1[64 * (127 + 64 + 48)]; /* max iteration block */
+
+    /* Pre-allocate scratch buffer on stack to avoid malloc/free per round.
+     * Max K1 size = (127 + 64 + 48) * 64 = 15,296 bytes.
+     * AES-CBC encrypt is done in-place on K1. */
+    uint8_t K1[64 * (127 + 64 + 48)];
 
     for (;;) {
-        /* Step b: Build K1 = password + hash + extra, repeated 64 times */
+        /* Step b: Build K1 = (password + hash + extra) repeated 64 times */
         size_t seq_len = pw_len + (size_t)hash_len + (size_t)extra_len;
         uint8_t seq[127 + 64 + 48]; /* max: 127 pw + 64 hash + 48 extra */
         memcpy(seq, password, pw_len);
@@ -648,38 +671,54 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
         for (int i = 0; i < 64; i++)
             memcpy(K1 + i * seq_len, seq, seq_len);
 
-        /* Step c: AES-CBC encrypt K1 with key=hash[0:16], iv=hash[16:32] */
-        uint8_t *aes_out = malloc(K1_len + 16); /* CBC may need padding room */
-        if (!aes_out) { memcpy(out, hash, 32); return; }
-        size_t aes_len = 0;
-        CCCrypt(kCCEncrypt, kCCAlgorithmAES, 0, /* no padding */
-                hash, 16, hash + 16,
-                K1, K1_len,
-                aes_out, K1_len + 16, &aes_len);
+        /* Step c: AES-CBC encrypt K1 in-place with key=hash[0:16], iv=hash[16:32] */
+        /* K1_len is always a multiple of 16 because seq_len * 64 and the
+         * minimum seq_len (pw=0 + hash=32 + extra=0 = 32) is already 16-aligned. */
+        size_t aes_len = K1_len;
 
-        /* Step d: Choose hash based on first byte of encrypted result */
-        /* Sum of first 16 bytes mod 3 determines hash algorithm */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_CRYPTO)
+        {
+            uint8x16_t rk[11];
+            aes128_expand_key_neon(hash, rk);
+            aes128_cbc_encrypt_inplace_rk(rk, hash + 16, K1, K1_len);
+        }
+#else
+        {
+            size_t cc_out_len = 0;
+            /* CCCrypt supports in-place encryption (src==dst) on macOS */
+            CCCrypt(kCCEncrypt, kCCAlgorithmAES, 0,
+                    hash, 16, hash + 16,
+                    K1, K1_len,
+                    K1, K1_len, &cc_out_len);
+            aes_len = cc_out_len;
+        }
+#endif
+
+        /* Step d: Choose hash based on sum of first 16 bytes mod 3 */
         unsigned sum = 0;
-        for (int i = 0; i < 16; i++) sum += aes_out[i];
+        for (int i = 0; i < 16; i++) sum += K1[i];
 
         switch (sum % 3) {
             case 0:
-                CC_SHA256(aes_out, (CC_LONG)aes_len, hash);
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_SHA2)
+                sha256_hash_neon(K1, aes_len, hash);
+#else
+                CC_SHA256(K1, (CC_LONG)aes_len, hash);
+#endif
                 hash_len = 32;
                 break;
             case 1:
-                CC_SHA384(aes_out, (CC_LONG)aes_len, hash);
+                CC_SHA384(K1, (CC_LONG)aes_len, hash);
                 hash_len = 48;
                 break;
             case 2:
-                CC_SHA512(aes_out, (CC_LONG)aes_len, hash);
+                CC_SHA512(K1, (CC_LONG)aes_len, hash);
                 hash_len = 64;
                 break;
         }
 
         /* Step e: Check termination */
-        uint8_t last_byte = aes_out[aes_len - 1];
-        free(aes_out);
+        uint8_t last_byte = K1[aes_len - 1];
         round++;
 
         if (round >= 64 && last_byte <= (round - 32))

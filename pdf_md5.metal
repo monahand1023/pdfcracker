@@ -428,14 +428,14 @@ kernel void pdf_sha256_verify(
     for (uint i = 0; i < pw_len; i++)
         input[input_len++] = passwords[pw_offset + i];
 
-    if (params.check_owner) {
-        /* Owner: password + O_validation_salt + U[0:48] */
+    if (params.check_owner == 1) {
+        /* Owner only: password + O_validation_salt + U[0:48] */
         for (uint i = 0; i < 8; i++)
             input[input_len++] = params.o_salt[i];
         for (uint i = 0; i < 48; i++)
             input[input_len++] = params.u_full[i];
     } else {
-        /* User: password + U_validation_salt */
+        /* User (check_owner==0) or user-first in dual mode (check_owner==2) */
         for (uint i = 0; i < 8; i++)
             input[input_len++] = params.u_salt[i];
     }
@@ -444,16 +444,39 @@ kernel void pdf_sha256_verify(
     sha256_hash(input, input_len, hash);
 
     /* Compare against target hash (constant address space) */
-    uchar match = 1;
-    if (params.check_owner) {
+    uchar match = 0;
+    if (params.check_owner == 1) {
+        match = 1;
         for (uint i = 0; i < 32; i++) {
             if (hash[i] != params.o_hash[i]) { match = 0; break; }
         }
+        if (match) match = 2; /* owner match */
     } else {
+        match = 1;
         for (uint i = 0; i < 32; i++) {
             if (hash[i] != params.u_hash[i]) { match = 0; break; }
         }
+        /* match == 1 means user match, 0 means no match */
     }
+
+    /* Dual mode (check_owner==2): if user didn't match, try owner */
+    if (params.check_owner == 2 && match == 0) {
+        uint owner_len = 0;
+        for (uint i = 0; i < pw_len; i++)
+            input[owner_len++] = passwords[pw_offset + i];
+        for (uint i = 0; i < 8; i++)
+            input[owner_len++] = params.o_salt[i];
+        for (uint i = 0; i < 48; i++)
+            input[owner_len++] = params.u_full[i];
+
+        sha256_hash(input, owner_len, hash);
+
+        match = 2;
+        for (uint i = 0; i < 32; i++) {
+            if (hash[i] != params.o_hash[i]) { match = 0; break; }
+        }
+    }
+
     results[tid] = match;
 }
 
@@ -916,6 +939,12 @@ struct PDFR6GPU {
     uchar  extra[48];         /* extra data: empty for user, U[0:48] for owner */
     uint   extra_len;         /* 0 for user, 48 for owner */
     uint   max_rounds;        /* safety limit (default 200) */
+    uint   check_both;        /* 1 = dual mode: try primary, then secondary */
+    uchar  target_hash2[32];  /* secondary target hash (owner when primary is user) */
+    uchar  salt2[8];          /* secondary validation salt */
+    uchar  extra2[48];        /* secondary extra data */
+    uint   extra_len2;        /* secondary extra length */
+    uint   _pad;              /* padding for alignment */
 };
 
 kernel void pdf_r6_verify(
@@ -1014,6 +1043,79 @@ kernel void pdf_r6_verify(
     for (uint i = 0; i < 32; i++) {
         if (hash[i] != params.target_hash[i]) { match = 0; break; }
     }
+
+    /* Dual mode: if primary didn't match and check_both is set, try secondary params */
+    if (match == 0 && params.check_both == 1) {
+        /* Re-run full KDF with secondary (owner) params */
+
+        /* Step a: SHA-256(password + salt2 + extra2) */
+        init_len = 0;
+        for (uint i = 0; i < pw_len; i++)
+            K1[init_len++] = passwords[pw_offset + i];
+        for (uint i = 0; i < 8; i++)
+            K1[init_len++] = params.salt2[i];
+        for (uint i = 0; i < params.extra_len2; i++)
+            K1[init_len++] = params.extra2[i];
+
+        sha256_hash_dev(K1, init_len, hash);
+        hash_len = 32;
+
+        round = 0;
+        for (;;) {
+            uint seq_len = pw_len + hash_len + params.extra_len2;
+            uint pos2 = 0;
+            for (uint i = 0; i < pw_len; i++)
+                K1[pos2++] = passwords[pw_offset + i];
+            for (uint i = 0; i < hash_len; i++)
+                K1[pos2++] = hash[i];
+            for (uint i = 0; i < params.extra_len2; i++)
+                K1[pos2++] = params.extra2[i];
+
+            uint K1_len2 = seq_len * 64;
+            for (uint rep = 1; rep < 64; rep++) {
+                for (uint i = 0; i < seq_len; i++)
+                    K1[rep * seq_len + i] = K1[i];
+            }
+
+            uchar aes_key2[16], aes_iv2[16];
+            for (uint i = 0; i < 16; i++) aes_key2[i] = hash[i];
+            for (uint i = 0; i < 16; i++) aes_iv2[i]  = hash[16 + i];
+
+            uint aes_len2 = (K1_len2 / 16) * 16;
+            aes128_cbc_encrypt(aes_key2, aes_iv2, K1, aes_len2, aes_out);
+
+            uint sum2 = 0;
+            for (uint i = 0; i < 16; i++) sum2 += uint(aes_out[i]);
+
+            switch (sum2 % 3) {
+                case 0:
+                    sha256_hash_dev(aes_out, aes_len2, hash);
+                    hash_len = 32;
+                    break;
+                case 1:
+                    sha384_hash_dev(aes_out, aes_len2, hash);
+                    hash_len = 48;
+                    break;
+                case 2:
+                    sha512_hash_dev(aes_out, aes_len2, hash);
+                    hash_len = 64;
+                    break;
+            }
+
+            uchar last_byte2 = aes_out[aes_len2 - 1];
+            round++;
+
+            if (round >= 64 && last_byte2 <= uchar(round - 32))
+                break;
+            if (round > params.max_rounds) break;
+        }
+
+        match = 2; /* owner match marker */
+        for (uint i = 0; i < 32; i++) {
+            if (hash[i] != params.target_hash2[i]) { match = 0; break; }
+        }
+    }
+
     results[tid] = match;
 }
 

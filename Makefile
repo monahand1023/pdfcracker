@@ -11,7 +11,7 @@ saslprep.o: saslprep.c saslprep.h
 	$(CC) $(CFLAGS) -c saslprep.c
 
 # ── PDF encryption parser + crypto ────────────────────────────
-pdf_encrypt.o: pdf_encrypt.c pdf_encrypt.h saslprep.h
+pdf_encrypt.o: pdf_encrypt.c pdf_encrypt.h saslprep.h sha256_simd.h aes_simd.h
 	$(CC) $(CFLAGS) -c pdf_encrypt.c
 
 # ── Metal GPU key derivation ─────────────────────────────────
@@ -39,6 +39,12 @@ test_all: test_all.c pdf_encrypt.o saslprep.o pdf_encrypt.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ test_all.c pdf_encrypt.o saslprep.o
 
 clean:
-	rm -f pdfcrack server client test_all *.o *.air *.metallib
+	rm -f pdfcrack server client test_all fuzz_rules *.o *.air *.metallib
 
-.PHONY: all clean
+test-integration: pdfcrack
+	./test_integration.sh
+
+fuzz-rules: fuzz_rules.c
+	clang -fsanitize=fuzzer,address,undefined -o fuzz_rules fuzz_rules.c
+
+.PHONY: all clean test-integration fuzz-rules
