@@ -39,7 +39,7 @@ test_all: test_all.c pdf_encrypt.o saslprep.o pdf_encrypt.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ test_all.c pdf_encrypt.o saslprep.o
 
 clean:
-	rm -f pdfcrack server client test_all fuzz_rules *.o *.air *.metallib
+	rm -f pdfcrack server client test_all fuzz_rules *.o *.air *.metallib *.profraw *.profdata
 
 test-integration: pdfcrack
 	./test_integration.sh
@@ -47,4 +47,12 @@ test-integration: pdfcrack
 fuzz-rules: fuzz_rules.c
 	clang -fsanitize=fuzzer,address,undefined -o fuzz_rules fuzz_rules.c
 
-.PHONY: all clean test-integration fuzz-rules
+# ── Profile-guided optimization (PGO) ───────────────────────
+pgo:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -fprofile-generate"
+	./pdfcrack -f test_r4_aes128.pdf -B
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -fprofile-use -fprofile-correction"
+
+.PHONY: all clean test-integration fuzz-rules pgo

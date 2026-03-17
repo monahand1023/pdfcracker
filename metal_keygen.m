@@ -13,6 +13,21 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+
+/* ── Helper: pack passwords into GPU buffers ────────────────────── */
+static inline void pack_passwords_gpu(uint8_t *pw_buf, uint8_t *len_buf,
+                                       const char **passwords, int count,
+                                       int packed_len, int max_len)
+{
+    memset(pw_buf, 0, (size_t)count * packed_len);
+    for (int i = 0; i < count; i++) {
+        if (!passwords[i]) { len_buf[i] = 0; continue; }
+        size_t plen = strlen(passwords[i]);
+        if (plen > (size_t)max_len) plen = (size_t)max_len;
+        memcpy(pw_buf + (size_t)i * packed_len, passwords[i], plen);
+        len_buf[i] = (uint8_t)plen;
+    }
+}
 #include <mach/mach_time.h>
 
 /* Must match the struct in pdf_md5.metal exactly */
@@ -187,15 +202,7 @@ int metal_keygen_batch(MetalKeygenContext *ctx,
         /* Pack passwords into GPU buffer */
         uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
         uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
-
-        memset(pw_data, 0, (size_t)count * PW_PACKED_LEN);
-        for (int i = 0; i < count; i++) {
-            if (!passwords[i]) { len_data[i] = 0; continue; }
-            size_t plen = strlen(passwords[i]);
-            if (plen > PW_PACKED_LEN) plen = PW_PACKED_LEN;
-            memcpy(pw_data + i * PW_PACKED_LEN, passwords[i], plen);
-            len_data[i] = (uint8_t)plen;
-        }
+        pack_passwords_gpu(pw_data, len_data, passwords, count, PW_PACKED_LEN, PW_PACKED_LEN);
 
         /* Create command buffer and encoder */
         id<MTLCommandBuffer> cmdBuf = [ctx->queue commandBuffer];
@@ -248,15 +255,7 @@ void *metal_keygen_submit_async(MetalKeygenContext *ctx,
 
         uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
         uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
-
-        memset(pw_data, 0, (size_t)count * PW_PACKED_LEN);
-        for (int i = 0; i < count; i++) {
-            if (!passwords[i]) { len_data[i] = 0; continue; }
-            size_t plen = strlen(passwords[i]);
-            if (plen > PW_PACKED_LEN) plen = PW_PACKED_LEN;
-            memcpy(pw_data + i * PW_PACKED_LEN, passwords[i], plen);
-            len_data[i] = (uint8_t)plen;
-        }
+        pack_passwords_gpu(pw_data, len_data, passwords, count, PW_PACKED_LEN, PW_PACKED_LEN);
 
         id<MTLCommandBuffer> cmdBuf = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
@@ -525,14 +524,7 @@ int metal_sha256_verify_batch_ex(MetalSHA256Context *ctx,
         /* Pack passwords into GPU buffer */
         uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
         uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
-
-        memset(pw_data, 0, (size_t)count * SHA256_PW_PACKED_LEN);
-        for (int i = 0; i < count; i++) {
-            size_t plen = strlen(passwords[i]);
-            if (plen > 127) plen = 127;
-            memcpy(pw_data + (size_t)i * SHA256_PW_PACKED_LEN, passwords[i], plen);
-            len_data[i] = (uint8_t)plen;
-        }
+        pack_passwords_gpu(pw_data, len_data, passwords, count, SHA256_PW_PACKED_LEN, 127);
 
         /* Clear results */
         memset([ctx->results_buf[buf] contents], 0, (size_t)count);
@@ -606,14 +598,7 @@ void *metal_sha256_submit_async(MetalSHA256Context *ctx, const char **passwords,
 
         uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
         uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
-
-        memset(pw_data, 0, (size_t)count * SHA256_PW_PACKED_LEN);
-        for (int i = 0; i < count; i++) {
-            size_t plen = strlen(passwords[i]);
-            if (plen > 127) plen = 127;
-            memcpy(pw_data + (size_t)i * SHA256_PW_PACKED_LEN, passwords[i], plen);
-            len_data[i] = (uint8_t)plen;
-        }
+        pack_passwords_gpu(pw_data, len_data, passwords, count, SHA256_PW_PACKED_LEN, 127);
 
         memset([ctx->results_buf[buf] contents], 0, (size_t)count);
 
@@ -853,14 +838,7 @@ int metal_r6_verify_batch_ex(MetalR6Context *ctx, const char **passwords, int co
 
         uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
         uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
-
-        memset(pw_data, 0, (size_t)count * 128);
-        for (int i = 0; i < count; i++) {
-            size_t plen = strlen(passwords[i]);
-            if (plen > 127) plen = 127;
-            memcpy(pw_data + (size_t)i * 128, passwords[i], plen);
-            len_data[i] = (uint8_t)plen;
-        }
+        pack_passwords_gpu(pw_data, len_data, passwords, count, 128, 127);
 
         memset([ctx->results_buf[buf] contents], 0, (size_t)count);
 
@@ -927,14 +905,7 @@ void *metal_r6_submit_async(MetalR6Context *ctx, const char **passwords, int cou
 
         uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
         uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
-
-        memset(pw_data, 0, (size_t)count * 128);
-        for (int i = 0; i < count; i++) {
-            size_t plen = strlen(passwords[i]);
-            if (plen > 127) plen = 127;
-            memcpy(pw_data + (size_t)i * 128, passwords[i], plen);
-            len_data[i] = (uint8_t)plen;
-        }
+        pack_passwords_gpu(pw_data, len_data, passwords, count, 128, 127);
 
         memset([ctx->results_buf[buf] contents], 0, (size_t)count);
 
@@ -1026,14 +997,7 @@ int metal_r6_verify_batch_sub_ex(MetalR6Context *ctx,
         /* Pack all passwords into the buffer upfront */
         uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
         uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
-
-        memset(pw_data, 0, (size_t)count * 128);
-        for (int i = 0; i < count; i++) {
-            size_t plen = strlen(passwords[i]);
-            if (plen > 127) plen = 127;
-            memcpy(pw_data + (size_t)i * 128, passwords[i], plen);
-            len_data[i] = (uint8_t)plen;
-        }
+        pack_passwords_gpu(pw_data, len_data, passwords, count, 128, 127);
 
         memset([ctx->results_buf[buf] contents], 0, (size_t)count);
 

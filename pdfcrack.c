@@ -87,10 +87,11 @@ static int              g_fast_crypto = 0; /* 1 = use direct MD5+RC4 */
 
 /* ── GPU acceleration ──────────────────────────────────────────── */
 #define GPU_BATCH_SIZE  65536
-#define CPU_WORK_CHUNK  512   /* CPU threads grab this many from shared counter */
+#define CPU_WORK_CHUNK   512   /* CPU threads grab this many from shared counter */
+#define NEON_WORK_CHUNK  2048  /* NEON threads: larger chunk reduces atomic contention */
 static MetalKeygenContext *g_gpu_ctx     = NULL;
-static MetalSHA256Context *g_sha256_ctx __attribute__((unused)) = NULL;  /* R5 SHA-256 GPU pipeline */
-static MetalR6Context     *g_r6_ctx    __attribute__((unused)) = NULL;  /* R6 GPU pipeline */
+static MetalSHA256Context *g_sha256_ctx = NULL;  /* R5 SHA-256 GPU pipeline */
+static MetalR6Context     *g_r6_ctx    = NULL;  /* R6 GPU pipeline */
 static int                 g_use_gpu    = 0;
 static atomic_long         g_next_idx   __attribute__((aligned(64))) = 0; /* shared work counter for GPU+CPU */
 
@@ -1072,9 +1073,9 @@ static void *dict_worker_neon(void *arg)
         if (__builtin_expect(atomic_load_explicit(&g_found,
                              memory_order_relaxed), 0))
             break;
-        long chunk_start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+        long chunk_start = atomic_fetch_add(&g_next_idx, NEON_WORK_CHUNK);
         if (chunk_start >= g_nwords) break;
-        long chunk_end = chunk_start + CPU_WORK_CHUNK;
+        long chunk_end = chunk_start + NEON_WORK_CHUNK;
         if (chunk_end > g_nwords) chunk_end = g_nwords;
 
         long i = chunk_start;
@@ -2496,15 +2497,15 @@ static void *brute_worker_neon(void *arg)
     int use_inc = (g_idx_to_pass == index_to_pass && g_next_char_for == g_charset);
 
     if (a->use_shared) {
-        /* Shared work counter mode — grab CPU_WORK_CHUNK at a time,
+        /* Shared work counter mode — grab NEON_WORK_CHUNK at a time,
          * then process 4 at a time within each chunk */
         for (;;) {
             if (__builtin_expect(atomic_load_explicit(&g_found,
                                  memory_order_relaxed), 0))
                 break;
-            long chunk_start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+            long chunk_start = atomic_fetch_add(&g_next_idx, NEON_WORK_CHUNK);
             if (chunk_start >= a->end) break;
-            long chunk_end = chunk_start + CPU_WORK_CHUNK;
+            long chunk_end = chunk_start + NEON_WORK_CHUNK;
             if (chunk_end > a->end) chunk_end = a->end;
 
             long i = chunk_start;
@@ -2534,10 +2535,8 @@ static void *brute_worker_neon(void *arg)
                 }
 
                 const char *pw[4] = { pass[0], pass[1], pass[2], pass[3] };
-                int pwlen[4] = {
-                    (int)strlen(pass[0]), (int)strlen(pass[1]),
-                    (int)strlen(pass[2]), (int)strlen(pass[3])
-                };
+                int total_len = a->length + g_prefix_len + g_suffix_len;
+                int pwlen[4] = { total_len, total_len, total_len, total_len };
 
                 /* Dispatch to appropriate batch4 based on password mode */
                 int hits = 0;
@@ -2622,10 +2621,8 @@ static void *brute_worker_neon(void *arg)
             }
 
             const char *pw[4] = { pass[0], pass[1], pass[2], pass[3] };
-            int pwlen[4] = {
-                (int)strlen(pass[0]), (int)strlen(pass[1]),
-                (int)strlen(pass[2]), (int)strlen(pass[3])
-            };
+            int total_len = a->length + g_prefix_len + g_suffix_len;
+            int pwlen[4] = { total_len, total_len, total_len, total_len };
 
             int hits = 0;
             if (g_password_mode == PW_MODE_OWNER)
@@ -2887,6 +2884,10 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
 
         if (g_enc_params.revision == 2) {
             /* Algorithm 4: RC4-encrypt padding, compare all 32 bytes of U */
+            /* Early first-byte exit: reject 255/256 candidates instantly */
+            if (rc4_first_byte(key, key_bytes, PDF_PASSWORD_PADDING[0])
+                != g_enc_params.u_value[0])
+                continue;
             uint8_t computed_u[32];
             rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, computed_u, 32);
             if (memcmp(computed_u, g_enc_params.u_value, 32) == 0)

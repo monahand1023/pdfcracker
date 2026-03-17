@@ -501,6 +501,29 @@ PDFEncryptParams pdf_parse_encrypt_file(const char *path)
     return params;
 }
 
+/* ── Helper: 19 additional RC4 passes with XOR-modified keys (16 bytes) ── */
+static inline void rc4_multi_pass_16(const uint8_t *key, int key_len,
+                                      uint8_t data[16], int start, int end, int step)
+{
+    for (int r = start; r != end + step; r += step) {
+        uint8_t mod_key[16];
+        for (int j = 0; j < key_len; j++)
+            mod_key[j] = key[j] ^ (uint8_t)r;
+        uint8_t temp[16];
+        rc4_encrypt_16(mod_key, key_len, data, temp);
+        memcpy(data, temp, 16);
+    }
+}
+
+/* ── Helper: pad or truncate password to 32 bytes per PDF spec ── */
+static inline void pad_password(const char *password, uint8_t padded[32])
+{
+    size_t plen = password ? strlen(password) : 0;
+    if (plen > 32) plen = 32;
+    if (plen > 0) memcpy(padded, password, plen);
+    if (plen < 32) memcpy(padded + plen, PDF_PASSWORD_PADDING, 32 - plen);
+}
+
 /* ================================================================
  * Algorithm 2: Compute encryption key from user password
  * (ISO 32000-1 section 7.6.3.3)
@@ -515,10 +538,7 @@ int pdf_compute_encryption_key(const PDFEncryptParams *params,
 
     /* Step a: Pad or truncate password to 32 bytes */
     uint8_t padded[32];
-    size_t plen = password ? strlen(password) : 0;
-    if (plen > 32) plen = 32;
-    if (plen > 0) memcpy(padded, password, plen);
-    if (plen < 32) memcpy(padded + plen, PDF_PASSWORD_PADDING, 32 - plen);
+    pad_password(password, padded);
 
     /* Step b-f: MD5 hash of padded + O + P(LE) + fileID [+ 0xFFFFFFFF if !encryptMetadata] */
     CC_MD5_CTX md5;
@@ -593,14 +613,7 @@ static void compute_u_r3(const PDFEncryptParams *params,
     rc4_encrypt_16(key, key_len, hash, encrypted);
 
     /* (c) 19 additional RC4 passes with XOR-modified keys */
-    for (int i = 1; i <= 19; i++) {
-        uint8_t mod_key[16];
-        for (int j = 0; j < key_len; j++)
-            mod_key[j] = key[j] ^ (uint8_t)i;
-        uint8_t temp[16];
-        rc4_encrypt_16(mod_key, key_len, encrypted, temp);
-        memcpy(encrypted, temp, 16);
-    }
+    rc4_multi_pass_16(key, key_len, encrypted, 1, 19, 1);
 
     /* First 16 bytes are the check value, rest is arbitrary */
     memcpy(u_out, encrypted, 16);
@@ -782,6 +795,25 @@ static int verify_owner_r5(const PDFEncryptParams *params, const char *password)
     return memcmp(hash, params->o_value, 32) == 0;
 }
 
+/* ── Helper: SASLprep normalization for R6 passwords ─────────── */
+static inline void normalize_password_r6(const char *password,
+                                          const uint8_t **out_data,
+                                          size_t *out_len)
+{
+    size_t pw_len = password ? strlen(password) : 0;
+    if (pw_len > 127) pw_len = 127;
+    *out_len = pw_len;
+    /* Try SASLprep normalization; fall back to raw password */
+    static _Thread_local uint8_t norm_buf[128];
+    size_t norm_len = 0;
+    if (pw_len > 0 && saslprep(password, pw_len, norm_buf, &norm_len) == 0 && norm_len > 0) {
+        *out_data = norm_buf;
+        *out_len = norm_len;
+    } else {
+        *out_data = (const uint8_t *)password;
+    }
+}
+
 /* ================================================================
  * R6 user password verification (Algorithm 2.A with 2.B hash)
  * Algorithm2B(password, U_validation_salt, "") == U[0:32]
@@ -790,19 +822,9 @@ static int verify_user_r6(const PDFEncryptParams *params, const char *password)
 {
     if (params->u_value_len < 40) return 0;
 
-    size_t pw_len = password ? strlen(password) : 0;
-    if (pw_len > 127) pw_len = 127;
-
-    /* SASLprep normalization for R6 (ISO 32000-2 7.6.4.3.3) */
-    uint8_t norm_pw[128];
-    size_t norm_len = 0;
     const uint8_t *pw_data;
-    if (pw_len > 0 && saslprep(password, pw_len, norm_pw, &norm_len) == 0 && norm_len > 0) {
-        pw_data = norm_pw;
-        pw_len = norm_len;
-    } else {
-        pw_data = (const uint8_t *)password;
-    }
+    size_t pw_len;
+    normalize_password_r6(password, &pw_data, &pw_len);
 
     uint8_t hash[32];
     algorithm_2b(pw_data, pw_len,
@@ -821,19 +843,9 @@ static int verify_owner_r6(const PDFEncryptParams *params, const char *password)
 {
     if (params->o_value_len < 40 || params->u_value_len < 48) return 0;
 
-    size_t pw_len = password ? strlen(password) : 0;
-    if (pw_len > 127) pw_len = 127;
-
-    /* SASLprep normalization for R6 (ISO 32000-2 7.6.4.3.3) */
-    uint8_t norm_pw[128];
-    size_t norm_len = 0;
     const uint8_t *pw_data;
-    if (pw_len > 0 && saslprep(password, pw_len, norm_pw, &norm_len) == 0 && norm_len > 0) {
-        pw_data = norm_pw;
-        pw_len = norm_len;
-    } else {
-        pw_data = (const uint8_t *)password;
-    }
+    size_t pw_len;
+    normalize_password_r6(password, &pw_data, &pw_len);
 
     uint8_t hash[32];
     algorithm_2b(pw_data, pw_len,
@@ -892,10 +904,7 @@ int pdf_verify_owner_password(const PDFEncryptParams *params, const char *passwo
 
     /* Step a: Pad the owner password */
     uint8_t padded[32];
-    size_t plen = password ? strlen(password) : 0;
-    if (plen > 32) plen = 32;
-    if (plen > 0) memcpy(padded, password, plen);
-    if (plen < 32) memcpy(padded + plen, PDF_PASSWORD_PADDING, 32 - plen);
+    pad_password(password, padded);
 
     /* Step b: MD5 hash */
     uint8_t hash[16];
@@ -1045,6 +1054,10 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
     if (params->revision == 2) {
         /* Algorithm 4: RC4-encrypt padding, compare 32 bytes */
         for (int i = 0; i < 4; i++) {
+            /* Early first-byte exit: reject 255/256 candidates instantly */
+            if (rc4_first_byte(keys[i], key_bytes, PDF_PASSWORD_PADDING[0])
+                != params->u_value[0])
+                continue;
             uint8_t computed_u[32];
             rc4_encrypt(keys[i], key_bytes, PDF_PASSWORD_PADDING, computed_u, 32);
             if (memcmp(computed_u, params->u_value, 32) == 0)
@@ -1067,14 +1080,7 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
             /* Early first-byte exit: skip 19 RC4 passes if first byte wrong */
             if (encrypted[0] != params->u_value[0]) continue;
 
-            for (int r = 1; r <= 19; r++) {
-                uint8_t mod_key[16];
-                for (int j = 0; j < key_bytes; j++)
-                    mod_key[j] = keys[i][j] ^ (uint8_t)r;
-                uint8_t temp[16];
-                rc4_encrypt_16(mod_key, key_bytes, encrypted, temp);
-                memcpy(encrypted, temp, 16);
-            }
+            rc4_multi_pass_16(keys[i], key_bytes, encrypted, 1, 19, 1);
 
             if (memcmp(encrypted, params->u_value, 16) == 0)
                 result |= (1 << i);

@@ -495,6 +495,10 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
     for (int i = 0; i < count; i++) {
         const uint8_t *key = keys + i * key_bytes;
         if (g_enc_params.revision == 2) {
+            /* Early first-byte exit: reject 255/256 candidates instantly */
+            if (rc4_first_byte(key, key_bytes, PDF_PASSWORD_PADDING[0])
+                != g_enc_params.u_value[0])
+                continue;
             uint8_t computed_u[32];
             rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, computed_u, 32);
             if (memcmp(computed_u, g_enc_params.u_value, 32) == 0) {
