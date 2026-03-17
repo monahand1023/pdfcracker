@@ -290,6 +290,7 @@ static int  g_mutate_mode = 0;
 /* -- L33tspeak substitutions attack --------------------------- */
 #define ATTACK_LEET 13
 static int  g_leet_mode = 0;
+static int  g_metadata_seeds = 0;
 
 /* -- Global incremental heap (for resume) --------------------- */
 static IncrHeap *g_incr_heap = NULL;
@@ -297,6 +298,7 @@ static IncrHeap *g_incr_heap = NULL;
 /* Forward declarations for incremental save/load (defined later) */
 static void incr_heap_save(const char *path);
 static int incr_heap_load(const char *path);
+static int extract_metadata_seeds(const char *pdf_path, char ***words_out);
 
 /* ── Safe integer parsing with range checking ────────────────── */
 static int safe_atoi(const char *s, int min_val, int max_val, const char *name)
@@ -602,6 +604,8 @@ static void ckpt_save(void)
     if (g_pdf_path)
         fprintf(f, "pdf_path=%s\n", g_pdf_path);
 
+    fflush(f);
+    fsync(fileno(f));
     fclose(f);
     if (rename(tmp, g_ckpt_path) != 0) perror("checkpoint rename");
 
@@ -992,6 +996,102 @@ static void *dict_worker(void *arg)
     free(arg);
     return NULL;
 }
+
+#ifdef __ARM_NEON
+/* ================================================================
+ * NEON dictionary attack — process 4 words at a time
+ * ================================================================ */
+static void *dict_worker_neon(void *arg)
+{
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+
+    (void)arg;
+    long local_count = 0;
+
+    /* Shared work counter mode — process 4 words per iteration */
+    for (;;) {
+        if (__builtin_expect(atomic_load_explicit(&g_found,
+                             memory_order_relaxed), 0))
+            break;
+        long chunk_start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+        if (chunk_start >= g_nwords) break;
+        long chunk_end = chunk_start + CPU_WORK_CHUNK;
+        if (chunk_end > g_nwords) chunk_end = g_nwords;
+
+        long i = chunk_start;
+        /* Process groups of 4 with NEON SIMD */
+        for (; i + 3 < chunk_end; i += 4) {
+            if (__builtin_expect(atomic_load_explicit(&g_found,
+                                 memory_order_relaxed), 0))
+                break;
+
+            const char *pw[4] = { g_words[i], g_words[i+1],
+                                  g_words[i+2], g_words[i+3] };
+            int pwlen[4] = {
+                (int)strlen(pw[0]), (int)strlen(pw[1]),
+                (int)strlen(pw[2]), (int)strlen(pw[3])
+            };
+
+            int hits = 0;
+            if (g_password_mode == PW_MODE_OWNER)
+                hits = pdf_verify_owner_batch4(&g_enc_params, pw, pwlen);
+            else if (g_password_mode == PW_MODE_USER)
+                hits = pdf_verify_user_batch4(&g_enc_params, pw, pwlen);
+            else {
+                hits = pdf_verify_user_batch4(&g_enc_params, pw, pwlen);
+                if (hits) g_found_type = "User";
+                int remaining_mask = (~hits) & 0xF;
+                if (remaining_mask) {
+                    int owner_hits = pdf_verify_owner_batch4(&g_enc_params, pw, pwlen);
+                    owner_hits &= remaining_mask;
+                    if (owner_hits) g_found_type = "Owner";
+                    hits |= owner_hits;
+                }
+            }
+            if (g_password_mode == PW_MODE_OWNER && hits)
+                g_found_type = "Owner";
+            else if (g_password_mode == PW_MODE_USER && hits)
+                g_found_type = "User";
+
+            local_count += 4;
+            if (local_count >= TESTED_BATCH) {
+                atomic_fetch_add_explicit(&g_tested, local_count,
+                                          memory_order_relaxed);
+                local_count = 0;
+            }
+            if (__builtin_expect(hits, 0)) {
+                for (int b = 0; b < 4; b++) {
+                    if (hits & (1 << b)) {
+                        if (!atomic_exchange(&g_found, 1))
+                            strncpy(g_password, pw[b], MAX_PASS_LEN);
+                    }
+                }
+            }
+        }
+        /* Handle remaining 1-3 words with scalar path */
+        for (; i < chunk_end; i++) {
+            if (__builtin_expect(atomic_load_explicit(&g_found,
+                                 memory_order_relaxed), 0))
+                break;
+            local_count++;
+            if (local_count >= TESTED_BATCH) {
+                atomic_fetch_add_explicit(&g_tested, local_count,
+                                          memory_order_relaxed);
+                local_count = 0;
+            }
+            if (test_password_fast(g_words[i])) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, g_words[i], MAX_PASS_LEN);
+            }
+        }
+    }
+    if (local_count > 0)
+        atomic_fetch_add(&g_tested, local_count);
+
+    free(arg);
+    return NULL;
+}
+#endif
 
 /* ================================================================
  * Brute-force
@@ -4859,6 +4959,28 @@ static int run_fingerprint_attack(int nthreads, pthread_t *threads, int *spawned
     fmt_num(fp_total, s_fp, sizeof(s_fp));
     fprintf(stderr, "Mode   : fingerprint (common passwords, keywalks, dates, PINs, ~%s candidates)\n", s_fp);
 
+    /* Phase 0: try PDF metadata-derived passwords (Author, Title, etc.) */
+    {
+        char **meta_words = NULL;
+        int meta_count = extract_metadata_seeds(g_pdf_path, &meta_words);
+        if (meta_count > 0) {
+            fprintf(stderr, "  Phase 0: metadata seeds (%d)...\n", meta_count);
+            for (int i = 0; i < meta_count && !atomic_load(&g_found); i++) {
+                if (test_password_fast(meta_words[i])) {
+                    if (!atomic_exchange(&g_found, 1))
+                        strncpy(g_password, meta_words[i], MAX_PASS_LEN);
+                    for (int j = 0; j < meta_count; j++) free(meta_words[j]);
+                    free(meta_words);
+                    return 1;
+                }
+                atomic_fetch_add(&g_tested, 1);
+            }
+            for (int i = 0; i < meta_count; i++) free(meta_words[i]);
+        }
+        free(meta_words);
+    }
+    if (atomic_load(&g_found)) return 1;
+
     /* Phase 1: try common passwords directly (single-threaded, small list) */
     fprintf(stderr, "  Phase 1: common passwords (%d)...\n", n_common);
     for (int i = 0; g_fingerprint_passwords[i] && !atomic_load(&g_found); i++) {
@@ -5329,6 +5451,82 @@ static PasswordHints interactive_interview(void)
 }
 
 /* ================================================================
+ * PDF metadata extraction — extract Author/Title/Subject as seed words
+ * ================================================================ */
+static int extract_metadata_seeds(const char *pdf_path, char ***words_out)
+{
+    CFStringRef s = CFStringCreateWithCString(NULL, pdf_path, kCFStringEncodingUTF8);
+    CFURLRef url  = CFURLCreateWithFileSystemPath(NULL, s, kCFURLPOSIXPathStyle, 0);
+    CFRelease(s);
+    CGPDFDocumentRef doc = CGPDFDocumentCreateWithURL(url);
+    CFRelease(url);
+    if (!doc) return 0;
+
+    /* Try to unlock with empty password to access metadata */
+    CGPDFDocumentUnlockWithPassword(doc, "");
+
+    CGPDFDictionaryRef info = CGPDFDocumentGetInfo(doc);
+    if (!info) { CGPDFDocumentRelease(doc); return 0; }
+
+    const char *keys[] = { "Title", "Author", "Subject", "Keywords", "Creator" };
+    char **seeds = malloc(sizeof(char *) * 256);
+    int count = 0;
+
+    for (int k = 0; k < 5 && count < 250; k++) {
+        CGPDFStringRef val = NULL;
+        if (!CGPDFDictionaryGetString(info, keys[k], &val) || !val) continue;
+
+        CFStringRef cfstr = CGPDFStringCopyTextString(val);
+        if (!cfstr) continue;
+
+        char buf[256];
+        if (!CFStringGetCString(cfstr, buf, sizeof(buf), kCFStringEncodingUTF8)) {
+            CFRelease(cfstr);
+            continue;
+        }
+        CFRelease(cfstr);
+
+        /* Add the full value */
+        if (strlen(buf) > 0 && strlen(buf) <= MAX_PASS_LEN) {
+            seeds[count++] = strdup(buf);
+        }
+
+        /* Split on spaces, commas, semicolons and add individual tokens */
+        char tmp[256];
+        strncpy(tmp, buf, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+        char *tok = strtok(tmp, " ,;-_.");
+        while (tok && count < 250) {
+            if (strlen(tok) >= 2 && strlen(tok) <= MAX_PASS_LEN)
+                seeds[count++] = strdup(tok);
+            tok = strtok(NULL, " ,;-_.");
+        }
+
+        /* Add lowercase variant */
+        char lower[256];
+        strncpy(lower, buf, sizeof(lower) - 1);
+        lower[sizeof(lower) - 1] = '\0';
+        for (char *c = lower; *c; c++) *c = (char)tolower((unsigned char)*c);
+        if (strlen(lower) > 0 && strlen(lower) <= MAX_PASS_LEN)
+            seeds[count++] = strdup(lower);
+
+        /* Add no-spaces variant */
+        char nospace[256];
+        int j = 0;
+        for (int i = 0; buf[i] && j < 255; i++) {
+            if (buf[i] != ' ') nospace[j++] = buf[i];
+        }
+        nospace[j] = '\0';
+        if (j > 0 && j <= MAX_PASS_LEN && strcmp(nospace, buf) != 0)
+            seeds[count++] = strdup(nospace);
+    }
+
+    CGPDFDocumentRelease(doc);
+    *words_out = seeds;
+    return count;
+}
+
+/* ================================================================
  * Usage
  * ================================================================ */
 static void usage(const char *p)
@@ -5397,7 +5595,8 @@ static void usage(const char *p)
         "  --dates                     date-based password attack (MMDDYYYY, YYYYMMDD, etc.)\n"
         "  --date-range YYYY-YYYY      year range for --dates (default: 1940-2026)\n"
         "  --mutate                    smart mutations of dict words (use with -d)\n"
-        "  --leet                      l33tspeak substitutions of dict words (use with -d)\n",
+        "  --leet                      l33tspeak substitutions of dict words (use with -d)\n"
+        "  --metadata-seeds            extract PDF Author/Title/Subject as seed passwords\n",
         p, p, p, p, p, p, p);
     exit(1);
 }
@@ -5410,6 +5609,7 @@ int main(int argc, char *argv[])
     const char *pdf_path  = NULL;
     const char *dict_path = NULL;
     const char *charset   = DEFAULT_CHARSET;
+    int         charset_explicit = 0;
     const char *mask_str  = NULL;
     int         brute     = 0;
     int         max_len   = 4;
@@ -5457,6 +5657,7 @@ int main(int argc, char *argv[])
         {"date-range",       required_argument, NULL, 0x118},
         {"mutate",           no_argument,       NULL, 0x119},
         {"leet",             no_argument,       NULL, 0x11A},
+        {"metadata-seeds",   no_argument,       NULL, 0x11B},
         {NULL, 0, NULL, 0}
     };
 
@@ -5468,7 +5669,7 @@ int main(int argc, char *argv[])
             case 'd': dict_path   = optarg;       break;
             case 'b': brute       = 1;            break;
             case 'l': max_len     = safe_atoi(optarg, 1, 127, "-l"); break;
-            case 'c': charset     = optarg;       break;
+            case 'c': charset     = optarg; charset_explicit = 1; break;
             case 't': nthreads    = safe_atoi(optarg, 1, 256, "-t"); break;
             case 'G': no_gpu      = 1;            break;
             case 'r': resume      = 1;            break;
@@ -5539,6 +5740,7 @@ int main(int argc, char *argv[])
             }
             case 0x119: g_mutate_mode      = 1;            break;
             case 0x11A: g_leet_mode        = 1;            break;
+            case 0x11B: g_metadata_seeds   = 1;            break;
             default:  usage(argv[0]);
         }
     }
@@ -5812,11 +6014,19 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* When resuming, peek at checkpoint to determine mode before validation */
-    if (resume && !brute && !dict_path && !g_mask_mode && !g_auto_mode) {
+    /* When resuming, peek at checkpoint to determine mode and restore state */
+    if (resume) {
         ckpt_make_path(pdf_path);
         Checkpoint peek = ckpt_load();
         if (peek.valid) {
+            /* Restore charset from checkpoint if not specified on command line */
+            if (peek.charset[0] && !charset_explicit) {
+                static char restored_charset[256];
+                strncpy(restored_charset, peek.charset, sizeof(restored_charset) - 1);
+                charset = restored_charset;
+            }
+            /* Auto-detect mode if not specified on command line */
+            if (!brute && !dict_path && !g_mask_mode && !g_auto_mode) {
             if (peek.attack_mode == ATTACK_BRUTE) brute = 1;
             else if (peek.attack_mode == ATTACK_MASK) {
                 g_mask_mode = 1;
@@ -5828,6 +6038,7 @@ int main(int argc, char *argv[])
             } else if (peek.attack_mode == ATTACK_AUTO) g_auto_mode = 1;
             else if (peek.attack_mode == ATTACK_RULE) g_rule_mode = 1;
             else if (peek.attack_mode == ATTACK_HYBRID) g_hybrid_mode = 1;
+            }
         }
     }
 
@@ -5875,6 +6086,10 @@ int main(int argc, char *argv[])
 
     g_charset  = charset;
     g_cs_len   = (int)strlen(charset);
+    if (brute && g_cs_len == 0) {
+        fprintf(stderr, "Error: charset is empty\n");
+        return 1;
+    }
     g_nthreads = nthreads;
 
     /* Load Markov model if specified */
@@ -6157,11 +6372,15 @@ int main(int argc, char *argv[])
                                 g_r6_ctx ? gpu_r6_dict_worker : g_sha256_ctx ? gpu_sha256_dict_worker : gpu_dict_worker, NULL);
                 }
                 int limit = nthreads < (int)g_nwords ? nthreads : (int)g_nwords;
+                void *(*dict_fn)(void *) = dict_worker;
+#ifdef __ARM_NEON
+                if (g_use_neon && g_fast_crypto) dict_fn = dict_worker_neon;
+#endif
                 for (int t = 0; t < limit; t++) {
                     DictArg *a = malloc(sizeof(DictArg));
                     a->id = t;
                     a->use_shared = g_use_gpu;
-                    pthread_create(&threads[spawned++], NULL, dict_worker, a);
+                    pthread_create(&threads[spawned++], NULL, dict_fn, a);
                 }
                 for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
             }
@@ -6894,6 +7113,30 @@ int main(int argc, char *argv[])
             pthread_join(prog, NULL);
             return 1;
         }
+
+        /* Inject PDF metadata as seed words if requested */
+        if (g_metadata_seeds) {
+            char **meta_words = NULL;
+            int meta_count = extract_metadata_seeds(pdf_path, &meta_words);
+            if (meta_count > 0) {
+                /* Prepend metadata seeds to wordlist (checked first) */
+                long new_total = g_nwords + meta_count;
+                char **merged = malloc(sizeof(char *) * (size_t)new_total);
+                if (merged) {
+                    for (int i = 0; i < meta_count; i++)
+                        merged[i] = meta_words[i];
+                    for (long i = 0; i < g_nwords; i++)
+                        merged[meta_count + i] = g_words[i];
+                    free(g_words);
+                    g_words = merged;
+                    g_nwords = new_total;
+                    fprintf(stderr, "Metadata: added %d seed words from PDF metadata\n",
+                            meta_count);
+                }
+            }
+            free(meta_words);
+        }
+
         long dict_start = (resume && ck.valid &&
                           (ck.attack_mode == ATTACK_DICT || !ck.is_brute))
                           ? ck.dict_idx : 0;
@@ -6909,11 +7152,15 @@ int main(int argc, char *argv[])
         }
 
         int limit = nthreads < (int)g_nwords ? nthreads : (int)g_nwords;
+        void *(*dict_fn)(void *) = dict_worker;
+#ifdef __ARM_NEON
+        if (g_use_neon && g_fast_crypto) dict_fn = dict_worker_neon;
+#endif
         for (int t = 0; t < limit; t++) {
             DictArg *a = malloc(sizeof(DictArg));
             a->id = t;
             a->use_shared = g_use_gpu;
-            pthread_create(&threads[spawned++], NULL, dict_worker, a);
+            pthread_create(&threads[spawned++], NULL, dict_fn, a);
         }
         for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
 

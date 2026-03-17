@@ -317,6 +317,32 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# --- 34. Metadata seeds (no crash with --metadata-seeds) ---
+echo "test123" > "$TMPDIR/dict_meta.txt"
+run_test "Metadata seeds" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_meta.txt" --metadata-seeds --no-pot
+
+# --- 35. Checkpoint charset restore ---
+echo "checkpoint charset restore test..."
+rm -f test_r4_aes128.ckpt
+timeout 2 $PDFCRACK -f test_r4_aes128.pdf -b -l 7 -c "aepstuvwxyz" --no-pot >/dev/null 2>/dev/null || true
+sleep 1
+if [ -f test_r4_aes128.ckpt ]; then
+    # Resume WITHOUT specifying -c — charset should be restored from checkpoint
+    output=$(timeout 60 $PDFCRACK -f test_r4_aes128.pdf -b -l 7 --no-pot -r 2>&1) || true
+    if echo "$output" | grep -qF "aepstuvwxyz"; then
+        echo "  [PASS] Checkpoint charset restore"
+        PASS=$((PASS + 1))
+    else
+        echo "  [FAIL] Checkpoint charset restore (charset not restored)"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo "  [FAIL] Checkpoint charset restore (no checkpoint)"
+    FAIL=$((FAIL + 1))
+fi
+rm -f test_r4_aes128.ckpt
+
 echo ""
 echo "=== Summary ==="
 echo "Total: $PASS passed, $FAIL failed"
