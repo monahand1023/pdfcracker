@@ -3057,6 +3057,20 @@ static void *gpu_dict_worker(void *arg)
             pending_handle = NULL;
             if (n > 0)
                 verify_keys_rc4(keys[pending_buf], pw_ptrs[pending_buf], n, key_bytes);
+            /* Reverse mode: try reversed versions via scalar fallback */
+            if (g_reverse_mode && !atomic_load_explicit(&g_found, memory_order_relaxed)) {
+                for (int i = 0; i < pending_count; i++) {
+                    char rev[MAX_PASS_LEN + 1];
+                    size_t wlen = strlen(pw_ptrs[pending_buf][i]);
+                    if (wlen > 0 && wlen <= MAX_PASS_LEN) {
+                        reverse_string(pw_ptrs[pending_buf][i], rev, wlen);
+                        if (strcmp(rev, pw_ptrs[pending_buf][i]) != 0 && test_password_fast(rev)) {
+                            if (!atomic_exchange(&g_found, 1))
+                                strncpy(g_password, rev, MAX_PASS_LEN);
+                        }
+                    }
+                }
+            }
             atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
@@ -3071,6 +3085,20 @@ static void *gpu_dict_worker(void *arg)
                                            pending_count, keys[pending_buf]);
         if (n > 0)
             verify_keys_rc4(keys[pending_buf], pw_ptrs[pending_buf], n, key_bytes);
+        /* Reverse mode: try reversed versions via scalar fallback */
+        if (g_reverse_mode && !atomic_load_explicit(&g_found, memory_order_relaxed)) {
+            for (int i = 0; i < pending_count; i++) {
+                char rev[MAX_PASS_LEN + 1];
+                size_t wlen = strlen(pw_ptrs[pending_buf][i]);
+                if (wlen > 0 && wlen <= MAX_PASS_LEN) {
+                    reverse_string(pw_ptrs[pending_buf][i], rev, wlen);
+                    if (strcmp(rev, pw_ptrs[pending_buf][i]) != 0 && test_password_fast(rev)) {
+                        if (!atomic_exchange(&g_found, 1))
+                            strncpy(g_password, rev, MAX_PASS_LEN);
+                    }
+                }
+            }
+        }
         atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
