@@ -1076,10 +1076,6 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
         for (int i = 0; i < 4; i++) {
             uint8_t encrypted[16];
             rc4_encrypt_16(keys[i], key_bytes, base_hash, encrypted);
-
-            /* Early first-byte exit: skip 19 RC4 passes if first byte wrong */
-            if (encrypted[0] != params->u_value[0]) continue;
-
             rc4_multi_pass_16(keys[i], key_bytes, encrypted, 1, 19, 1);
 
             if (memcmp(encrypted, params->u_value, 16) == 0)

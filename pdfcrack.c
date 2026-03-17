@@ -2898,9 +2898,6 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
             uint8_t encrypted[16];
             rc4_encrypt_16(key, key_bytes, base_hash, encrypted);
 
-            /* Early first-byte exit: skip 19 RC4 passes if mismatch */
-            if (encrypted[0] != g_enc_params.u_value[0]) continue;
-
             for (int r = 1; r <= 19; r++) {
                 uint8_t mod_key[16];
                 for (int j = 0; j < key_bytes; j++)
