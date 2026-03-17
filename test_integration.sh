@@ -343,6 +343,39 @@ else
 fi
 rm -f test_r4_aes128.ckpt
 
+# --- 36. Smart attack ---
+run_test "Smart attack" "test123" \
+    $PDFCRACK -f test_encrypted.pdf --smart --no-pot
+
+# --- 37. Smart attack with dict (reversed word) ---
+echo "321tset" > "$TMPDIR/dict_smart_rev.txt"
+run_test "Smart attack with dict (reversed word)" "test123" \
+    $PDFCRACK -f test_encrypted.pdf --smart -d "$TMPDIR/dict_smart_rev.txt" --no-pot
+
+# --- 38. Reverse dict attack ---
+echo "321tset" > "$TMPDIR/dict_reverse.txt"
+run_test "Reverse dict attack" "test123" \
+    $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_reverse.txt" --reverse --no-pot
+
+# --- 39. Pattern attack (runs without crash) ---
+run_test "Pattern attack (no crash)" "Password not found" \
+    $PDFCRACK -f test_encrypted.pdf --pattern --no-pot
+
+# --- 40. Reverse requires dict validation ---
+output=$($PDFCRACK -f test_encrypted.pdf --reverse --no-pot 2>&1) || true
+if echo "$output" | grep -qiE "requires.*-d|wordlist"; then
+    echo "  [PASS] Reverse requires dict validation"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] Reverse requires dict validation"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- 41. Smart attack with reversed dict word ---
+echo "seassap" > "$TMPDIR/dict_smart_r4.txt"
+run_test "Smart finds reversed dict word" "passaes" \
+    $PDFCRACK -f test_r4_aes128.pdf --smart -d "$TMPDIR/dict_smart_r4.txt" --no-pot
+
 echo ""
 echo "=== Summary ==="
 echo "Total: $PASS passed, $FAIL failed"

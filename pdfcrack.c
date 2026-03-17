@@ -292,6 +292,17 @@ static int  g_mutate_mode = 0;
 static int  g_leet_mode = 0;
 static int  g_metadata_seeds = 0;
 
+/* -- Smart attack (intelligent multi-phase) ------------------- */
+#define ATTACK_SMART 14
+static int  g_smart_mode = 0;
+
+/* -- Reverse flag for dict mode ------------------------------- */
+static int  g_reverse_mode = 0;
+
+/* -- Pattern attack (common name patterns) -------------------- */
+#define ATTACK_PATTERN 15
+static int  g_pattern_mode = 0;
+
 /* -- Global incremental heap (for resume) --------------------- */
 static IncrHeap *g_incr_heap = NULL;
 
@@ -299,6 +310,9 @@ static IncrHeap *g_incr_heap = NULL;
 static void incr_heap_save(const char *path);
 static int incr_heap_load(const char *path);
 static int extract_metadata_seeds(const char *pdf_path, char ***words_out);
+static int extract_filename_seeds(const char *pdf_path, char ***words_out);
+static int run_smart_attack(int nthreads, pthread_t *threads, int *spawned_out);
+static int run_pattern_attack(int nthreads, pthread_t *threads, int *spawned_out);
 
 /* ── Safe integer parsing with range checking ────────────────── */
 static int safe_atoi(const char *s, int min_val, int max_val, const char *name)
@@ -560,7 +574,8 @@ static void ckpt_save(void)
     /* Save attack mode */
     static const char *mode_names[] = {
         "brute", "dict", "mask", "rule", "hybrid", "auto", "prince", "fingerprint",
-        "combinator", "mask_rule", "incremental", "dates", "mutate", "leet"
+        "combinator", "mask_rule", "incremental", "dates", "mutate", "leet",
+        "smart", "pattern"
     };
     fprintf(f, "attack_mode=%s\n", mode_names[g_attack_mode]);
 
@@ -679,6 +694,10 @@ static Checkpoint ckpt_load(void)
             ck.attack_mode = ATTACK_LEET; ck.is_brute = 0;
         } else if (strncmp(line, "attack_mode=auto", 16) == 0) {
             ck.attack_mode = ATTACK_AUTO;
+        } else if (strncmp(line, "attack_mode=smart", 17) == 0) {
+            ck.attack_mode = ATTACK_SMART; ck.is_brute = 1;
+        } else if (strncmp(line, "attack_mode=pattern", 19) == 0) {
+            ck.attack_mode = ATTACK_PATTERN; ck.is_brute = 0;
         } else if (strncmp(line, "charset=", 8) == 0) {
             strncpy(ck.charset, line + 8, sizeof(ck.charset) - 1);
         } else if (strncmp(line, "current_len=", 12) == 0) {
@@ -923,6 +942,16 @@ static void *progress_thread(void *arg)
 }
 
 /* ================================================================
+ * Reverse string helper (for --reverse mode)
+ * ================================================================ */
+static void reverse_string(const char *src, char *dst, size_t len)
+{
+    for (size_t i = 0; i < len; i++)
+        dst[i] = src[len - 1 - i];
+    dst[len] = '\0';
+}
+
+/* ================================================================
  * Dictionary attack
  * ================================================================ */
 typedef struct { int id; int use_shared; } DictArg;
@@ -968,6 +997,21 @@ static void *dict_worker(void *arg)
                     if (!atomic_exchange(&g_found, 1))
                         strncpy(g_password, g_words[i], MAX_PASS_LEN);
                 }
+                if (!hit && g_reverse_mode) {
+                    char rev[MAX_PASS_LEN + 1];
+                    size_t wlen = strlen(g_words[i]);
+                    if (wlen > 0 && wlen <= MAX_PASS_LEN) {
+                        reverse_string(g_words[i], rev, wlen);
+                        if (strcmp(rev, g_words[i]) != 0) {
+                            hit = g_fast_crypto ? test_password_fast(rev)
+                                                : test_password_cg(doc, rev);
+                            if (hit) {
+                                if (!atomic_exchange(&g_found, 1))
+                                    strncpy(g_password, rev, MAX_PASS_LEN);
+                            }
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -986,6 +1030,21 @@ static void *dict_worker(void *arg)
             if (hit) {
                 if (!atomic_exchange(&g_found, 1))
                     strncpy(g_password, g_words[i], MAX_PASS_LEN);
+            }
+            if (!hit && g_reverse_mode) {
+                char rev[MAX_PASS_LEN + 1];
+                size_t wlen = strlen(g_words[i]);
+                if (wlen > 0 && wlen <= MAX_PASS_LEN) {
+                    reverse_string(g_words[i], rev, wlen);
+                    if (strcmp(rev, g_words[i]) != 0) {
+                        hit = g_fast_crypto ? test_password_fast(rev)
+                                            : test_password_cg(doc, rev);
+                        if (hit) {
+                            if (!atomic_exchange(&g_found, 1))
+                                strncpy(g_password, rev, MAX_PASS_LEN);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1067,6 +1126,20 @@ static void *dict_worker_neon(void *arg)
                     }
                 }
             }
+            /* Reverse mode: try reversed versions of non-hit words */
+            if (!hits && g_reverse_mode) {
+                for (int b = 0; b < 4; b++) {
+                    char rev[MAX_PASS_LEN + 1];
+                    size_t wlen = (size_t)pwlen[b];
+                    if (wlen > 0 && wlen <= MAX_PASS_LEN) {
+                        reverse_string(pw[b], rev, wlen);
+                        if (strcmp(rev, pw[b]) != 0 && test_password_fast(rev)) {
+                            if (!atomic_exchange(&g_found, 1))
+                                strncpy(g_password, rev, MAX_PASS_LEN);
+                        }
+                    }
+                }
+            }
         }
         /* Handle remaining 1-3 words with scalar path */
         for (; i < chunk_end; i++) {
@@ -1082,6 +1155,16 @@ static void *dict_worker_neon(void *arg)
             if (test_password_fast(g_words[i])) {
                 if (!atomic_exchange(&g_found, 1))
                     strncpy(g_password, g_words[i], MAX_PASS_LEN);
+            } else if (g_reverse_mode) {
+                char rev[MAX_PASS_LEN + 1];
+                size_t wlen = strlen(g_words[i]);
+                if (wlen > 0 && wlen <= MAX_PASS_LEN) {
+                    reverse_string(g_words[i], rev, wlen);
+                    if (strcmp(rev, g_words[i]) != 0 && test_password_fast(rev)) {
+                        if (!atomic_exchange(&g_found, 1))
+                            strncpy(g_password, rev, MAX_PASS_LEN);
+                    }
+                }
             }
         }
     }
@@ -5527,6 +5610,474 @@ static int extract_metadata_seeds(const char *pdf_path, char ***words_out)
 }
 
 /* ================================================================
+ * Filename seed extraction — extract words from PDF filename
+ * ================================================================ */
+static int extract_filename_seeds(const char *pdf_path, char ***words_out)
+{
+    /* Get basename */
+    const char *base = strrchr(pdf_path, '/');
+    base = base ? base + 1 : pdf_path;
+
+    char name[256];
+    strncpy(name, base, sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
+
+    /* Strip .pdf extension */
+    size_t nlen = strlen(name);
+    if (nlen > 4 && strcasecmp(name + nlen - 4, ".pdf") == 0)
+        name[nlen - 4] = '\0';
+
+    char **seeds = malloc(sizeof(char *) * 64);
+    int count = 0;
+    if (!seeds) { *words_out = NULL; return 0; }
+
+    /* Add full filename (without extension) */
+    if (strlen(name) > 0 && strlen(name) <= MAX_PASS_LEN)
+        seeds[count++] = strdup(name);
+
+    /* Split on common delimiters */
+    char tmp[256];
+    strncpy(tmp, name, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    char *tok = strtok(tmp, " _-.,()[]{}");
+    while (tok && count < 56) {
+        size_t tlen = strlen(tok);
+        if (tlen >= 2 && tlen <= MAX_PASS_LEN) {
+            seeds[count++] = strdup(tok);
+            /* Lowercase variant */
+            char lower[MAX_PASS_LEN + 1];
+            for (size_t i = 0; i <= tlen; i++)
+                lower[i] = (char)tolower((unsigned char)tok[i]);
+            if (strcmp(lower, tok) != 0)
+                seeds[count++] = strdup(lower);
+        }
+        tok = strtok(NULL, " _-.,()[]{}");
+    }
+
+    *words_out = seeds;
+    return count;
+}
+
+/* ================================================================
+ * Common first names for pattern attack
+ * ================================================================ */
+static const char *g_common_names[] = {
+    "james","mary","john","patricia","robert","jennifer","michael","linda",
+    "david","elizabeth","william","barbara","richard","susan","joseph","jessica",
+    "thomas","sarah","christopher","karen","charles","lisa","daniel","nancy",
+    "matthew","betty","anthony","margaret","mark","sandra","donald","ashley",
+    "steven","kimberly","paul","emily","andrew","donna","joshua","michelle",
+    "kenneth","carol","kevin","amanda","brian","dorothy","george","melissa",
+    "timothy","deborah","ronald","stephanie","edward","rebecca","jason","sharon",
+    "jeffrey","laura","ryan","cynthia","jacob","kathleen","gary","amy",
+    "nicholas","angela","eric","shirley","jonathan","anna","stephen","brenda",
+    "larry","pamela","justin","emma","scott","nicole","brandon","helen",
+    "benjamin","samantha","samuel","katherine","raymond","christine","gregory","debra",
+    "frank","rachel","alexander","carolyn","patrick","janet","jack","catherine",
+    "dennis","maria","jerry","heather","tyler","diane","aaron","ruth",
+    "jose","julie","adam","olivia","nathan","joyce","henry","virginia",
+    "peter","victoria","zachary","kelly","douglas","lauren","harold","christina",
+    "carl","joan","arthur","evelyn","gerald","judith","roger","megan",
+    "keith","andrea","jeremy","cheryl","terry","hannah","sean","jacqueline",
+    "austin","martha","albert","gloria","jesse","teresa","willie","ann",
+    "christian","sara","bruce","madison","jordan","frances","ralph","kathryn",
+    "roy","janice","eugene","jean","randy","abigail","philip","alice",
+    "harry","judy","vincent","sophia","bobby","grace","dylan","denise",
+    "billy","amber","joe","howard","carlos","marilyn","russell","beverly",
+    "alan","theresa","wayne","natalie","elijah","diana",
+    NULL
+};
+
+/* ================================================================
+ * Smart attack: intelligent multi-phase attack
+ *
+ * Analyzes PDF metadata/filename, generates targeted candidates,
+ * then falls through progressively broader strategies.
+ * ================================================================ */
+static int run_smart_attack(int nthreads, pthread_t *threads, int *spawned_out)
+{
+    fprintf(stderr, "Mode   : smart (intelligent multi-phase attack)\n");
+
+    /* Collect all seed words from metadata + filename */
+    char **meta_seeds = NULL, **file_seeds = NULL;
+    int meta_count = extract_metadata_seeds(g_pdf_path, &meta_seeds);
+    int file_count = extract_filename_seeds(g_pdf_path, &file_seeds);
+    int total_seeds = meta_count + file_count;
+
+    /* Merge seeds into one array */
+    char **all_seeds = malloc(sizeof(char *) * (size_t)(total_seeds + 1));
+    int seed_count = 0;
+    if (all_seeds) {
+        for (int i = 0; i < meta_count; i++) all_seeds[seed_count++] = meta_seeds[i];
+        for (int i = 0; i < file_count; i++) all_seeds[seed_count++] = file_seeds[i];
+    }
+    free(meta_seeds);
+    free(file_seeds);
+
+    /* ── Phase 0: Metadata + filename seeds (direct) ────────── */
+    if (seed_count > 0) {
+        fprintf(stderr, "  Phase 0: metadata + filename seeds (%d candidates)...\n", seed_count);
+        for (int i = 0; i < seed_count && !atomic_load(&g_found); i++) {
+            if (test_password_fast(all_seeds[i])) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, all_seeds[i], MAX_PASS_LEN);
+                goto smart_done;
+            }
+            atomic_fetch_add(&g_tested, 1);
+        }
+    }
+
+    /* ── Phase 1: Common passwords ──────────────────────────── */
+    if (!atomic_load(&g_found)) {
+        int n_common = 0;
+        for (int i = 0; g_fingerprint_passwords[i]; i++) n_common++;
+        fprintf(stderr, "  Phase 1: common passwords (%d)...\n", n_common);
+        for (int i = 0; g_fingerprint_passwords[i] && !atomic_load(&g_found); i++) {
+            if (test_password_fast(g_fingerprint_passwords[i])) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, g_fingerprint_passwords[i], MAX_PASS_LEN);
+                goto smart_done;
+            }
+            atomic_fetch_add(&g_tested, 1);
+        }
+    }
+
+    /* ── Phase 2: Metadata/filename mutations ───────────────── */
+    if (!atomic_load(&g_found) && seed_count > 0) {
+        fprintf(stderr, "  Phase 2: seed mutations (%d seeds x ~100 mutations)...\n", seed_count);
+        char pw[MAX_PASS_LEN + 1];
+        for (int s = 0; s < seed_count && !atomic_load(&g_found); s++) {
+            const char *seed = all_seeds[s];
+            size_t slen = strlen(seed);
+            if (slen == 0 || slen > MAX_PASS_LEN - 4) continue;
+
+            /* Variants: original, capitalized, reversed */
+            char variants[3][MAX_PASS_LEN + 1];
+            int nvariants = 0;
+
+            strncpy(variants[nvariants++], seed, MAX_PASS_LEN);
+
+            /* Capitalized */
+            strncpy(variants[nvariants], seed, MAX_PASS_LEN);
+            variants[nvariants][0] = (char)toupper((unsigned char)variants[nvariants][0]);
+            if (strcmp(variants[nvariants], seed) != 0) nvariants++;
+
+            /* Reversed */
+            reverse_string(seed, variants[nvariants], slen);
+            if (strcmp(variants[nvariants], seed) != 0) nvariants++;
+
+            for (int v = 0; v < nvariants && !atomic_load(&g_found); v++) {
+                const char *base = variants[v];
+                size_t blen = strlen(base);
+
+                /* base + digit 0-9 */
+                for (int d = 0; d <= 9 && !atomic_load(&g_found); d++) {
+                    snprintf(pw, sizeof(pw), "%s%d", base, d);
+                    if (test_password_fast(pw)) {
+                        if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN);
+                        goto smart_done;
+                    }
+                    atomic_fetch_add(&g_tested, 1);
+                }
+                /* base + year 2000-2026 */
+                for (int y = 2000; y <= 2026 && !atomic_load(&g_found); y++) {
+                    if (blen + 4 > MAX_PASS_LEN) break;
+                    snprintf(pw, sizeof(pw), "%s%d", base, y);
+                    if (test_password_fast(pw)) {
+                        if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN);
+                        goto smart_done;
+                    }
+                    atomic_fetch_add(&g_tested, 1);
+                }
+                /* base + common suffixes */
+                static const char *suffixes[] = { "!", "@", "#", "123", "1234", "!", "1", "12", NULL };
+                for (int i = 0; suffixes[i] && !atomic_load(&g_found); i++) {
+                    if (blen + strlen(suffixes[i]) > MAX_PASS_LEN) continue;
+                    snprintf(pw, sizeof(pw), "%s%s", base, suffixes[i]);
+                    if (test_password_fast(pw)) {
+                        if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN);
+                        goto smart_done;
+                    }
+                    atomic_fetch_add(&g_tested, 1);
+                }
+            }
+        }
+    }
+
+    /* ── Phase 3: Keyboard walks ────────────────────────────── */
+    if (!atomic_load(&g_found)) {
+        fprintf(stderr, "  Phase 3: keyboard walks...\n");
+        typedef char KWEntry[MAX_PASS_LEN + 1];
+        KWEntry *kw_walks = malloc(50000 * sizeof(KWEntry));
+        if (kw_walks) {
+            int nwalks = keywalk_generate(kw_walks, 50000);
+            for (int i = 0; i < nwalks && !atomic_load(&g_found); i++) {
+                if (test_password_fast(kw_walks[i])) {
+                    if (!atomic_exchange(&g_found, 1))
+                        strncpy(g_password, kw_walks[i], MAX_PASS_LEN);
+                    free(kw_walks);
+                    goto smart_done;
+                }
+                atomic_fetch_add(&g_tested, 1);
+            }
+            free(kw_walks);
+        }
+    }
+
+    /* ── Phase 4: Date patterns ─────────────────────────────── */
+    if (!atomic_load(&g_found)) {
+        fprintf(stderr, "  Phase 4: date patterns (1950-2026)...\n");
+        char datepw[16];
+        for (int y = 2026; y >= 1950 && !atomic_load(&g_found); y--) {
+            for (int m = 1; m <= 12 && !atomic_load(&g_found); m++) {
+                int dim = 31;
+                if (m == 2) dim = (y % 4 == 0) ? 29 : 28;
+                else if (m == 4 || m == 6 || m == 9 || m == 11) dim = 30;
+                for (int d = 1; d <= dim && !atomic_load(&g_found); d++) {
+                    snprintf(datepw, sizeof(datepw), "%04d%02d%02d", y, m, d);
+                    if (test_password_fast(datepw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN); goto smart_done; }
+                    snprintf(datepw, sizeof(datepw), "%02d%02d%04d", m, d, y);
+                    if (test_password_fast(datepw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN); goto smart_done; }
+                    snprintf(datepw, sizeof(datepw), "%02d%02d%04d", d, m, y);
+                    if (test_password_fast(datepw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN); goto smart_done; }
+                    snprintf(datepw, sizeof(datepw), "%02d%02d", m, d);
+                    if (test_password_fast(datepw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN); goto smart_done; }
+                    atomic_fetch_add(&g_tested, 4);
+                }
+            }
+            snprintf(datepw, sizeof(datepw), "%04d", y);
+            if (test_password_fast(datepw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN); goto smart_done; }
+            atomic_fetch_add(&g_tested, 1);
+        }
+    }
+
+    /* ── Phase 5: Reversed dictionary (if -d provided) ──────── */
+    if (!atomic_load(&g_found) && g_words && g_nwords > 0) {
+        fprintf(stderr, "  Phase 5: reversed dictionary words (%ld)...\n", g_nwords);
+        char rev[MAX_PASS_LEN + 1];
+        for (long i = 0; i < g_nwords && !atomic_load(&g_found); i++) {
+            size_t wlen = strlen(g_words[i]);
+            if (wlen > 0 && wlen <= MAX_PASS_LEN) {
+                reverse_string(g_words[i], rev, wlen);
+                if (strcmp(rev, g_words[i]) != 0 && test_password_fast(rev)) {
+                    if (!atomic_exchange(&g_found, 1))
+                        strncpy(g_password, rev, MAX_PASS_LEN);
+                    goto smart_done;
+                }
+            }
+            atomic_fetch_add(&g_tested, 1);
+        }
+    }
+
+    /* ── Phase 6: Common name + year/digit patterns ─────────── */
+    if (!atomic_load(&g_found)) {
+        int n_names = 0;
+        for (int i = 0; g_common_names[i]; i++) n_names++;
+        long pattern_est = (long)n_names * (27 + 10 + 3) * 2;
+        char num_buf[16];
+        fmt_num(pattern_est, num_buf, sizeof(num_buf));
+        fprintf(stderr, "  Phase 6: name patterns (%d names, ~%s candidates)...\n",
+                n_names, num_buf);
+        char pw[MAX_PASS_LEN + 1];
+        for (int i = 0; g_common_names[i] && !atomic_load(&g_found); i++) {
+            const char *name = g_common_names[i];
+            size_t nlen = strlen(name);
+
+            /* Capitalized variant */
+            char cap[MAX_PASS_LEN + 1];
+            strncpy(cap, name, MAX_PASS_LEN);
+            cap[0] = (char)toupper((unsigned char)cap[0]);
+
+            /* name + year, Name + year */
+            for (int y = 2000; y <= 2026 && !atomic_load(&g_found); y++) {
+                snprintf(pw, sizeof(pw), "%s%d", name, y);
+                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
+                snprintf(pw, sizeof(pw), "%s%d", cap, y);
+                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
+                atomic_fetch_add(&g_tested, 2);
+            }
+            /* name + digit, Name + digit */
+            for (int d = 0; d <= 9 && !atomic_load(&g_found); d++) {
+                snprintf(pw, sizeof(pw), "%s%d", name, d);
+                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
+                snprintf(pw, sizeof(pw), "%s%d", cap, d);
+                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
+                atomic_fetch_add(&g_tested, 2);
+            }
+            /* Name + symbol */
+            if (nlen + 1 <= MAX_PASS_LEN) {
+                snprintf(pw, sizeof(pw), "%s!", cap);
+                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
+                snprintf(pw, sizeof(pw), "%s@", cap);
+                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
+                snprintf(pw, sizeof(pw), "%s#", cap);
+                if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); goto smart_done; }
+                atomic_fetch_add(&g_tested, 3);
+            }
+        }
+    }
+
+    /* ── Phase 7: PIN brute-force 1-8 digits ────────────────── */
+    if (!atomic_load(&g_found)) {
+        fprintf(stderr, "  Phase 7: digit-only brute-force (1-8 chars)...\n");
+        const char *saved_cs = g_charset;
+        int saved_cs_len = g_cs_len;
+        void (*saved_fn)(long, int, char *) = g_idx_to_pass;
+        g_charset = "0123456789";
+        g_cs_len = 10;
+        g_idx_to_pass = index_to_pass;
+
+        for (int len = 1; len <= 8 && !atomic_load(&g_found); len++) {
+            long total = 1;
+            for (int i = 0; i < len; i++) total *= 10;
+            atomic_store(&g_tested, 0);
+            atomic_store(&g_total, total);
+            atomic_store(&g_next_idx, 0);
+            int sp = 0;
+            void *(*worker_fn)(void *) = brute_worker;
+#ifdef __ARM_NEON
+            if (g_use_neon) worker_fn = brute_worker_neon;
+#endif
+            for (int t = 0; t < nthreads; t++) {
+                BruteArg *a = malloc(sizeof(BruteArg));
+                *a = (BruteArg){ .id = t, .length = len,
+                                 .start = 0, .end = total, .use_shared = 1 };
+                pthread_create(&threads[sp++], NULL, worker_fn, a);
+            }
+            for (int t = 0; t < sp; t++) pthread_join(threads[t], NULL);
+        }
+        g_charset = saved_cs;
+        g_cs_len = saved_cs_len;
+        g_idx_to_pass = saved_fn;
+    }
+
+    /* ── Phase 8: Alpha-lowercase brute-force 1-6 ──────────── */
+    if (!atomic_load(&g_found)) {
+        fprintf(stderr, "  Phase 8: lowercase alpha brute-force (1-6 chars)...\n");
+        const char *saved_cs = g_charset;
+        int saved_cs_len = g_cs_len;
+        void (*saved_fn)(long, int, char *) = g_idx_to_pass;
+        g_charset = "abcdefghijklmnopqrstuvwxyz";
+        g_cs_len = 26;
+        g_idx_to_pass = index_to_pass;
+
+        for (int len = 1; len <= 6 && !atomic_load(&g_found); len++) {
+            long total = 1;
+            for (int i = 0; i < len; i++) total *= 26;
+            atomic_store(&g_tested, 0);
+            atomic_store(&g_total, total);
+            atomic_store(&g_next_idx, 0);
+            int sp = 0;
+            void *(*worker_fn)(void *) = brute_worker;
+#ifdef __ARM_NEON
+            if (g_use_neon) worker_fn = brute_worker_neon;
+#endif
+            for (int t = 0; t < nthreads; t++) {
+                BruteArg *a = malloc(sizeof(BruteArg));
+                *a = (BruteArg){ .id = t, .length = len,
+                                 .start = 0, .end = total, .use_shared = 1 };
+                pthread_create(&threads[sp++], NULL, worker_fn, a);
+            }
+            for (int t = 0; t < sp; t++) pthread_join(threads[t], NULL);
+        }
+        g_charset = saved_cs;
+        g_cs_len = saved_cs_len;
+        g_idx_to_pass = saved_fn;
+    }
+
+smart_done:
+    for (int i = 0; i < seed_count; i++) free(all_seeds[i]);
+    free(all_seeds);
+    *spawned_out = 0;
+    return atomic_load(&g_found) ? 1 : 0;
+}
+
+/* ================================================================
+ * Pattern attack: structured name-based password patterns
+ *
+ * Generates candidates from common first names + years/digits/symbols.
+ * No wordlist needed — uses built-in name database.
+ * ================================================================ */
+static int run_pattern_attack(int nthreads, pthread_t *threads, int *spawned_out)
+{
+    int n_names = 0;
+    for (int i = 0; g_common_names[i]; i++) n_names++;
+
+    /* Estimate: per name: 27 years * 2 + 10 digits * 2 + 1000 nums + 3 symbols = ~1077 */
+    long pattern_total = (long)n_names * 1077 + 400; /* +400 for name+name combos */
+    char nbuf[32];
+    fmt_num(pattern_total, nbuf, sizeof(nbuf));
+    fprintf(stderr, "Mode   : pattern (%d names, ~%s candidates)\n\n", n_names, nbuf);
+
+    atomic_store(&g_tested, 0);
+    atomic_store(&g_total, pattern_total);
+
+    char pw[MAX_PASS_LEN + 1];
+
+    for (int i = 0; g_common_names[i] && !atomic_load(&g_found); i++) {
+        const char *name = g_common_names[i];
+        size_t nlen = strlen(name);
+        char cap[MAX_PASS_LEN + 1];
+        strncpy(cap, name, MAX_PASS_LEN);
+        cap[0] = (char)toupper((unsigned char)cap[0]);
+
+        /* name + year, Name + year (1990-2026) */
+        for (int y = 1990; y <= 2026 && !atomic_load(&g_found); y++) {
+            snprintf(pw, sizeof(pw), "%s%d", name, y);
+            if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); break; }
+            snprintf(pw, sizeof(pw), "%s%d", cap, y);
+            if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); break; }
+            atomic_fetch_add(&g_tested, 2);
+        }
+        if (atomic_load(&g_found)) break;
+
+        /* name + 0..999, Name + 0..999 */
+        for (int d = 0; d <= 999 && !atomic_load(&g_found); d++) {
+            snprintf(pw, sizeof(pw), "%s%d", name, d);
+            if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); break; }
+            atomic_fetch_add(&g_tested, 1);
+        }
+        if (atomic_load(&g_found)) break;
+
+        /* Name + symbol */
+        if (nlen + 1 <= MAX_PASS_LEN) {
+            static const char *syms[] = { "!", "@", "#", "$", "123", "1234", NULL };
+            for (int s = 0; syms[s] && !atomic_load(&g_found); s++) {
+                if (nlen + strlen(syms[s]) <= MAX_PASS_LEN) {
+                    snprintf(pw, sizeof(pw), "%s%s", cap, syms[s]);
+                    if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); break; }
+                    atomic_fetch_add(&g_tested, 1);
+                }
+            }
+        }
+    }
+
+    /* Top 20 name+name combos */
+    if (!atomic_load(&g_found)) {
+        int combo_limit = n_names < 20 ? n_names : 20;
+        for (int i = 0; i < combo_limit && !atomic_load(&g_found); i++) {
+            for (int j = 0; j < combo_limit && !atomic_load(&g_found); j++) {
+                if (i == j) continue;
+                size_t l1 = strlen(g_common_names[i]);
+                size_t l2 = strlen(g_common_names[j]);
+                if (l1 + l2 <= MAX_PASS_LEN) {
+                    snprintf(pw, sizeof(pw), "%s%s", g_common_names[i], g_common_names[j]);
+                    if (test_password_fast(pw)) {
+                        if (!atomic_exchange(&g_found, 1))
+                            strncpy(g_password, pw, MAX_PASS_LEN);
+                        break;
+                    }
+                    atomic_fetch_add(&g_tested, 1);
+                }
+            }
+        }
+    }
+
+    *spawned_out = 0;
+    return atomic_load(&g_found) ? 1 : 0;
+}
+
+/* ================================================================
  * Usage
  * ================================================================ */
 static void usage(const char *p)
@@ -5540,6 +6091,8 @@ static void usage(const char *p)
         "  %s -f <pdf> -d <wordlist> -H <sufflen>   hybrid dict+suffix\n"
         "  %s -f <pdf> -A -d <wordlist> [-b] [-l N] auto mode (chains attacks)\n"
         "  %s -f <pdf> -B                           benchmark mode\n"
+        "  %s -f <pdf> --smart [-d <wordlist>]      intelligent multi-phase attack\n"
+        "  %s -f <pdf> --pattern                    name-based pattern attack\n"
         "\nOptions:\n"
         "  -f  PDF file\n"
         "  -d  wordlist (one password per line)\n"
@@ -5596,8 +6149,11 @@ static void usage(const char *p)
         "  --date-range YYYY-YYYY      year range for --dates (default: 1940-2026)\n"
         "  --mutate                    smart mutations of dict words (use with -d)\n"
         "  --leet                      l33tspeak substitutions of dict words (use with -d)\n"
-        "  --metadata-seeds            extract PDF Author/Title/Subject as seed passwords\n",
-        p, p, p, p, p, p, p);
+        "  --metadata-seeds            extract PDF Author/Title/Subject as seed passwords\n"
+        "  --smart                     intelligent multi-phase attack (metadata, patterns, PINs, brute)\n"
+        "  --reverse                   also try reversed words in dictionary mode (use with -d)\n"
+        "  --pattern                   pattern attack using common names + years/digits/symbols\n",
+        p, p, p, p, p, p, p, p, p);
     exit(1);
 }
 
@@ -5658,6 +6214,9 @@ int main(int argc, char *argv[])
         {"mutate",           no_argument,       NULL, 0x119},
         {"leet",             no_argument,       NULL, 0x11A},
         {"metadata-seeds",   no_argument,       NULL, 0x11B},
+        {"smart",            no_argument,       NULL, 0x11C},
+        {"reverse",          no_argument,       NULL, 0x11D},
+        {"pattern",          no_argument,       NULL, 0x11E},
         {NULL, 0, NULL, 0}
     };
 
@@ -5741,6 +6300,9 @@ int main(int argc, char *argv[])
             case 0x119: g_mutate_mode      = 1;            break;
             case 0x11A: g_leet_mode        = 1;            break;
             case 0x11B: g_metadata_seeds   = 1;            break;
+            case 0x11C: g_smart_mode      = 1;            break;
+            case 0x11D: g_reverse_mode    = 1;            break;
+            case 0x11E: g_pattern_mode    = 1;            break;
             default:  usage(argv[0]);
         }
     }
@@ -6057,12 +6619,16 @@ int main(int argc, char *argv[])
     if (!brute && !dict_path && !g_mask_mode && !g_benchmark_mode &&
         !g_auto_mode && !g_prince_mode && !g_fingerprint_mode &&
         !g_incremental_mode && !g_dates_mode && !g_mutate_mode &&
-        !g_leet_mode && !resume) {
-        fprintf(stderr, "-d, -b, -m, -A, -B, --prince, --fingerprint, --incremental, --dates, --mutate, or --leet required\n");
+        !g_leet_mode && !g_smart_mode && !g_pattern_mode && !resume) {
+        fprintf(stderr, "-d, -b, -m, -A, -B, --prince, --fingerprint, --incremental, --dates, --mutate, --leet, --smart, or --pattern required\n");
         usage(argv[0]);
     }
     if ((g_mutate_mode || g_leet_mode) && !dict_path) {
         fprintf(stderr, "--mutate and --leet require -d <wordlist>\n");
+        usage(argv[0]);
+    }
+    if (g_reverse_mode && !dict_path) {
+        fprintf(stderr, "--reverse requires -d <wordlist>\n");
         usage(argv[0]);
     }
     if (nthreads > MAX_THREADS) nthreads = MAX_THREADS;
@@ -6931,6 +7497,40 @@ int main(int argc, char *argv[])
         run_fingerprint_attack(nthreads, threads, &spawned);
     }
 
+    /* ── Smart attack (intelligent multi-phase) ──────────────── */
+    else if (g_smart_mode) {
+        g_is_brute = 1;
+        g_attack_mode = ATTACK_SMART;
+
+        /* Load wordlist if provided (used in Phase 5: reversed dict) */
+        if (dict_path && !g_words) {
+            load_wordlist(dict_path);
+        }
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, 0); /* unknown total — multi-phase */
+
+        run_smart_attack(nthreads, threads, &spawned);
+
+        if (g_words) {
+            for (long i = 0; i < g_nwords; i++) free(g_words[i]);
+            free(g_words);
+            g_words = NULL;
+            g_nwords = 0;
+        }
+    }
+
+    /* ── Pattern attack (common name patterns) ───────────────── */
+    else if (g_pattern_mode) {
+        g_is_brute = 0;
+        g_attack_mode = ATTACK_PATTERN;
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, 0);
+
+        run_pattern_attack(nthreads, threads, &spawned);
+    }
+
     /* ── Incremental (Markov probability order) attack ─────────── */
     else if (g_incremental_mode && g_markov) {
         g_is_brute = 1;
@@ -7258,7 +7858,8 @@ auto_done:
     /* Mode name for JSON output */
     static const char *mode_names[] = {
         "brute", "dict", "mask", "rule", "hybrid", "auto", "prince", "fingerprint",
-        "combinator", "mask_rule", "incremental", "dates", "mutate", "leet"
+        "combinator", "mask_rule", "incremental", "dates", "mutate", "leet",
+        "smart", "pattern"
     };
     const char *cur_mode_name = (g_attack_mode >= 0 && g_attack_mode <= 13)
                                 ? mode_names[g_attack_mode] : "unknown";
