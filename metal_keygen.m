@@ -190,6 +190,7 @@ int metal_keygen_batch(MetalKeygenContext *ctx,
 
         memset(pw_data, 0, (size_t)count * PW_PACKED_LEN);
         for (int i = 0; i < count; i++) {
+            if (!passwords[i]) { len_data[i] = 0; continue; }
             size_t plen = strlen(passwords[i]);
             if (plen > PW_PACKED_LEN) plen = PW_PACKED_LEN;
             memcpy(pw_data + i * PW_PACKED_LEN, passwords[i], plen);
@@ -227,6 +228,78 @@ int metal_keygen_batch(MetalKeygenContext *ctx,
 
         /* Copy keys out */
         uint8_t *gpu_keys = (uint8_t *)[ctx->keys_buf[buf] contents];
+        memcpy(keys_out, gpu_keys, (size_t)count * ctx->key_bytes);
+
+        return count;
+    }
+}
+
+/* ── Async batch submission (non-blocking) ─────────────────────── */
+
+void *metal_keygen_submit_async(MetalKeygenContext *ctx,
+                                 const char **passwords, int count)
+{
+    if (!ctx || count <= 0) return NULL;
+    if (count > ctx->max_batch) count = ctx->max_batch;
+
+    @autoreleasepool {
+        int buf = ctx->current_buf;
+        ctx->current_buf ^= 1;
+
+        uint8_t *pw_data  = (uint8_t *)[ctx->pw_buf[buf] contents];
+        uint8_t *len_data = (uint8_t *)[ctx->len_buf[buf] contents];
+
+        memset(pw_data, 0, (size_t)count * PW_PACKED_LEN);
+        for (int i = 0; i < count; i++) {
+            if (!passwords[i]) { len_data[i] = 0; continue; }
+            size_t plen = strlen(passwords[i]);
+            if (plen > PW_PACKED_LEN) plen = PW_PACKED_LEN;
+            memcpy(pw_data + i * PW_PACKED_LEN, passwords[i], plen);
+            len_data[i] = (uint8_t)plen;
+        }
+
+        id<MTLCommandBuffer> cmdBuf = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+
+        [encoder setComputePipelineState:ctx->pipeline];
+        [encoder setBuffer:ctx->pw_buf[buf]   offset:0 atIndex:0];
+        [encoder setBuffer:ctx->len_buf[buf]  offset:0 atIndex:1];
+        [encoder setBuffer:ctx->params_buf    offset:0 atIndex:2];
+        [encoder setBuffer:ctx->keys_buf[buf] offset:0 atIndex:3];
+
+        NSUInteger threadWidth = ctx->pipeline.maxTotalThreadsPerThreadgroup;
+        if (threadWidth > 256) threadWidth = 256;
+        MTLSize gridSize  = MTLSizeMake((NSUInteger)count, 1, 1);
+        MTLSize groupSize = MTLSizeMake(threadWidth, 1, 1);
+
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
+        [encoder endEncoding];
+
+        [cmdBuf commit];
+
+        return (__bridge_retained void *)cmdBuf;
+    }
+}
+
+int metal_keygen_wait_results(MetalKeygenContext *ctx, void *handle,
+                               int count, uint8_t *keys_out)
+{
+    if (!ctx || !handle) return 0;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuf = (__bridge_transfer id<MTLCommandBuffer>)handle;
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.error) {
+            fprintf(stderr, "Metal keygen async: compute error: %s\n",
+                    [[cmdBuf.error localizedDescription] UTF8String]);
+            return 0;
+        }
+
+        /* Results are in the OTHER buffer (we toggled current_buf in submit) */
+        int results_buf = ctx->current_buf ^ 1;
+
+        uint8_t *gpu_keys = (uint8_t *)[ctx->keys_buf[results_buf] contents];
         memcpy(keys_out, gpu_keys, (size_t)count * ctx->key_bytes);
 
         return count;

@@ -52,6 +52,20 @@ int metal_keygen_key_bytes(MetalKeygenContext *ctx);
 double metal_keygen_benchmark(MetalKeygenContext *ctx, int bench_count);
 
 /*
+ * Submit a batch asynchronously (non-blocking).
+ * Returns an opaque handle for later waiting via metal_keygen_wait_results.
+ */
+void *metal_keygen_submit_async(MetalKeygenContext *ctx,
+                                 const char **passwords, int count);
+
+/*
+ * Wait for an async keygen batch to complete and copy keys.
+ * Returns count on success, 0 on error.
+ */
+int metal_keygen_wait_results(MetalKeygenContext *ctx, void *handle,
+                               int count, uint8_t *keys_out);
+
+/*
  * Free all Metal resources.
  */
 void metal_keygen_free(MetalKeygenContext *ctx);

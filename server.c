@@ -148,6 +148,9 @@ static int g_web_port = 0;
 /* Server binary directory (for serving files over HTTP) */
 static char g_server_dir[PATH_MAX] = ".";
 
+/* Optional HTTP auth token */
+static char g_auth_token[256] = {0};
+
 /* Start time (monotonic, for elapsed calculation) */
 static double g_start_time = 0;
 
@@ -758,9 +761,35 @@ static void http_serve_dashboard(int fd)
     write(fd, html, body_len);
 }
 
+/* Check HTTP auth token in query string. Returns 1 if OK, 0 if denied. */
+static int http_check_auth(const char *path)
+{
+    if (!g_auth_token[0]) return 1;  /* no token configured */
+    const char *q = strchr(path, '?');
+    if (!q) return 0;
+    q++;  /* skip '?' */
+    /* Look for token=<value> in query string */
+    const char *p = q;
+    while (*p) {
+        if (strncmp(p, "token=", 6) == 0) {
+            p += 6;
+            const char *end = strchr(p, '&');
+            size_t tlen = end ? (size_t)(end - p) : strlen(p);
+            if (tlen == strlen(g_auth_token) && memcmp(p, g_auth_token, tlen) == 0)
+                return 1;
+            return 0;
+        }
+        const char *amp = strchr(p, '&');
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return 0;
+}
+
 static void handle_http_request(int fd, const char *request_line)
 {
-    /* Parse "GET /path HTTP/1.x" — extract path between first / and next space */
+    /* Parse "GET /path HTTP/1.x" — extract full path+query between first / and next space */
+    char full_path[512] = {0};
     char path[256] = {0};
     {
         const char *start = strchr(request_line, '/');
@@ -769,9 +798,15 @@ static void handle_http_request(int fd, const char *request_line)
             const char *end = strchr(start, ' ');
             if (!end) end = start + strlen(start);
             size_t len = (size_t)(end - start);
-            if (len >= sizeof(path)) len = sizeof(path) - 1;
-            memcpy(path, start, len);
-            path[len] = '\0';
+            if (len >= sizeof(full_path)) len = sizeof(full_path) - 1;
+            memcpy(full_path, start, len);
+            full_path[len] = '\0';
+            /* Strip query string for path matching */
+            const char *qmark = strchr(full_path, '?');
+            size_t plen = qmark ? (size_t)(qmark - full_path) : len;
+            if (plen >= sizeof(path)) plen = sizeof(path) - 1;
+            memcpy(path, full_path, plen);
+            path[plen] = '\0';
         }
     }
 
@@ -779,6 +814,12 @@ static void handle_http_request(int fd, const char *request_line)
     char hdr[MAX_LINE];
     while (sock_readline(fd, hdr, sizeof(hdr)) > 0) {
         if (hdr[0] == '\0' || hdr[0] == '\r') break;
+    }
+
+    /* Auth check — exempt join.sh (bootstrap entry point) */
+    if (strcmp(path, "join.sh") != 0 && !http_check_auth(full_path)) {
+        dprintf(fd, "HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        return;
     }
 
     /* GET / — serve the dashboard */
@@ -934,6 +975,7 @@ static void *client_handler(void *arg)
     ci->active   = 1;
     ci->slot_free = 0;
     strncpy(ci->ip_str, ip_str, INET_ADDRSTRLEN);
+    ci->ip_str[INET_ADDRSTRLEN - 1] = '\0';
     ci->last_seen = mono_time();
     ci->current_lease_id = 0;
     pthread_mutex_unlock(&g_clients_lock);
@@ -986,7 +1028,9 @@ static void *client_handler(void *arg)
             /* Compute speed and adaptive chunk size */
             if (elapsed > 0.1 && tested > 0) {
                 ci->speed = (double)tested / elapsed;
-                long new_size = (long)(ci->speed * TARGET_SECS);
+                double raw_size = ci->speed * TARGET_SECS;
+                if (raw_size > (double)MAX_CHUNK_BRUTE) raw_size = (double)MAX_CHUNK_BRUTE;
+                long new_size = (long)raw_size;
                 if (g_brute) {
                     if (g_pdf_revision == 6) {
                         if (new_size < MIN_CHUNK_BRUTE_R6) new_size = MIN_CHUNK_BRUTE_R6;
@@ -1022,7 +1066,7 @@ static void *client_handler(void *arg)
             long out_start = 0, out_end = 0, out_dict_start = 0, out_dict_count = 0;
             uint64_t lid = 0;
             int retries = 0;
-            while (retries < 3) {
+            while (retries < 30) {
                 lid = assign_work(ci, &is_brute, &out_len,
                                   &out_start, &out_end,
                                   &out_dict_start, &out_dict_count,
@@ -1043,7 +1087,7 @@ static void *client_handler(void *arg)
 
                 /* Active leases exist — wait for possible requeue */
                 retries++;
-                struct timespec wait_ts = {2, 0};
+                struct timespec wait_ts = {0, 200000000};  /* 200ms */
                 nanosleep(&wait_ts, NULL);
             }
 
@@ -1931,7 +1975,8 @@ static void usage(const char *p)
         "  %s -f <pdf> -b [-l <maxlen>] [-c <charset>] [-p <port>]  brute-force\n"
         "  %s -f <pdf> ... -R <ckpt_file>                       restore\n"
         "\nOptions:\n"
-        "  --web-port N   Start web dashboard on port N (default: disabled)\n"
+        "  --web-port N        Start web dashboard on port N (default: disabled)\n"
+        "  --auth-token SECRET Require ?token=SECRET on HTTP endpoints\n"
         "\nStarts cracking locally and listens for remote workers.\n"
         "Other Macs can join with:\n"
         "  bash /tmp/join.sh user@<this-ip> [port]\n",
@@ -1973,14 +2018,19 @@ int main(int argc, char *argv[])
     int         freq_mode_flag = 0;
     int         auto_mode_flag = 0;
 
-    /* Manual long option parsing for --web-port */
+    /* Manual long option parsing for --web-port and --auth-token */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--web-port") == 0 && i + 1 < argc) {
             g_web_port = atoi(argv[i + 1]);
-            /* Remove these two args so getopt doesn't choke */
             for (int j = i; j + 2 < argc; j++) argv[j] = argv[j + 2];
             argc -= 2;
-            i--;  /* re-check this position */
+            i--;
+        } else if (strcmp(argv[i], "--auth-token") == 0 && i + 1 < argc) {
+            strncpy(g_auth_token, argv[i + 1], sizeof(g_auth_token) - 1);
+            g_auth_token[sizeof(g_auth_token) - 1] = '\0';
+            for (int j = i; j + 2 < argc; j++) argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
         }
     }
 
@@ -2006,6 +2056,9 @@ int main(int argc, char *argv[])
 
     if (!pdf_path)            { fprintf(stderr, "-f required\n");       usage(argv[0]); }
     if (!brute && !dict_path) { fprintf(stderr, "-d or -b required\n"); usage(argv[0]); }
+
+    if (!g_auth_token[0])
+        fprintf(stderr, "WARNING: No --auth-token set; HTTP endpoints are unauthenticated\n");
 
     /* ── Load PDF ──────────────────────────────────────────────── */
     g_pdf_path = pdf_path;

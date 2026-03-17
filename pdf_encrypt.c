@@ -668,6 +668,7 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
         if (extra_len > 0)
             memcpy(seq + pw_len + hash_len, extra, (size_t)extra_len);
 
+        if (seq_len > sizeof(K1) / 64) return;
         size_t K1_len = seq_len * 64;
 
         /* Doubling memcpy: copy seq once, then double the filled region

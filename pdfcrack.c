@@ -540,7 +540,7 @@ static void ckpt_make_path(const char *pdf_path)
         size_t base = (size_t)(dot - pdf_path);
         if (base >= sizeof(g_ckpt_path) - 6) base = sizeof(g_ckpt_path) - 6;
         memcpy(g_ckpt_path, pdf_path, base);
-        strcpy(g_ckpt_path + base, ".ckpt");
+        memcpy(g_ckpt_path + base, ".ckpt", 6);
     } else {
         snprintf(g_ckpt_path, sizeof(g_ckpt_path), "%s.ckpt", pdf_path);
     }
@@ -603,7 +603,7 @@ static void ckpt_save(void)
         fprintf(f, "pdf_path=%s\n", g_pdf_path);
 
     fclose(f);
-    rename(tmp, g_ckpt_path);  /* atomic replace */
+    if (rename(tmp, g_ckpt_path) != 0) perror("checkpoint rename");
 
     /* Also save incremental heap if in incremental mode */
     if (g_attack_mode == ATTACK_INCREMENTAL && g_incr_heap && g_ckpt_path[0]) {
@@ -678,7 +678,7 @@ static Checkpoint ckpt_load(void)
         } else if (strncmp(line, "charset=", 8) == 0) {
             strncpy(ck.charset, line + 8, sizeof(ck.charset) - 1);
         } else if (strncmp(line, "current_len=", 12) == 0) {
-            ck.resume_len = atoi(line + 12);
+            ck.resume_len = safe_atoi(line + 12, 0, 127, "current_len");
         } else if (strncmp(line, "current_idx=", 12) == 0) {
             ck.resume_idx = atol(line + 12);
             ck.dict_idx = ck.resume_idx;
@@ -686,20 +686,22 @@ static Checkpoint ckpt_load(void)
             ck.completed_prior = atol(line + 16);
         } else if (strncmp(line, "prefix=", 7) == 0) {
             strncpy(ck.prefix, line + 7, MAX_PASS_LEN);
+            ck.prefix[MAX_PASS_LEN] = '\0';
         } else if (strncmp(line, "suffix=", 7) == 0) {
             strncpy(ck.suffix, line + 7, MAX_PASS_LEN);
+            ck.suffix[MAX_PASS_LEN] = '\0';
         } else if (strncmp(line, "mask_pattern=", 13) == 0) {
             strncpy(ck.mask_pattern, line + 13, sizeof(ck.mask_pattern) - 1);
         } else if (strncmp(line, "hybrid_suffix_len=", 18) == 0) {
-            ck.hybrid_suffix_len = atoi(line + 18);
+            ck.hybrid_suffix_len = safe_atoi(line + 18, 0, 32, "hybrid_suffix_len");
         } else if (strncmp(line, "hybrid_mask=", 12) == 0) {
             strncpy(ck.hybrid_mask, line + 12, sizeof(ck.hybrid_mask) - 1);
         } else if (strncmp(line, "auto_phase=", 11) == 0) {
-            ck.auto_phase = atoi(line + 11);
+            ck.auto_phase = safe_atoi(line + 11, 0, 20, "auto_phase");
         } else if (strncmp(line, "freq_mode=", 10) == 0) {
-            ck.freq_mode = atoi(line + 10);
+            ck.freq_mode = safe_atoi(line + 10, 0, 1, "freq_mode");
         } else if (strncmp(line, "password_mode=", 14) == 0) {
-            ck.password_mode = atoi(line + 14);
+            ck.password_mode = safe_atoi(line + 14, 0, 2, "password_mode");
         } else if (strncmp(line, "custom_charset_", 15) == 0 &&
                    line[15] >= '1' && line[15] <= '4' && line[16] == '=') {
             int ci = line[15] - '1';
@@ -1611,7 +1613,7 @@ static void pot_init(void)
     if (!home) home = "/tmp";
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s/.pdfcracker", home);
-    mkdir(dir, 0755);
+    if (mkdir(dir, 0700) == -1 && errno != EEXIST) { perror(dir); return; }
     snprintf(g_pot_path, sizeof(g_pot_path), "%s/pdfcracker.pot", dir);
 }
 
@@ -1629,7 +1631,7 @@ static void pot_compute_hash(const PDFEncryptParams *p, char *hex_out)
     uint8_t hash[32];
     CC_SHA256_Final(hash, &ctx);
     for (int i = 0; i < 32; i++)
-        sprintf(hex_out + i * 2, "%02x", hash[i]);
+        snprintf(hex_out + i * 2, 3, "%02x", hash[i]);
     hex_out[64] = '\0';
 }
 
@@ -2614,6 +2616,18 @@ static void select_best_engine(int nthreads)
 static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
                            int count, int key_bytes)
 {
+    /* For R3/R4: MD5(padding+fileID) is identical for all passwords.
+     * Compute once before the loop to avoid redundant MD5 calls. */
+    uint8_t base_hash[16];
+    if (g_enc_params.revision >= 3) {
+        CC_MD5_CTX md5;
+        CC_MD5_Init(&md5);
+        CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, 32);
+        CC_MD5_Update(&md5, g_enc_params.file_id,
+                      (CC_LONG)g_enc_params.file_id_len);
+        CC_MD5_Final(base_hash, &md5);
+    }
+
     for (int i = 0; i < count; i++) {
         const uint8_t *key = keys + i * key_bytes;
         int user_match = 0;
@@ -2629,20 +2643,13 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
             if (memcmp(computed_u, g_enc_params.u_value, 32) == 0)
                 user_match = 1;
         } else {
-            /* Algorithm 5: MD5(padding+fileID), 20 RC4 passes, compare 16 bytes */
-            CC_MD5_CTX md5;
-            CC_MD5_Init(&md5);
-            CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, 32);
-            CC_MD5_Update(&md5, g_enc_params.file_id,
-                          (CC_LONG)g_enc_params.file_id_len);
-            uint8_t hash[16];
-            CC_MD5_Final(hash, &md5);
-
+            /* Algorithm 5: RC4 with pre-computed MD5(padding+fileID),
+             * 20 RC4 passes, compare 16 bytes */
             uint8_t encrypted[16];
             size_t out_len = 16;
             CCCrypt(kCCEncrypt, kCCAlgorithmRC4, 0,
                     key, (size_t)key_bytes, NULL,
-                    hash, 16, encrypted, 16, &out_len);
+                    base_hash, 16, encrypted, 16, &out_len);
 
             for (int r = 1; r <= 19; r++) {
                 uint8_t mod_key[16];
@@ -2695,11 +2702,21 @@ static void *gpu_brute_worker(void *arg)
     GPUBruteArg *a = (GPUBruteArg *)arg;
     int key_bytes = metal_keygen_key_bytes(g_gpu_ctx);
 
-    const char **pw_ptrs = malloc(sizeof(char *) * GPU_BATCH_SIZE);
-    char *pw_storage = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN + 1));
-    uint8_t *keys = malloc((size_t)GPU_BATCH_SIZE * key_bytes);
+    /* Double-buffered password arrays for pipelining */
+    const char **pw_ptrs[2];
+    char *pw_storage[2];
+    uint8_t *keys[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        pw_storage[b] = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN + 1));
+        keys[b] = malloc((size_t)GPU_BATCH_SIZE * key_bytes);
+        if (!pw_ptrs[b] || !pw_storage[b] || !keys[b]) goto done;
+    }
 
-    if (!pw_ptrs || !pw_storage || !keys) goto done;
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
@@ -2708,27 +2725,45 @@ static void *gpu_brute_worker(void *arg)
         if (end > a->total) end = a->total;
         int count = (int)(end - start);
 
-        /* Generate password strings */
+        /* Generate password strings on CPU while GPU processes previous batch */
         for (int i = 0; i < count; i++) {
-            char *pw = pw_storage + i * (MAX_PASS_LEN + 1);
+            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
             g_idx_to_pass(start + i, a->length, pw);
-            pw_ptrs[i] = pw;
+            pw_ptrs[cur_buf][i] = pw;
         }
 
-        /* GPU: MD5 key derivation */
-        int n = metal_keygen_batch(g_gpu_ctx, pw_ptrs, count, keys);
-        if (n <= 0) break;
+        /* Wait for previous GPU batch and verify on CPU */
+        if (pending_handle) {
+            int n = metal_keygen_wait_results(g_gpu_ctx, pending_handle,
+                                               pending_count, keys[pending_buf]);
+            pending_handle = NULL;
+            if (n > 0)
+                verify_keys_rc4(keys[pending_buf], pw_ptrs[pending_buf], n, key_bytes);
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
 
-        /* CPU: RC4 verification */
-        verify_keys_rc4(keys, pw_ptrs, n, key_bytes);
+        /* Submit current batch to GPU (non-blocking) */
+        pending_handle = metal_keygen_submit_async(g_gpu_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
 
-        atomic_fetch_add_explicit(&g_tested, (long)n, memory_order_relaxed);
+    /* Drain last pending batch */
+    if (pending_handle) {
+        int n = metal_keygen_wait_results(g_gpu_ctx, pending_handle,
+                                           pending_count, keys[pending_buf]);
+        if (n > 0)
+            verify_keys_rc4(keys[pending_buf], pw_ptrs[pending_buf], n, key_bytes);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
 done:
-    free(pw_ptrs);
-    free(pw_storage);
-    free(keys);
+    for (int b = 0; b < 2; b++) {
+        free(pw_ptrs[b]);
+        free(pw_storage[b]);
+        free(keys[b]);
+    }
     free(arg);
     return NULL;
 }
@@ -2742,10 +2777,19 @@ static void *gpu_dict_worker(void *arg)
     (void)arg;
     int key_bytes = metal_keygen_key_bytes(g_gpu_ctx);
 
-    const char **pw_ptrs = malloc(sizeof(char *) * GPU_BATCH_SIZE);
-    uint8_t *keys = malloc((size_t)GPU_BATCH_SIZE * key_bytes);
+    /* Double-buffered for async GPU pipelining */
+    const char **pw_ptrs[2];
+    uint8_t *keys[2];
+    for (int b = 0; b < 2; b++) {
+        pw_ptrs[b] = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+        keys[b] = malloc((size_t)GPU_BATCH_SIZE * key_bytes);
+        if (!pw_ptrs[b] || !keys[b]) goto done;
+    }
 
-    if (!pw_ptrs || !keys) goto done;
+    int cur_buf = 0;
+    void *pending_handle = NULL;
+    int pending_count = 0;
+    int pending_buf = 0;
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
@@ -2755,19 +2799,36 @@ static void *gpu_dict_worker(void *arg)
         int count = (int)(end - start);
 
         for (int i = 0; i < count; i++)
-            pw_ptrs[i] = g_words[start + i];
+            pw_ptrs[cur_buf][i] = g_words[start + i];
 
-        int n = metal_keygen_batch(g_gpu_ctx, (const char **)pw_ptrs, count, keys);
-        if (n <= 0) break;
+        if (pending_handle) {
+            int n = metal_keygen_wait_results(g_gpu_ctx, pending_handle,
+                                               pending_count, keys[pending_buf]);
+            pending_handle = NULL;
+            if (n > 0)
+                verify_keys_rc4(keys[pending_buf], pw_ptrs[pending_buf], n, key_bytes);
+            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
+        }
 
-        verify_keys_rc4(keys, pw_ptrs, n, key_bytes);
+        pending_handle = metal_keygen_submit_async(g_gpu_ctx, pw_ptrs[cur_buf], count);
+        pending_count = count;
+        pending_buf = cur_buf;
+        cur_buf ^= 1;
+    }
 
-        atomic_fetch_add_explicit(&g_tested, (long)n, memory_order_relaxed);
+    if (pending_handle) {
+        int n = metal_keygen_wait_results(g_gpu_ctx, pending_handle,
+                                           pending_count, keys[pending_buf]);
+        if (n > 0)
+            verify_keys_rc4(keys[pending_buf], pw_ptrs[pending_buf], n, key_bytes);
+        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
     }
 
 done:
-    free(pw_ptrs);
-    free(keys);
+    for (int b = 0; b < 2; b++) {
+        free(pw_ptrs[b]);
+        free(keys[b]);
+    }
     free(arg);
     return NULL;
 }
@@ -5229,10 +5290,10 @@ static PasswordHints interactive_interview(void)
     if (buf[0]) {
         char *dash = strchr(buf, '-');
         if (dash) {
-            h.min_len = atoi(buf);
-            h.max_len = atoi(dash + 1);
+            h.min_len = (int)strtol(buf, NULL, 10);
+            h.max_len = (int)strtol(dash + 1, NULL, 10);
         } else {
-            int n = atoi(buf);
+            int n = (int)strtol(buf, NULL, 10);
             if (n > 0) { h.min_len = n; h.max_len = n; }
         }
         if (h.min_len < 1) h.min_len = 1;

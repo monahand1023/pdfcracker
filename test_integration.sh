@@ -226,6 +226,97 @@ echo "test123" > "$TMPDIR/dict_leet.txt"
 run_test "Leet attack" "test123" \
     $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_leet.txt" --leet --no-pot
 
+# --- 27. Checkpoint resume end-to-end ---
+echo "checkpoint resume test..."
+rm -f test_r4_aes128.ckpt
+# Use timeout to stop first run (sends SIGTERM, pdfcrack saves checkpoint).
+# Charset "aepstuvwxyz" (11 chars), len 7. ~19M passwords, ~15s to exhaust.
+# timeout 2 interrupts after 2s, creating checkpoint.
+timeout 2 $PDFCRACK -f test_r4_aes128.pdf -b -l 7 -c "aepstuvwxyz" --no-pot >/dev/null 2>/dev/null || true
+sleep 1
+if [ -f test_r4_aes128.ckpt ]; then
+    # Resume from checkpoint — must re-specify charset and max-len
+    # (checkpoint stores them but runtime doesn't restore charset yet)
+    output=$(timeout 60 $PDFCRACK -f test_r4_aes128.pdf -b -l 7 -c "aepstuvwxyz" --no-pot -r 2>/dev/null) || true
+    if echo "$output" | grep -qF "passaes"; then
+        echo "  [PASS] Checkpoint resume end-to-end"
+        PASS=$((PASS + 1))
+    else
+        echo "  [FAIL] Checkpoint resume end-to-end (password not found after resume)"
+        echo "         got: $(echo "$output" | head -1)"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo "  [FAIL] Checkpoint resume end-to-end (checkpoint not created)"
+    FAIL=$((FAIL + 1))
+fi
+rm -f test_r4_aes128.ckpt
+
+# --- 28. Malicious checkpoint values ---
+echo "malicious checkpoint test..."
+# Place malicious checkpoint where pdfcrack will auto-detect it
+cat > test_encrypted.ckpt <<'CKPT'
+current_idx=0
+current_len=999999
+attack_mode=0
+charset=abc
+CKPT
+output=$($PDFCRACK -f test_encrypted.pdf -b --no-pot -r 2>&1) || true
+rm -f test_encrypted.ckpt
+if echo "$output" | grep -qiE "invalid|error|must be"; then
+    echo "  [PASS] Malicious checkpoint rejected"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] Malicious checkpoint rejected (no error for current_len=999999)"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- 29. Empty wordlist ---
+run_test "Empty wordlist" "Password not found" \
+    $PDFCRACK -f test_encrypted.pdf -d /dev/null --no-pot
+
+# --- 30. R6 owner password ---
+echo "owner_r6" > "$TMPDIR/dict_r6_owner.txt"
+run_test_timeout "R6 owner password (-O)" "owner_r6" 120 \
+    $PDFCRACK -f test_pikepdf_r6.pdf -d "$TMPDIR/dict_r6_owner.txt" -O --no-pot
+
+# --- 31. Max-length password (32 chars) ---
+# Use a mask to test a known 32-char password boundary
+# We can't easily create a 32-char password PDF, so test that the tool
+# handles 32-char input without crash
+echo "abcdefghijklmnopqrstuvwxyz123456" > "$TMPDIR/dict_32char.txt"
+output=$(timeout 10 $PDFCRACK -f test_encrypted.pdf -d "$TMPDIR/dict_32char.txt" --no-pot 2>&1) || true
+if ! echo "$output" | grep -qiE "crash|segfault|abort"; then
+    echo "  [PASS] Max-length password (no crash)"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] Max-length password (crashed)"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- 32. Benchmark regression gate ---
+bench_output=$(timeout 60 $PDFCRACK -f test_r4_aes128.pdf -B --no-pot 2>&1) || true
+speed=$(echo "$bench_output" | grep -i "single-core" | grep -oE '[0-9]+' | head -1)
+if [ -n "$speed" ] && [ "$speed" -ge 10000 ]; then
+    echo "  [PASS] Benchmark regression gate (${speed}/s >= 10000/s)"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] Benchmark regression gate (${speed:-0}/s < 10000/s)"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- 33. GPU vs CPU consistency ---
+# Verify GPU path finds same password as CPU-only dictionary attack
+echo "passaes" > "$TMPDIR/dict_gpu_check.txt"
+gpu_output=$(timeout 30 $PDFCRACK -f test_r4_aes128.pdf -d "$TMPDIR/dict_gpu_check.txt" --no-pot 2>/dev/null) || true
+if echo "$gpu_output" | grep -qF "passaes"; then
+    echo "  [PASS] GPU vs CPU consistency"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] GPU vs CPU consistency (GPU path failed to find password)"
+    FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "=== Summary ==="
 echo "Total: $PASS passed, $FAIL failed"

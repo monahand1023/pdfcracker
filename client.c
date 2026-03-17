@@ -28,6 +28,7 @@
 #include <sys/qos.h>
 #include <mach/mach_time.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <pwd.h>
 #include <dns_sd.h>
 #include <sys/select.h>
@@ -1314,11 +1315,18 @@ static int run_session(const char *host, int port)
         free(pdf_buf); close(fd); g_server_fd = -1; return 1;
     }
 
-    /* Save to temp file */
-    snprintf(g_pdf_path, sizeof(g_pdf_path), "/tmp/pdfcrack_%d.pdf", getpid());
-    FILE *pf = fopen(g_pdf_path, "wb");
+    /* Save to temp file (unpredictable name, restricted permissions) */
+    snprintf(g_pdf_path, sizeof(g_pdf_path), "/tmp/pdfcrack_XXXXXX");
+    int tmpfd = mkstemp(g_pdf_path);
+    if (tmpfd < 0) {
+        perror("mkstemp");
+        free(pdf_buf); close(fd); g_server_fd = -1; return 1;
+    }
+    fchmod(tmpfd, 0600);
+    FILE *pf = fdopen(tmpfd, "wb");
     if (!pf) {
         perror(g_pdf_path);
+        close(tmpfd);
         free(pdf_buf); close(fd); g_server_fd = -1; return 1;
     }
     fwrite(pdf_buf, 1, (size_t)pdf_size, pf);
@@ -1477,12 +1485,19 @@ static int run_session(const char *host, int port)
             }
             g_current_lease_id = lease_id;
 
+            #define MAX_DICT_CHUNK 1000000
+            if (count <= 0 || count > MAX_DICT_CHUNK) {
+                fprintf(stderr, "Bad dict count: %ld\n", count);
+                close(fd); g_server_fd = -1; return 1;
+            }
             char **words = malloc((size_t)count * sizeof(char *));
             if (!words) { perror("malloc"); close(fd); g_server_fd = -1; return 1; }
+            SockBuf sbuf;
+            sockbuf_init(&sbuf, fd);
             long loaded = 0;
             for (long i = 0; i < count; i++) {
                 char word[MAX_PASS_LEN + 4];
-                if (sock_readline(fd, word, sizeof(word)) < 0) break;
+                if (sockbuf_readline(&sbuf, word, sizeof(word)) < 0) break;
                 words[loaded] = strdup(word);
                 if (words[loaded]) loaded++;
             }

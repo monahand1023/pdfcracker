@@ -30,6 +30,7 @@
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -137,6 +138,33 @@ static inline int sock_readline(int fd, char *buf, int maxlen)
     return i;
 }
 
+/* ── Buffered socket reader (reduces syscalls for dict receive) ── */
+typedef struct {
+    int  fd;
+    char buf[4096];
+    int  pos, len;
+} SockBuf;
+
+static inline void sockbuf_init(SockBuf *sb, int fd) {
+    sb->fd = fd; sb->pos = 0; sb->len = 0;
+}
+
+static inline int sockbuf_readline(SockBuf *sb, char *out, int maxlen) {
+    int i = 0;
+    while (i < maxlen - 1) {
+        if (sb->pos >= sb->len) {
+            ssize_t r = read(sb->fd, sb->buf, sizeof(sb->buf));
+            if (r <= 0) return -1;
+            sb->pos = 0; sb->len = (int)r;
+        }
+        char c = sb->buf[sb->pos++];
+        if (c == '\n') break;
+        if (c != '\r') out[i++] = c;
+    }
+    out[i] = '\0';
+    return i;
+}
+
 /* ── Send a formatted text line (appends \n) ──────────────────── */
 static inline int sock_printf(int fd, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
@@ -157,9 +185,10 @@ static inline int sock_printf(int fd, const char *fmt, ...)
 /* ── Brute-force keyspace math ────────────────────────────────── */
 static inline long keyspace_for_length(int len, int cs_len)
 {
+    if (cs_len <= 0) return 0;
     long n = 1;
     for (int i = 0; i < len; i++) {
-        if (n > (long)2e18 / cs_len) return (long)2e18;
+        if (n > LONG_MAX / cs_len) return LONG_MAX;
         n *= cs_len;
     }
     return n;
