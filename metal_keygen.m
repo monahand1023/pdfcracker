@@ -516,6 +516,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  salt[8];
     uint8_t  extra[48];
     uint32_t extra_len;
+    uint32_t max_rounds;
 } PDFR6GPU;
 
 #define R6_MAX_BATCH      8192   /* smaller batches: R6 is very compute-heavy */
@@ -626,6 +627,7 @@ MetalR6Context *metal_r6_init(const PDFEncryptParams *params,
             memcpy(gpu_params.salt, params->u_value + 32, 8);
             gpu_params.extra_len = 0;
         }
+        gpu_params.max_rounds = 200; /* default safety limit */
 
         ctx->params_buf = [device newBufferWithBytes:&gpu_params
                                     length:sizeof(gpu_params)
@@ -637,6 +639,15 @@ MetalR6Context *metal_r6_init(const PDFEncryptParams *params,
                 R6_MAX_BATCH);
 
         return ctx;
+    }
+}
+
+void metal_r6_set_max_rounds(MetalR6Context *ctx, int max_rounds)
+{
+    if (!ctx || max_rounds < 64) return;
+    @autoreleasepool {
+        PDFR6GPU *gpu_params = (PDFR6GPU *)[ctx->params_buf contents];
+        gpu_params->max_rounds = (uint32_t)max_rounds;
     }
 }
 

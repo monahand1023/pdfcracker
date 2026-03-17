@@ -915,6 +915,7 @@ struct PDFR6GPU {
     uchar  salt[8];           /* validation salt (U[32:40] or O[32:40]) */
     uchar  extra[48];         /* extra data: empty for user, U[0:48] for owner */
     uint   extra_len;         /* 0 for user, 48 for owner */
+    uint   max_rounds;        /* safety limit (default 200) */
 };
 
 kernel void pdf_r6_verify(
@@ -1004,8 +1005,8 @@ kernel void pdf_r6_verify(
         if (round >= 64 && last_byte <= uchar(round - 32))
             break;
 
-        /* Safety limit: spec says typically 64-80 rounds */
-        if (round > 200) break;
+        /* Safety limit (configurable via --max-rounds, default 200) */
+        if (round > params.max_rounds) break;
     }
 
     /* Compare first 32 bytes of hash against target */

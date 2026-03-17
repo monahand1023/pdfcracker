@@ -122,6 +122,12 @@ int metal_r6_max_batch(MetalR6Context *ctx);
 void metal_r6_free(MetalR6Context *ctx);
 
 /*
+ * Set max round count for R6 verification (default 200).
+ * Lower values trade a tiny chance of false negatives for speed.
+ */
+void metal_r6_set_max_rounds(MetalR6Context *ctx, int max_rounds);
+
+/*
  * Async R6 pipeline (double-dispatch):
  * Submit a batch without waiting for completion.
  * Returns an opaque handle (command buffer) for later waiting.

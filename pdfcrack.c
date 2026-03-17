@@ -20,6 +20,9 @@
  *   pdfcrack -f file.pdf -d words.txt -H "?d?d?d?s"  # hybrid dict+mask
  *   pdfcrack -f file.pdf -B                          # benchmark mode
  *   pdfcrack -f file.pdf -b -l 6 -F                  # freq-ordered brute
+ *   pdfcrack -f file.pdf -d words.txt --prince        # PRINCE word combos
+ *   pdfcrack -f file.pdf --fingerprint                # smart pattern attack
+ *   pdfcrack -f file.pdf -d words.txt -R --dedup      # rules with dedup
  */
 
 #include <CoreGraphics/CoreGraphics.h>
@@ -173,6 +176,17 @@ static char g_hybrid_mask_str[256] = {0};
 
 /* ── Benchmark mode ──────────────────────────────────────────── */
 static int  g_benchmark_mode = 0;
+
+/* ── PRINCE attack mode ─────────────────────────────────────── */
+#define ATTACK_PRINCE  6
+static int  g_prince_mode = 0;
+
+/* ── Fingerprint (smart) attack mode ────────────────────────── */
+#define ATTACK_FINGERPRINT 7
+static int  g_fingerprint_mode = 0;
+
+/* ── Max rounds for R6 GPU ──────────────────────────────────── */
+static int  g_max_rounds = 200;
 
 /* ── Frequency-ordered charset ───────────────────────────────── */
 #define FREQ_CHARSET \
@@ -447,7 +461,7 @@ static void ckpt_save(void)
 
     /* Save attack mode */
     static const char *mode_names[] = {
-        "brute", "dict", "mask", "rule", "hybrid", "auto"
+        "brute", "dict", "mask", "rule", "hybrid", "auto", "prince", "fingerprint"
     };
     fprintf(f, "attack_mode=%s\n", mode_names[g_attack_mode]);
 
@@ -538,6 +552,10 @@ static Checkpoint ckpt_load(void)
             ck.attack_mode = ATTACK_RULE; ck.is_brute = 0;
         } else if (strncmp(line, "attack_mode=hybrid", 18) == 0) {
             ck.attack_mode = ATTACK_HYBRID; ck.is_brute = 0;
+        } else if (strncmp(line, "attack_mode=prince", 18) == 0) {
+            ck.attack_mode = ATTACK_PRINCE; ck.is_brute = 0;
+        } else if (strncmp(line, "attack_mode=fingerprint", 23) == 0) {
+            ck.attack_mode = ATTACK_FINGERPRINT; ck.is_brute = 1;
         } else if (strncmp(line, "attack_mode=auto", 16) == 0) {
             ck.attack_mode = ATTACK_AUTO;
         } else if (strncmp(line, "charset=", 8) == 0) {
@@ -1146,7 +1164,9 @@ static int load_rules_file(const char *path)
 
     char line[256];
     g_nrules = 0;
+    int line_num = 0, skipped = 0;
     while (fgets(line, sizeof(line), f) && g_nrules < MAX_RULES) {
+        line_num++;
         size_t len = strlen(line);
         while (len && (line[len-1] == '\n' || line[len-1] == '\r'))
             line[--len] = '\0';
@@ -1158,13 +1178,25 @@ static int load_rules_file(const char *path)
         int ok = 1;
         while (*p && r->nops < MAX_OPS_PER_RULE) {
             int consumed = parse_rule_op(p, r);
-            if (consumed <= 0) { ok = 0; break; }
+            if (consumed <= 0) {
+                fprintf(stderr, "  Warning: %s:%d: unknown op '%c' in \"%s\" (skipped)\n",
+                        path, line_num, *p, line);
+                ok = 0;
+                skipped++;
+                break;
+            }
             p += consumed;
         }
         if (ok && r->nops > 0) g_nrules++;
     }
     fclose(f);
-    fprintf(stderr, "Loaded %d rules from %s\n", g_nrules, path);
+    fprintf(stderr, "Loaded %d rules from %s", g_nrules, path);
+    if (skipped) fprintf(stderr, " (%d lines skipped)", skipped);
+    fputc('\n', stderr);
+    if (g_nrules == 0) {
+        fprintf(stderr, "Error: no valid rules found in %s\n", path);
+        return 0;
+    }
     return 1;
 }
 
@@ -1193,6 +1225,40 @@ static void init_rules(void)
     for (int i = 1; i <= 9; i++)
         add_rule_2(RULE_CAPITALIZE, 0, 0, 0,
                    RULE_APPEND_CHAR, (char)('0' + i), 0, 0);
+}
+
+/* Deduplicate rule-generated candidates using a bloom filter.
+ * Returns 1 if the password was already seen (skip), 0 if new. */
+static uint64_t g_rule_bloom[65536]; /* 512KB bloom filter */
+static int      g_rule_dedup = 0;
+
+static inline int rule_dedup_check(const char *pw)
+{
+    if (!g_rule_dedup) return 0;
+    /* FNV-1a hash */
+    uint64_t h1 = 14695981039346656037ULL;
+    for (const char *p = pw; *p; p++) {
+        h1 ^= (uint8_t)*p;
+        h1 *= 1099511628211ULL;
+    }
+    /* Second hash: rotate + xor */
+    uint64_t h2 = h1 ^ (h1 >> 33);
+    h2 *= 0xff51afd7ed558ccdULL;
+
+    unsigned idx1 = (unsigned)(h1 >> 48) & 0xFFFF;
+    unsigned bit1 = (unsigned)(h1 >> 6) & 63;
+    unsigned idx2 = (unsigned)(h2 >> 48) & 0xFFFF;
+    unsigned bit2 = (unsigned)(h2 >> 6) & 63;
+
+    uint64_t mask1 = 1ULL << bit1;
+    uint64_t mask2 = 1ULL << bit2;
+
+    if ((g_rule_bloom[idx1] & mask1) && (g_rule_bloom[idx2] & mask2))
+        return 1; /* probably seen */
+
+    g_rule_bloom[idx1] |= mask1;
+    g_rule_bloom[idx2] |= mask2;
+    return 0;
 }
 
 /* Apply a single rule op in-place on buf[0..len-1]. Returns new length. */
@@ -2014,6 +2080,9 @@ static void *rule_worker(void *arg)
                                           memory_order_relaxed);
                 local_count = 0;
             }
+            /* Skip duplicate candidates */
+            if (rule_dedup_check(pass)) continue;
+
             int hit = g_fast_crypto ? test_password_fast(pass)
                                     : test_password_cg(doc, pass);
             if (hit) {
@@ -2605,6 +2674,203 @@ done:
 /* ================================================================
  * Benchmark mode: measure passwords/second on all engines
  * ================================================================ */
+/* ================================================================
+ * PRINCE attack: combine 2-3 dictionary words
+ * Keyspace: nwords^2 + nwords^3 (2-word and 3-word combos)
+ * ================================================================ */
+static long g_prince_2word_total = 0;
+static long g_prince_total = 0;
+static int  g_prince_max_words = 3;
+
+static void prince_index_to_pass(long idx, char *out)
+{
+    /* Indices [0, nwords^2) → 2-word combos
+     * Indices [nwords^2, nwords^2 + nwords^3) → 3-word combos */
+    int pos = 0;
+    if (idx < g_prince_2word_total) {
+        long w2 = idx % g_nwords;
+        long w1 = idx / g_nwords;
+        const char *s1 = g_words[w1], *s2 = g_words[w2];
+        size_t l1 = strlen(s1), l2 = strlen(s2);
+        if (l1 + l2 <= MAX_PASS_LEN) {
+            memcpy(out, s1, l1);
+            memcpy(out + l1, s2, l2);
+            pos = (int)(l1 + l2);
+        }
+    } else if (g_prince_max_words >= 3) {
+        long rem = idx - g_prince_2word_total;
+        long w3 = rem % g_nwords; rem /= g_nwords;
+        long w2 = rem % g_nwords;
+        long w1 = rem / g_nwords;
+        const char *s1 = g_words[w1], *s2 = g_words[w2], *s3 = g_words[w3];
+        size_t l1 = strlen(s1), l2 = strlen(s2), l3 = strlen(s3);
+        if (l1 + l2 + l3 <= MAX_PASS_LEN) {
+            memcpy(out, s1, l1);
+            memcpy(out + l1, s2, l2);
+            memcpy(out + l1 + l2, s3, l3);
+            pos = (int)(l1 + l2 + l3);
+        }
+    }
+    out[pos] = '\0';
+}
+
+static void *prince_worker(void *arg)
+{
+    (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    long local_count = 0;
+    char pass[MAX_PASS_LEN * 3 + 1];
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+        if (start >= g_prince_total) break;
+        long end = start + CPU_WORK_CHUNK;
+        if (end > g_prince_total) end = g_prince_total;
+
+        for (long idx = start; idx < end && !atomic_load_explicit(&g_found, memory_order_relaxed); idx++) {
+            prince_index_to_pass(idx, pass);
+            if (pass[0] && test_password_fast(pass)) {
+                if (!atomic_exchange(&g_found, 1))
+                    strncpy(g_password, pass, MAX_PASS_LEN);
+                break;
+            }
+            if (++local_count >= TESTED_BATCH) {
+                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+                local_count = 0;
+            }
+        }
+    }
+    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    free(arg);
+    return NULL;
+}
+
+/* ================================================================
+ * Fingerprint attack: try common patterns before brute-force
+ * - Common passwords (password, 123456, etc.)
+ * - Date patterns (MMDDYYYY, YYYYMMDD, DDMMYYYY)
+ * - Keyboard walks (qwerty, asdfgh, etc.)
+ * ================================================================ */
+static const char *g_fingerprint_passwords[] = {
+    /* Top 50 most common passwords */
+    "password", "123456", "12345678", "1234", "qwerty",
+    "12345", "dragon", "passwd", "password1", "abc123",
+    "monkey", "master", "letmein", "login", "princess",
+    "qwerty123", "solo", "1q2w3e", "starwars", "welcome",
+    "admin", "passw0rd", "hello", "charlie", "shadow",
+    "sunshine", "iloveyou", "trustno1", "batman", "access",
+    "football", "jesus", "michael", "ninja", "mustang",
+    "summer", "1234567", "123456789", "1234567890", "000000",
+    "111111", "654321", "test", "password123", "test123",
+    "root", "pass", "changeme", "secret", "P@ssw0rd",
+    /* Common with numbers */
+    "pass1234", "pass123", "password12", "password1234",
+    "qwerty1", "qwerty12", "abc1234", "abcd1234",
+    /* Keyboard patterns */
+    "qwertyuiop", "asdfghjkl", "zxcvbnm", "1qaz2wsx",
+    "qazwsx", "1q2w3e4r", "1q2w3e4r5t", "zaq12wsx",
+    "!@#$%^&*", "1qaz!QAZ",
+    NULL
+};
+
+static int run_fingerprint_attack(int nthreads, pthread_t *threads, int *spawned_out)
+{
+    /* Phase 1: try common passwords directly (single-threaded, small list) */
+    fprintf(stderr, "Mode   : fingerprint — Phase 1: common passwords\n");
+    for (int i = 0; g_fingerprint_passwords[i] && !atomic_load(&g_found); i++) {
+        const char *pw = g_fingerprint_passwords[i];
+        if (test_password_fast(pw)) {
+            if (!atomic_exchange(&g_found, 1))
+                strncpy(g_password, pw, MAX_PASS_LEN);
+            return 1;
+        }
+        atomic_fetch_add(&g_tested, 1);
+    }
+    if (atomic_load(&g_found)) return 1;
+
+    /* Phase 2: date patterns (YYYYMMDD, MMDDYYYY, DDMMYYYY for 1950-2026) */
+    fprintf(stderr, "  Phase 2: date patterns (1950-2026)...\n");
+    char datepw[16];
+    for (int y = 2026; y >= 1950 && !atomic_load(&g_found); y--) {
+        for (int m = 1; m <= 12 && !atomic_load(&g_found); m++) {
+            int days_in_month = 31;
+            if (m == 2) days_in_month = (y % 4 == 0) ? 29 : 28;
+            else if (m == 4 || m == 6 || m == 9 || m == 11) days_in_month = 30;
+            for (int d = 1; d <= days_in_month && !atomic_load(&g_found); d++) {
+                /* YYYYMMDD */
+                snprintf(datepw, sizeof(datepw), "%04d%02d%02d", y, m, d);
+                if (test_password_fast(datepw)) {
+                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN);
+                    return 1;
+                }
+                /* MMDDYYYY */
+                snprintf(datepw, sizeof(datepw), "%02d%02d%04d", m, d, y);
+                if (test_password_fast(datepw)) {
+                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN);
+                    return 1;
+                }
+                /* DDMMYYYY */
+                snprintf(datepw, sizeof(datepw), "%02d%02d%04d", d, m, y);
+                if (test_password_fast(datepw)) {
+                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN);
+                    return 1;
+                }
+                /* Short forms: MMDD, DDMM, YYYY */
+                snprintf(datepw, sizeof(datepw), "%02d%02d", m, d);
+                if (test_password_fast(datepw)) {
+                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN);
+                    return 1;
+                }
+                atomic_fetch_add(&g_tested, 4);
+            }
+        }
+        /* Just the year */
+        snprintf(datepw, sizeof(datepw), "%04d", y);
+        if (test_password_fast(datepw)) {
+            if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN);
+            return 1;
+        }
+        atomic_fetch_add(&g_tested, 1);
+    }
+
+    /* Phase 3: digits brute-force 1-6 (fast, covers PINs) */
+    if (!atomic_load(&g_found)) {
+        fprintf(stderr, "  Phase 3: digit-only brute-force (1-6 chars)...\n");
+        const char *saved_cs = g_charset;
+        int saved_cs_len = g_cs_len;
+        void (*saved_fn)(long, int, char *) = g_idx_to_pass;
+        g_charset = "0123456789";
+        g_cs_len = 10;
+        g_idx_to_pass = index_to_pass;
+
+        for (int len = 1; len <= 6 && !atomic_load(&g_found); len++) {
+            long total = 1;
+            for (int i = 0; i < len; i++) total *= 10;
+            atomic_store(&g_tested, 0);
+            atomic_store(&g_total, total);
+            atomic_store(&g_next_idx, 0);
+            int spawned = 0;
+            void *(*worker_fn)(void *) = brute_worker;
+#ifdef __ARM_NEON
+            if (g_use_neon) worker_fn = brute_worker_neon;
+#endif
+            for (int t = 0; t < nthreads; t++) {
+                BruteArg *a = malloc(sizeof(BruteArg));
+                *a = (BruteArg){ .id = t, .length = len,
+                                 .start = 0, .end = total, .use_shared = 1 };
+                pthread_create(&threads[spawned++], NULL, worker_fn, a);
+            }
+            for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+        }
+        g_charset = saved_cs;
+        g_cs_len = saved_cs_len;
+        g_idx_to_pass = saved_fn;
+    }
+
+    *spawned_out = 0;
+    return atomic_load(&g_found) ? 1 : 0;
+}
+
 static void run_benchmark(int nthreads)
 {
     fprintf(stderr, "\n── Benchmark Mode ─────────────────────────────────\n");
@@ -2973,7 +3239,11 @@ static void usage(const char *p)
         "  --markov-threshold <N>      prune to top-N chars per position\n"
         "  --markov-generate <N>       output top-N candidates from model\n"
         "  --generate-wordlist <pat>   generate wordlist from pattern (e.g. \"Name{1990-2000}\")\n"
-        "  --combine                   merge and dedup wordlists from remaining args\n",
+        "  --combine                   merge and dedup wordlists from remaining args\n"
+        "  --prince                    PRINCE attack: combine 2-3 dictionary words (use with -d)\n"
+        "  --fingerprint               smart attack: common passwords, dates, PINs first\n"
+        "  --max-rounds <N>            R6 GPU max KDF rounds (default 200, min 64)\n"
+        "  --dedup                     skip duplicate candidates in rule-based attacks\n",
         p, p, p, p, p, p, p);
     exit(1);
 }
@@ -3012,6 +3282,10 @@ int main(int argc, char *argv[])
         {"generate-wordlist",required_argument, NULL, 0x103},
         {"combine",          no_argument,       NULL, 0x104},
         {"markov-generate",  required_argument, NULL, 0x105},
+        {"max-rounds",       required_argument, NULL, 0x106},
+        {"prince",           no_argument,       NULL, 0x107},
+        {"fingerprint",      no_argument,       NULL, 0x108},
+        {"dedup",            no_argument,       NULL, 0x109},
         {NULL, 0, NULL, 0}
     };
 
@@ -3061,6 +3335,10 @@ int main(int argc, char *argv[])
             case 0x103: generate_pattern      = optarg; break;
             case 0x104: combine_mode          = 1; break;
             case 0x105: markov_generate_n     = atoi(optarg); break;
+            case 0x106: g_max_rounds         = atoi(optarg); break;
+            case 0x107: g_prince_mode        = 1;            break;
+            case 0x108: g_fingerprint_mode   = 1;            break;
+            case 0x109: g_rule_dedup         = 1;            break;
             default:  usage(argv[0]);
         }
     }
@@ -3335,8 +3613,15 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (!brute && !dict_path && !g_mask_mode && !g_benchmark_mode && !g_auto_mode && !resume) {
-        fprintf(stderr, "-d, -b, -m, -A, or -B required\n");
+    /* --prince requires a wordlist */
+    if (g_prince_mode && !dict_path) {
+        fprintf(stderr, "--prince requires -d <wordlist>\n");
+        usage(argv[0]);
+    }
+
+    if (!brute && !dict_path && !g_mask_mode && !g_benchmark_mode &&
+        !g_auto_mode && !g_prince_mode && !g_fingerprint_mode && !resume) {
+        fprintf(stderr, "-d, -b, -m, -A, -B, --prince, or --fingerprint required\n");
         usage(argv[0]);
     }
     if (nthreads > MAX_THREADS) nthreads = MAX_THREADS;
@@ -3417,8 +3702,11 @@ int main(int argc, char *argv[])
         /* R6: full Algorithm 2.B verification on GPU */
         int check_owner = (g_password_mode == PW_MODE_OWNER) ? 1 : 0;
         g_r6_ctx = metal_r6_init(&g_enc_params, check_owner, NULL);
-        if (g_r6_ctx)
+        if (g_r6_ctx) {
             g_use_gpu = 1;
+            if (g_max_rounds != 200)
+                metal_r6_set_max_rounds(g_r6_ctx, g_max_rounds);
+        }
     } else if (g_fast_crypto && no_gpu && g_enc_params.revision >= 2 &&
                g_enc_params.revision <= 4) {
         /* GPU explicitly disabled — use NEON if available */
@@ -3459,9 +3747,10 @@ int main(int argc, char *argv[])
         ck = ckpt_load();
         if (ck.valid) {
             static const char *mode_labels[] = {
-                "brute-force", "dictionary", "mask", "rule", "hybrid", "auto"
+                "brute-force", "dictionary", "mask", "rule", "hybrid", "auto",
+                "prince", "fingerprint"
             };
-            const char *label = (ck.attack_mode >= 0 && ck.attack_mode <= 5)
+            const char *label = (ck.attack_mode >= 0 && ck.attack_mode <= 7)
                 ? mode_labels[ck.attack_mode] : "unknown";
             fprintf(stderr, "Resume : checkpoint found — %s", label);
 
@@ -3936,6 +4225,59 @@ int main(int argc, char *argv[])
 
         for (long i = 0; i < g_nwords; i++) free(g_words[i]);
         free(g_words);
+    }
+
+    /* ── PRINCE attack (word combinations) ──────────────────────── */
+    else if (g_prince_mode && dict_path) {
+        g_is_brute = 0;
+        g_attack_mode = ATTACK_PRINCE;
+        if (!g_words && !load_wordlist(dict_path)) {
+            atomic_store(&g_found, 1);
+            pthread_join(prog, NULL);
+            return 1;
+        }
+
+        /* Compute keyspace: nwords^2 + nwords^3 */
+        g_prince_2word_total = g_nwords * g_nwords;
+        long prince_3word = g_nwords * g_nwords * g_nwords;
+        /* Overflow check */
+        if (g_nwords > 10000) {
+            g_prince_max_words = 2;
+            prince_3word = 0;
+            fprintf(stderr, "Note: wordlist >10K words, limiting to 2-word combinations\n");
+        }
+        g_prince_total = g_prince_2word_total + prince_3word;
+
+        fprintf(stderr, "Mode   : PRINCE (%ld words, %s combos, keyspace %ld)\n\n",
+                g_nwords,
+                g_prince_max_words >= 3 ? "2+3 word" : "2 word",
+                g_prince_total);
+
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, g_prince_total);
+        atomic_store(&g_next_idx, 0);
+        spawned = 0;
+
+        for (int t = 0; t < nthreads; t++) {
+            void *a = malloc(1);
+            pthread_create(&threads[spawned++], NULL, prince_worker, a);
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+
+        for (long i = 0; i < g_nwords; i++) free(g_words[i]);
+        free(g_words);
+    }
+
+    /* ── Fingerprint attack (smart patterns) ─────────────────── */
+    else if (g_fingerprint_mode) {
+        g_is_brute = 1;
+        g_attack_mode = ATTACK_FINGERPRINT;
+
+        fprintf(stderr, "Mode   : fingerprint (common passwords, dates, PINs)\n\n");
+        atomic_store(&g_tested, 0);
+        atomic_store(&g_total, 0); /* unknown total */
+
+        run_fingerprint_attack(nthreads, threads, &spawned);
     }
 
     /* ── Dictionary attack ─────────────────────────────────────── */
