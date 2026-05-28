@@ -1062,7 +1062,7 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
                 continue;
             uint8_t computed_u[32];
             rc4_encrypt(keys[i], key_bytes, PDF_PASSWORD_PADDING, computed_u, PDF_PASSWORD_PADDING_LEN);
-            if (memcmp(computed_u, params->u_value, 32) == 0)
+            if (memcmp(computed_u, params->u_value, PDF_PASSWORD_PADDING_LEN) == 0)
                 result |= (1 << i);
         }
     } else {
