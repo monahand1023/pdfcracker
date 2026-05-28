@@ -17,8 +17,11 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Length of the PDF password padding string in bytes */
+#define PDF_PASSWORD_PADDING_LEN 32
+
 /* Standard 32-byte PDF password padding (ISO 32000-1, Table 3.18) */
-static const uint8_t PDF_PASSWORD_PADDING[32] = {
+static const uint8_t PDF_PASSWORD_PADDING[PDF_PASSWORD_PADDING_LEN] = {
     0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41,
     0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
     0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80,

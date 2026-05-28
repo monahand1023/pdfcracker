@@ -26,6 +26,9 @@
 #include <libgen.h>
 #include <dns_sd.h>
 
+/* Named constant for the lease-recheck nanosleep interval (~200 ms) */
+#define LEASE_RECHECK_NS 200000000
+
 /* ================================================================
  * Data Structures
  * ================================================================ */
@@ -1087,7 +1090,7 @@ static void *client_handler(void *arg)
 
                 /* Active leases exist — wait for possible requeue */
                 retries++;
-                struct timespec wait_ts = {0, 200000000};  /* 200ms */
+                struct timespec wait_ts = {0, LEASE_RECHECK_NS};
                 nanosleep(&wait_ts, NULL);
             }
 

@@ -40,6 +40,14 @@
 /* Batch size for atomic counter updates — avoids cache-line thrashing */
 #define TESTED_BATCH 256
 
+/* Flush local tested counter to global atomic in batches */
+#define FLUSH_TESTED_BATCH(lc) do { \
+    if (++(lc) == TESTED_BATCH) { \
+        atomic_fetch_add_explicit(&g_chunk_tested, (lc), memory_order_relaxed); \
+        (lc) = 0; \
+    } \
+} while (0)
+
 /* Maximum local threads (MAX_CLIENTS + 1 for GPU thread) */
 #define MAX_LOCAL_THREADS 65
 
@@ -78,6 +86,13 @@ static atomic_long g_chunk_tested = 0;
 static char          g_client_uuid[UUID_LEN + 1] = {0};
 static uint64_t      g_current_lease_id = 0;
 static volatile sig_atomic_t g_shutdown_requested = 0;
+
+/* ── Helper: record a found password ─────────────────────────── */
+static inline void set_found_password(const char *pass)
+{
+    strncpy(g_chunk_pass, pass, MAX_PASS_LEN);
+    g_chunk_pass[MAX_PASS_LEN] = '\0';
+}
 
 /* ================================================================
  * UUID persistence — ~/.pdfcracker_id
@@ -218,18 +233,12 @@ static void *brute_local_worker(void *arg)
                                      memory_order_relaxed), 0))
                     break;
                 index_to_password(i, a->length, g_charset, g_cs_len, pass);
-                if (++local_count == TESTED_BATCH) {
-                    atomic_fetch_add_explicit(&g_chunk_tested, local_count,
-                                              memory_order_relaxed);
-                    local_count = 0;
-                }
+                FLUSH_TESTED_BATCH(local_count);
                 int hit = g_fast_crypto ? test_password_fast_mode(pass)
                                         : test_password(doc, pass);
                 if (hit) {
                     if (!atomic_exchange(&g_chunk_found, 1))
-                        strncpy(g_chunk_pass, pass, MAX_PASS_LEN);
-                    g_chunk_pass[MAX_PASS_LEN] = '\0';
-                        g_chunk_pass[MAX_PASS_LEN] = '\0';
+                        set_found_password(pass);
                 }
             }
         }
@@ -239,17 +248,12 @@ static void *brute_local_worker(void *arg)
                                  memory_order_relaxed), 0))
                 break;
             index_to_password(i, a->length, g_charset, g_cs_len, pass);
-            if (++local_count == TESTED_BATCH) {
-                atomic_fetch_add_explicit(&g_chunk_tested, local_count,
-                                          memory_order_relaxed);
-                local_count = 0;
-            }
+            FLUSH_TESTED_BATCH(local_count);
             int hit = g_fast_crypto ? test_password_fast_mode(pass)
                                     : test_password(doc, pass);
             if (hit) {
                 if (!atomic_exchange(&g_chunk_found, 1))
-                    strncpy(g_chunk_pass, pass, MAX_PASS_LEN);
-                    g_chunk_pass[MAX_PASS_LEN] = '\0';
+                    set_found_password(pass);
             }
         }
     }
@@ -300,18 +304,12 @@ static void *dict_local_worker(void *arg)
                 if (__builtin_expect(atomic_load_explicit(&g_chunk_found,
                                      memory_order_relaxed), 0))
                     break;
-                if (++local_count == TESTED_BATCH) {
-                    atomic_fetch_add_explicit(&g_chunk_tested, local_count,
-                                              memory_order_relaxed);
-                    local_count = 0;
-                }
+                FLUSH_TESTED_BATCH(local_count);
                 int hit = g_fast_crypto ? test_password_fast_mode(a->words[i])
                                         : test_password(doc, a->words[i]);
                 if (hit) {
                     if (!atomic_exchange(&g_chunk_found, 1))
-                        strncpy(g_chunk_pass, a->words[i], MAX_PASS_LEN);
-                    g_chunk_pass[MAX_PASS_LEN] = '\0';
-                        g_chunk_pass[MAX_PASS_LEN] = '\0';
+                        set_found_password(a->words[i]);
                 }
             }
         }
@@ -320,17 +318,12 @@ static void *dict_local_worker(void *arg)
             if (__builtin_expect(atomic_load_explicit(&g_chunk_found,
                                  memory_order_relaxed), 0))
                 break;
-            if (++local_count == TESTED_BATCH) {
-                atomic_fetch_add_explicit(&g_chunk_tested, local_count,
-                                          memory_order_relaxed);
-                local_count = 0;
-            }
+            FLUSH_TESTED_BATCH(local_count);
             int hit = g_fast_crypto ? test_password_fast_mode(a->words[i])
                                     : test_password(doc, a->words[i]);
             if (hit) {
                 if (!atomic_exchange(&g_chunk_found, 1))
-                    strncpy(g_chunk_pass, a->words[i], MAX_PASS_LEN);
-                    g_chunk_pass[MAX_PASS_LEN] = '\0';
+                    set_found_password(a->words[i]);
             }
         }
     }
@@ -433,10 +426,10 @@ static int benchmark_gpu(void)
             const uint8_t *key = keys + i * key_bytes;
             if (g_enc_params.revision == 2) {
                 uint8_t u[32];
-                rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, u, 32);
+                rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, u, PDF_PASSWORD_PADDING_LEN);
             } else {
                 CC_MD5_CTX md5; CC_MD5_Init(&md5);
-                CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, 32);
+                CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, PDF_PASSWORD_PADDING_LEN);
                 CC_MD5_Update(&md5, g_enc_params.file_id,
                               (CC_LONG)g_enc_params.file_id_len);
                 uint8_t h[16]; CC_MD5_Final(h, &md5);
@@ -486,7 +479,7 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
     if (g_enc_params.revision >= 3) {
         CC_MD5_CTX md5;
         CC_MD5_Init(&md5);
-        CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, 32);
+        CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, PDF_PASSWORD_PADDING_LEN);
         CC_MD5_Update(&md5, g_enc_params.file_id,
                       (CC_LONG)g_enc_params.file_id_len);
         CC_MD5_Final(base_hash, &md5);
@@ -500,11 +493,10 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
                 != g_enc_params.u_value[0])
                 continue;
             uint8_t computed_u[32];
-            rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, computed_u, 32);
-            if (memcmp(computed_u, g_enc_params.u_value, 32) == 0) {
+            rc4_encrypt(key, key_bytes, PDF_PASSWORD_PADDING, computed_u, PDF_PASSWORD_PADDING_LEN);
+            if (memcmp(computed_u, g_enc_params.u_value, PDF_PASSWORD_PADDING_LEN) == 0) {
                 if (!atomic_exchange(&g_chunk_found, 1))
-                    strncpy(g_chunk_pass, passwords[i], MAX_PASS_LEN);
-                    g_chunk_pass[MAX_PASS_LEN] = '\0';
+                    set_found_password(passwords[i]);
                 return 1;
             }
         } else {
@@ -521,8 +513,7 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
             }
             if (memcmp(encrypted, g_enc_params.u_value, 16) == 0) {
                 if (!atomic_exchange(&g_chunk_found, 1))
-                    strncpy(g_chunk_pass, passwords[i], MAX_PASS_LEN);
-                    g_chunk_pass[MAX_PASS_LEN] = '\0';
+                    set_found_password(passwords[i]);
                 return 1;
             }
         }
@@ -607,10 +598,8 @@ static inline int sha256_wait_and_check(void *handle, int count,
         ? metal_sha256_wait_results_ex(g_sha256_ctx, handle, count, &match_type)
         : metal_sha256_wait_results(g_sha256_ctx, handle, count);
     if (match >= 0) {
-        if (!atomic_exchange(&g_chunk_found, 1)) {
-            strncpy(g_chunk_pass, pw_buf[match], MAX_PASS_LEN);
-            g_chunk_pass[MAX_PASS_LEN] = '\0';
-        }
+        if (!atomic_exchange(&g_chunk_found, 1))
+            set_found_password(pw_buf[match]);
     }
     return match;
 }
@@ -626,10 +615,8 @@ static inline int r6_wait_and_check(void *handle, int count,
         ? metal_r6_wait_results_ex(g_r6_ctx, handle, count, &match_type)
         : metal_r6_wait_results(g_r6_ctx, handle, count);
     if (match >= 0) {
-        if (!atomic_exchange(&g_chunk_found, 1)) {
-            strncpy(g_chunk_pass, pw_buf[match], MAX_PASS_LEN);
-            g_chunk_pass[MAX_PASS_LEN] = '\0';
-        }
+        if (!atomic_exchange(&g_chunk_found, 1))
+            set_found_password(pw_buf[match]);
     }
     return match;
 }

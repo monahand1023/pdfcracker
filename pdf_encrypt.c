@@ -521,7 +521,8 @@ static inline void pad_password(const char *password, uint8_t padded[32])
     size_t plen = password ? strlen(password) : 0;
     if (plen > 32) plen = 32;
     if (plen > 0) memcpy(padded, password, plen);
-    if (plen < 32) memcpy(padded + plen, PDF_PASSWORD_PADDING, 32 - plen);
+    if (plen < PDF_PASSWORD_PADDING_LEN)
+        memcpy(padded + plen, PDF_PASSWORD_PADDING, PDF_PASSWORD_PADDING_LEN - plen);
 }
 
 /* ================================================================
@@ -589,7 +590,7 @@ static void compute_u_r2(const uint8_t *key, int key_len,
                          uint8_t *u_out)
 {
     /* RC4-encrypt the 32-byte padding string with the key */
-    rc4_encrypt(key, key_len, PDF_PASSWORD_PADDING, u_out, 32);
+    rc4_encrypt(key, key_len, PDF_PASSWORD_PADDING, u_out, PDF_PASSWORD_PADDING_LEN);
 }
 
 /* ================================================================
@@ -602,7 +603,7 @@ static void compute_u_r3(const PDFEncryptParams *params,
     /* (a) MD5 hash of padding + file ID */
     CC_MD5_CTX md5;
     CC_MD5_Init(&md5);
-    CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, 32);
+    CC_MD5_Update(&md5, PDF_PASSWORD_PADDING, PDF_PASSWORD_PADDING_LEN);
     CC_MD5_Update(&md5, params->file_id, (CC_LONG)params->file_id_len);
 
     uint8_t hash[16];
@@ -1060,7 +1061,7 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
                 != params->u_value[0])
                 continue;
             uint8_t computed_u[32];
-            rc4_encrypt(keys[i], key_bytes, PDF_PASSWORD_PADDING, computed_u, 32);
+            rc4_encrypt(keys[i], key_bytes, PDF_PASSWORD_PADDING, computed_u, PDF_PASSWORD_PADDING_LEN);
             if (memcmp(computed_u, params->u_value, 32) == 0)
                 result |= (1 << i);
         }
@@ -1069,7 +1070,7 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
          * The initial MD5(padding+fileID) is the same for all 4, compute once. */
         CC_MD5_CTX md5ctx;
         CC_MD5_Init(&md5ctx);
-        CC_MD5_Update(&md5ctx, PDF_PASSWORD_PADDING, 32);
+        CC_MD5_Update(&md5ctx, PDF_PASSWORD_PADDING, PDF_PASSWORD_PADDING_LEN);
         CC_MD5_Update(&md5ctx, params->file_id, (CC_LONG)params->file_id_len);
         uint8_t base_hash[16];
         CC_MD5_Final(base_hash, &md5ctx);
