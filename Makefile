@@ -24,9 +24,13 @@ pdf_md5.metallib: pdf_md5.air
 metal_keygen.o: metal_keygen.m metal_keygen.h pdf_encrypt.h
 	$(CC) $(CFLAGS) -fobjc-arc -c metal_keygen.m
 
+# ── Checkpoint module ────────────────────────────────────────
+checkpoint.o: checkpoint.c checkpoint.h
+	$(CC) $(CFLAGS) -c checkpoint.c
+
 # ── Targets ──────────────────────────────────────────────────
-pdfcrack: pdfcrack.c pdf_encrypt.o saslprep.o metal_keygen.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ pdfcrack.c pdf_encrypt.o saslprep.o metal_keygen.o
+pdfcrack: pdfcrack.c checkpoint.o pdf_encrypt.o saslprep.o metal_keygen.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h checkpoint.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ pdfcrack.c checkpoint.o pdf_encrypt.o saslprep.o metal_keygen.o
 
 server: server.c protocol.h pdf_encrypt.o saslprep.o pdf_encrypt.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ server.c pdf_encrypt.o saslprep.o
@@ -42,7 +46,7 @@ test_saslprep: test_saslprep.c saslprep.o saslprep.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ test_saslprep.c saslprep.o
 
 clean:
-	rm -f pdfcrack server client test_all test_crypto test_saslprep fuzz_rules *.o *.air *.metallib *.profraw *.profdata
+	rm -f pdfcrack server client test_all test_crypto test_saslprep fuzz_rules checkpoint.o *.o *.air *.metallib *.profraw *.profdata
 
 test-integration: pdfcrack
 	./test_integration.sh

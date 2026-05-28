@@ -892,7 +892,264 @@ static void handle_http_request(int fd, const char *request_line)
 }
 
 /* ================================================================
- * Client handler
+ * send_session_config — send CONFIG/CHARSET/PWMODE/PDF to a newly
+ * registered client and wait for READY.
+ * Returns 0 on success, -1 on I/O error.
+ * ================================================================ */
+static int send_session_config(int fd, int ci_idx)
+{
+    char line[MAX_LINE];
+
+    /* ── Send config ───────────────────────────────────────────── */
+    if (g_brute) {
+        sock_printf(fd, "CONFIG BRUTE %d %d", g_max_len, g_password_mode);
+        sock_printf(fd, "CHARSET %s", g_charset);
+    } else {
+        sock_printf(fd, "CONFIG DICT %d", g_password_mode);
+    }
+
+    /* Send PWMODE (v4 protocol — older clients will ignore unknown lines) */
+    {
+        const char *pw_str = "both";
+        if (g_password_mode == PW_MODE_USER) pw_str = "user";
+        else if (g_password_mode == PW_MODE_OWNER) pw_str = "owner";
+        sock_printf(fd, "PWMODE %s", pw_str);
+    }
+
+    /* ── Send PDF ──────────────────────────────────────────────── */
+    sock_printf(fd, "PDF %ld", g_pdf_size);
+    if (write_exact(fd, g_pdf_data, (size_t)g_pdf_size) < 0) {
+        fprintf(stderr, "[client %d] failed sending PDF\n", ci_idx);
+        return -1;
+    }
+
+    /* ── Wait for READY ────────────────────────────────────────── */
+    if (sock_readline(fd, line, sizeof(line)) < 0) return -1;
+    if (strcmp(line, "READY") != 0) {
+        fprintf(stderr, "[client %d] expected READY, got: %s\n", ci_idx, line);
+        return -1;
+    }
+    fprintf(stderr, "[client %d] ready for work\n", ci_idx);
+    return 0;
+}
+
+/* ================================================================
+ * handle_protocol_message — handle one application-level message
+ * from the work loop (GETWORK, HEARTBEAT, COMPLETE, PARTIAL, FOUND).
+ *
+ * Returns:
+ *   0  — continue the work loop
+ *   1  — break the work loop (DONE / FOUND / ABORT sent)
+ * ================================================================ */
+static int handle_protocol_message(int fd, ClientInfo *ci,
+                                   int ci_idx, const char *line)
+{
+    /* ── GETWORK <tested> <elapsed> ─────────────────────────────── */
+    if (strncmp(line, "GETWORK", 7) == 0) {
+        long tested = 0;
+        double elapsed = 0.0;
+        sscanf(line, "GETWORK %ld %lf", &tested, &elapsed);
+
+        /* Note: tested count credited only in COMPLETE/PARTIAL handlers
+         * to avoid double-counting. Here we only use it for speed. */
+
+        /* Compute speed and adaptive chunk size */
+        if (elapsed > 0.1 && tested > 0) {
+            ci->speed = (double)tested / elapsed;
+            double raw_size = ci->speed * TARGET_SECS;
+            if (raw_size > (double)MAX_CHUNK_BRUTE) raw_size = (double)MAX_CHUNK_BRUTE;
+            long new_size = (long)raw_size;
+            if (g_brute) {
+                if (g_pdf_revision == 6) {
+                    if (new_size < MIN_CHUNK_BRUTE_R6) new_size = MIN_CHUNK_BRUTE_R6;
+                    if (new_size > MAX_CHUNK_BRUTE_R6) new_size = MAX_CHUNK_BRUTE_R6;
+                } else {
+                    if (new_size < MIN_CHUNK_BRUTE) new_size = MIN_CHUNK_BRUTE;
+                    if (new_size > MAX_CHUNK_BRUTE) new_size = MAX_CHUNK_BRUTE;
+                }
+            } else {
+                if (new_size < MIN_CHUNK_DICT) new_size = MIN_CHUNK_DICT;
+                if (new_size > MAX_CHUNK_DICT) new_size = MAX_CHUNK_DICT;
+            }
+            ci->chunk_size = new_size;
+        }
+
+        /* Check if found */
+        if (atomic_load(&g_found)) {
+            atomic_thread_fence(memory_order_acquire);
+            sock_printf(fd, "FOUND %s", g_password);
+            return 1;
+        }
+
+        /* Compute deadline */
+        int deadline = MIN_LEASE_SECS;
+        if (elapsed > 0.1) {
+            deadline = (int)(elapsed * LEASE_MULTIPLIER);
+            if (deadline < MIN_LEASE_SECS) deadline = MIN_LEASE_SECS;
+            if (deadline > MAX_LEASE_SECS) deadline = MAX_LEASE_SECS;
+        }
+
+        /* Assign work */
+        int is_brute = 0, out_len = 0;
+        long out_start = 0, out_end = 0, out_dict_start = 0, out_dict_count = 0;
+        uint64_t lid = 0;
+        int retries = 0;
+        while (retries < 30) {
+            lid = assign_work(ci, &is_brute, &out_len,
+                              &out_start, &out_end,
+                              &out_dict_start, &out_dict_count,
+                              deadline);
+            if (lid != 0) break;
+
+            /* No work available — check if leases are still in-flight */
+            int any_active = 0;
+            pthread_mutex_lock(&g_lease_lock);
+            int lcount = g_lease_count < MAX_LEASES ? g_lease_count : MAX_LEASES;
+            for (int li = 0; li < lcount; li++) {
+                int lslot = ((g_lease_count - 1 - li) % MAX_LEASES + MAX_LEASES) % MAX_LEASES;
+                if (g_leases[lslot].active) { any_active = 1; break; }
+            }
+            pthread_mutex_unlock(&g_lease_lock);
+
+            if (!any_active) break;  /* truly done */
+
+            /* Active leases exist — wait for possible requeue */
+            retries++;
+            struct timespec wait_ts = {0, LEASE_RECHECK_NS};
+            nanosleep(&wait_ts, NULL);
+        }
+
+        if (lid == 0) {
+            sock_printf(fd, "DONE");
+            return 1;
+        }
+
+        if (is_brute) {
+            sock_printf(fd, "BRUTE %d %ld %ld %llu",
+                       out_len, out_start, out_end,
+                       (unsigned long long)lid);
+        } else {
+            sock_printf(fd, "DICT %ld %llu",
+                       out_dict_count, (unsigned long long)lid);
+            for (long i = out_dict_start;
+                 i < out_dict_start + out_dict_count; i++)
+                sock_printf(fd, "%s", g_words[i]);
+        }
+        return 0;
+    }
+
+    /* ── HEARTBEAT <lease_id> <tested> ──────────────────────────── */
+    if (strncmp(line, "HEARTBEAT", 9) == 0) {
+        unsigned long long lid = 0;
+        long tested = 0;
+        sscanf(line, "HEARTBEAT %llu %ld", &lid, &tested);
+
+        pthread_mutex_lock(&g_lease_lock);
+        int slot = find_lease((uint64_t)lid);
+        if (slot >= 0 && g_leases[slot].active) {
+            g_leases[slot].tested_so_far = tested;
+            g_leases[slot].last_heartbeat = mono_time();
+        }
+        pthread_mutex_unlock(&g_lease_lock);
+
+        if (atomic_load(&g_found)) {
+            sock_printf(fd, "ABORT");
+        } else {
+            sock_printf(fd, "OK");
+        }
+        return 0;
+    }
+
+    /* ── COMPLETE <lease_id> <tested> ───────────────────────────── */
+    if (strncmp(line, "COMPLETE", 8) == 0) {
+        unsigned long long lid = 0;
+        long tested = 0;
+        sscanf(line, "COMPLETE %llu %ld", &lid, &tested);
+
+        if (tested > 0) {
+            atomic_fetch_add(&g_total_tested, tested);
+            ci->tested += tested;
+        }
+
+        pthread_mutex_lock(&g_lease_lock);
+        complete_lease((uint64_t)lid, tested);
+        pthread_mutex_unlock(&g_lease_lock);
+
+        ci->current_lease_id = 0;
+        return 0;
+    }
+
+    /* ── PARTIAL <lease_id> <hwm> ───────────────────────────────── */
+    if (strncmp(line, "PARTIAL", 7) == 0) {
+        unsigned long long lid = 0;
+        long hwm = 0;
+        sscanf(line, "PARTIAL %llu %ld", &lid, &hwm);
+
+        pthread_mutex_lock(&g_lease_lock);
+        int slot = find_lease((uint64_t)lid);
+        if (slot >= 0 && g_leases[slot].active) {
+            LeaseEntry *le = &g_leases[slot];
+            le->active = 0;
+
+            pthread_mutex_lock(&g_work_lock);
+            if (le->is_brute) {
+                /* Re-queue the remaining range */
+                long new_start = le->brute_start + hwm;
+                long credited = hwm;
+                if (credited > 0) {
+                    atomic_fetch_add(&g_total_tested, credited);
+                    ci->tested += credited;
+                }
+                if (new_start < le->brute_end) {
+                    push_requeue_brute(le->brute_len, new_start, le->brute_end);
+                }
+            } else {
+                /* Dict: re-queue entire chunk (can't split precisely) */
+                long credited = hwm;
+                if (credited > 0) {
+                    atomic_fetch_add(&g_total_tested, credited);
+                    ci->tested += credited;
+                }
+                push_requeue_dict(le->dict_start, le->dict_count);
+            }
+            pthread_mutex_unlock(&g_work_lock);
+        }
+        pthread_mutex_unlock(&g_lease_lock);
+
+        ci->current_lease_id = 0;
+        return 0;
+    }
+
+    /* ── FOUND <password> <lease_id> ────────────────────────────── */
+    if (strncmp(line, "FOUND ", 6) == 0) {
+        char pw[MAX_PASS_LEN + 1] = {0};
+        unsigned long long lid = 0;
+        sscanf(line, "FOUND %32s %llu", pw, &lid);
+
+        if (!atomic_exchange(&g_found, 1)) {
+            strncpy(g_password, pw, MAX_PASS_LEN);
+            atomic_thread_fence(memory_order_release);
+            fprintf(stderr,
+                "\n\n  *** PASSWORD FOUND by client %d: %s ***\n\n",
+                ci_idx, g_password);
+        }
+
+        if (lid > 0) {
+            pthread_mutex_lock(&g_lease_lock);
+            complete_lease((uint64_t)lid, 0);
+            pthread_mutex_unlock(&g_lease_lock);
+        }
+
+        sock_printf(fd, "OK");
+        return 1;
+    }
+
+    /* Unknown message — ignored */
+    return 0;
+}
+
+/* ================================================================
+ * Client handler — orchestrates connection lifecycle
  * ================================================================ */
 
 static void *client_handler(void *arg)
@@ -924,6 +1181,7 @@ static void *client_handler(void *arg)
         return NULL;
     }
 
+    /* ── Parse HELLO handshake ─────────────────────────────────── */
     int ncores = 0, proto_ver = 0;
     char uuid[UUID_LEN + 1] = {0};
     if (sscanf(line, "HELLO %d %36s %d", &ncores, uuid, &proto_ver) != 3 ||
@@ -940,7 +1198,7 @@ static void *client_handler(void *arg)
         goto done;
     }
 
-    /* Find or allocate client slot */
+    /* ── Find or allocate client slot ─────────────────────────── */
     pthread_mutex_lock(&g_clients_lock);
     ci_idx = find_client_by_uuid(uuid);
     if (ci_idx >= 0) {
@@ -973,9 +1231,9 @@ static void *client_handler(void *arg)
     }
 
     ClientInfo *ci = &g_clients[ci_idx];
-    ci->fd       = fd;
-    ci->cores    = ncores;
-    ci->active   = 1;
+    ci->fd        = fd;
+    ci->cores     = ncores;
+    ci->active    = 1;
     ci->slot_free = 0;
     strncpy(ci->ip_str, ip_str, INET_ADDRSTRLEN);
     ci->ip_str[INET_ADDRSTRLEN - 1] = '\0';
@@ -983,237 +1241,14 @@ static void *client_handler(void *arg)
     ci->current_lease_id = 0;
     pthread_mutex_unlock(&g_clients_lock);
 
-    /* ── Send config ───────────────────────────────────────────── */
-    if (g_brute) {
-        sock_printf(fd, "CONFIG BRUTE %d %d", g_max_len, g_password_mode);
-        sock_printf(fd, "CHARSET %s", g_charset);
-    } else {
-        sock_printf(fd, "CONFIG DICT %d", g_password_mode);
-    }
-
-    /* Send PWMODE (v4 protocol — older clients will ignore unknown lines) */
-    {
-        const char *pw_str = "both";
-        if (g_password_mode == PW_MODE_USER) pw_str = "user";
-        else if (g_password_mode == PW_MODE_OWNER) pw_str = "owner";
-        sock_printf(fd, "PWMODE %s", pw_str);
-    }
-
-    /* ── Send PDF ──────────────────────────────────────────────── */
-    sock_printf(fd, "PDF %ld", g_pdf_size);
-    if (write_exact(fd, g_pdf_data, (size_t)g_pdf_size) < 0) {
-        fprintf(stderr, "[client %d] failed sending PDF\n", ci_idx);
-        goto done;
-    }
-
-    /* ── Wait for READY ────────────────────────────────────────── */
-    if (sock_readline(fd, line, sizeof(line)) < 0) goto done;
-    if (strcmp(line, "READY") != 0) {
-        fprintf(stderr, "[client %d] expected READY, got: %s\n", ci_idx, line);
-        goto done;
-    }
-    fprintf(stderr, "[client %d] ready for work\n", ci_idx);
+    /* ── Send session config and PDF, wait for READY ──────────── */
+    if (send_session_config(fd, ci_idx) < 0) goto done;
 
     /* ── Work loop ─────────────────────────────────────────────── */
     while (!g_shutdown && sock_readline(fd, line, sizeof(line)) >= 0) {
-
         ci->last_seen = mono_time();
-
-        /* ── GETWORK <tested> <elapsed> ─────────────────────────── */
-        if (strncmp(line, "GETWORK", 7) == 0) {
-            long tested = 0;
-            double elapsed = 0.0;
-            sscanf(line, "GETWORK %ld %lf", &tested, &elapsed);
-
-            /* Note: tested count credited only in COMPLETE/PARTIAL handlers
-             * to avoid double-counting. Here we only use it for speed. */
-
-            /* Compute speed and adaptive chunk size */
-            if (elapsed > 0.1 && tested > 0) {
-                ci->speed = (double)tested / elapsed;
-                double raw_size = ci->speed * TARGET_SECS;
-                if (raw_size > (double)MAX_CHUNK_BRUTE) raw_size = (double)MAX_CHUNK_BRUTE;
-                long new_size = (long)raw_size;
-                if (g_brute) {
-                    if (g_pdf_revision == 6) {
-                        if (new_size < MIN_CHUNK_BRUTE_R6) new_size = MIN_CHUNK_BRUTE_R6;
-                        if (new_size > MAX_CHUNK_BRUTE_R6) new_size = MAX_CHUNK_BRUTE_R6;
-                    } else {
-                        if (new_size < MIN_CHUNK_BRUTE) new_size = MIN_CHUNK_BRUTE;
-                        if (new_size > MAX_CHUNK_BRUTE) new_size = MAX_CHUNK_BRUTE;
-                    }
-                } else {
-                    if (new_size < MIN_CHUNK_DICT) new_size = MIN_CHUNK_DICT;
-                    if (new_size > MAX_CHUNK_DICT) new_size = MAX_CHUNK_DICT;
-                }
-                ci->chunk_size = new_size;
-            }
-
-            /* Check if found */
-            if (atomic_load(&g_found)) {
-                atomic_thread_fence(memory_order_acquire);
-                sock_printf(fd, "FOUND %s", g_password);
-                break;
-            }
-
-            /* Compute deadline */
-            int deadline = MIN_LEASE_SECS;
-            if (elapsed > 0.1) {
-                deadline = (int)(elapsed * LEASE_MULTIPLIER);
-                if (deadline < MIN_LEASE_SECS) deadline = MIN_LEASE_SECS;
-                if (deadline > MAX_LEASE_SECS) deadline = MAX_LEASE_SECS;
-            }
-
-            /* Assign work */
-            int is_brute = 0, out_len = 0;
-            long out_start = 0, out_end = 0, out_dict_start = 0, out_dict_count = 0;
-            uint64_t lid = 0;
-            int retries = 0;
-            while (retries < 30) {
-                lid = assign_work(ci, &is_brute, &out_len,
-                                  &out_start, &out_end,
-                                  &out_dict_start, &out_dict_count,
-                                  deadline);
-                if (lid != 0) break;
-
-                /* No work available — check if leases are still in-flight */
-                int any_active = 0;
-                pthread_mutex_lock(&g_lease_lock);
-                int lcount = g_lease_count < MAX_LEASES ? g_lease_count : MAX_LEASES;
-                for (int li = 0; li < lcount; li++) {
-                    int lslot = ((g_lease_count - 1 - li) % MAX_LEASES + MAX_LEASES) % MAX_LEASES;
-                    if (g_leases[lslot].active) { any_active = 1; break; }
-                }
-                pthread_mutex_unlock(&g_lease_lock);
-
-                if (!any_active) break;  /* truly done */
-
-                /* Active leases exist — wait for possible requeue */
-                retries++;
-                struct timespec wait_ts = {0, LEASE_RECHECK_NS};
-                nanosleep(&wait_ts, NULL);
-            }
-
-            if (lid == 0) {
-                sock_printf(fd, "DONE");
-                break;
-            }
-
-            if (is_brute) {
-                sock_printf(fd, "BRUTE %d %ld %ld %llu",
-                           out_len, out_start, out_end,
-                           (unsigned long long)lid);
-            } else {
-                sock_printf(fd, "DICT %ld %llu",
-                           out_dict_count, (unsigned long long)lid);
-                for (long i = out_dict_start;
-                     i < out_dict_start + out_dict_count; i++)
-                    sock_printf(fd, "%s", g_words[i]);
-            }
-        }
-
-        /* ── HEARTBEAT <lease_id> <tested> ──────────────────────── */
-        else if (strncmp(line, "HEARTBEAT", 9) == 0) {
-            unsigned long long lid = 0;
-            long tested = 0;
-            sscanf(line, "HEARTBEAT %llu %ld", &lid, &tested);
-
-            pthread_mutex_lock(&g_lease_lock);
-            int slot = find_lease((uint64_t)lid);
-            if (slot >= 0 && g_leases[slot].active) {
-                g_leases[slot].tested_so_far = tested;
-                g_leases[slot].last_heartbeat = mono_time();
-            }
-            pthread_mutex_unlock(&g_lease_lock);
-
-            if (atomic_load(&g_found)) {
-                sock_printf(fd, "ABORT");
-            } else {
-                sock_printf(fd, "OK");
-            }
-        }
-
-        /* ── COMPLETE <lease_id> <tested> ───────────────────────── */
-        else if (strncmp(line, "COMPLETE", 8) == 0) {
-            unsigned long long lid = 0;
-            long tested = 0;
-            sscanf(line, "COMPLETE %llu %ld", &lid, &tested);
-
-            if (tested > 0) {
-                atomic_fetch_add(&g_total_tested, tested);
-                ci->tested += tested;
-            }
-
-            pthread_mutex_lock(&g_lease_lock);
-            complete_lease((uint64_t)lid, tested);
-            pthread_mutex_unlock(&g_lease_lock);
-
-            ci->current_lease_id = 0;
-        }
-
-        /* ── PARTIAL <lease_id> <hwm> ───────────────────────────── */
-        else if (strncmp(line, "PARTIAL", 7) == 0) {
-            unsigned long long lid = 0;
-            long hwm = 0;
-            sscanf(line, "PARTIAL %llu %ld", &lid, &hwm);
-
-            pthread_mutex_lock(&g_lease_lock);
-            int slot = find_lease((uint64_t)lid);
-            if (slot >= 0 && g_leases[slot].active) {
-                LeaseEntry *le = &g_leases[slot];
-                le->active = 0;
-
-                pthread_mutex_lock(&g_work_lock);
-                if (le->is_brute) {
-                    /* Re-queue the remaining range */
-                    long new_start = le->brute_start + hwm;
-                    long credited = hwm;
-                    if (credited > 0) {
-                        atomic_fetch_add(&g_total_tested, credited);
-                        ci->tested += credited;
-                    }
-                    if (new_start < le->brute_end) {
-                        push_requeue_brute(le->brute_len, new_start, le->brute_end);
-                    }
-                } else {
-                    /* Dict: re-queue entire chunk (can't split precisely) */
-                    long credited = hwm;
-                    if (credited > 0) {
-                        atomic_fetch_add(&g_total_tested, credited);
-                        ci->tested += credited;
-                    }
-                    push_requeue_dict(le->dict_start, le->dict_count);
-                }
-                pthread_mutex_unlock(&g_work_lock);
-            }
-            pthread_mutex_unlock(&g_lease_lock);
-
-            ci->current_lease_id = 0;
-        }
-
-        /* ── FOUND <password> <lease_id> ────────────────────────── */
-        else if (strncmp(line, "FOUND ", 6) == 0) {
-            char pw[MAX_PASS_LEN + 1] = {0};
-            unsigned long long lid = 0;
-            sscanf(line, "FOUND %32s %llu", pw, &lid);
-
-            if (!atomic_exchange(&g_found, 1)) {
-                strncpy(g_password, pw, MAX_PASS_LEN);
-                atomic_thread_fence(memory_order_release);
-                fprintf(stderr,
-                    "\n\n  *** PASSWORD FOUND by client %d: %s ***\n\n",
-                    ci_idx, g_password);
-            }
-
-            if (lid > 0) {
-                pthread_mutex_lock(&g_lease_lock);
-                complete_lease((uint64_t)lid, 0);
-                pthread_mutex_unlock(&g_lease_lock);
-            }
-
-            sock_printf(fd, "OK");
+        if (handle_protocol_message(fd, ci, ci_idx, line))
             break;
-        }
     }
 
 done:
