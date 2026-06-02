@@ -1,5 +1,7 @@
 # pdfcracker
 
+[![Release](https://img.shields.io/github/v/release/monahand1023/pdfcracker)](https://github.com/monahand1023/pdfcracker/releases) [![Language: C](https://img.shields.io/badge/language-C-00599C?logo=c&logoColor=white)](.) [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black?logo=apple)](.) [![GPU: Metal](https://img.shields.io/badge/GPU-Metal-792EE5)](.) [![License: MIT](https://img.shields.io/github/license/monahand1023/pdfcracker)](LICENSE)
+
 Fast PDF password cracker for macOS, optimized for Apple Silicon. Supports all PDF encryption revisions (R2–R6), multiple attack modes, distributed cracking across multiple machines, and auto-selects the fastest acceleration engine at startup.
 
 ## Requirements
