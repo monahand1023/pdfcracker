@@ -4,6 +4,33 @@
 
 Fast PDF password cracker for macOS, optimized for Apple Silicon. Supports all PDF encryption revisions (R2–R6), multiple attack modes, distributed cracking across multiple machines, and auto-selects the fastest acceleration engine at startup.
 
+## Demo
+
+`--fingerprint` mode detects the encryption, benchmarks every available engine, picks the fastest, and sweeps ~1.3M likely passwords (common passwords, keywalks, dates, PINs) — here it recovers the password in under a second on an M4 Pro:
+
+```console
+$ pdfcrack -f encrypted.pdf --fingerprint
+
+Crypto : direct MD5+RC4 (R3, 128-bit key)
+Metal  : initialized on Apple M4 Pro (max batch: 262144)
+Bench  : scalar 51659/s, NEON 86608/s, GPU 91917/s (per-core) — GPU+NEON selected (1304432/s est.)
+Target : encrypted.pdf
+Threads: 14 + GPU + NEON SIMD
+Mode   : fingerprint (common passwords, keywalks, dates, PINs, ~1.3M candidates)
+  Phase 1: common passwords (68)...
+
+User password found: test123
+```
+
+Other modes — `-d` dictionary (+ `-R` rules / `-H` hybrid), `-b` brute-force, `-m` mask (`test?d?d?d`), `--smart` multi-phase, and `--prince`:
+
+```console
+$ pdfcrack -f encrypted.pdf -m "test?d?d?d"
+Mode   : mask attack ("test?d?d?d", keyspace 1000)
+[####...............................]  12.4%  124/1000  248/s  1s
+User password found: test123
+```
+
 ## Requirements
 
 - macOS (Apple Silicon recommended; Intel supported)
