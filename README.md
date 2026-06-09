@@ -51,41 +51,30 @@ bash test_integration.sh      # run end-to-end integration tests (41 tests)
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────┐
-│                     pdfcrack.c                       │
-│  Attack modes: brute, dict, mask, rules, hybrid,     │
-│  PRINCE, smart, combinator, toggle, Markov, leet,    │
-│  mutate, date, fingerprint, auto                     │
-│                                                      │
-│  Worker threads                                      │
-│  ┌──────────────┐  ┌─────────────┐  ┌────────────┐  │
-│  │ brute_worker  │  │ dict_worker │  │ rule_worker│  │
-│  │ _neon variant │  │ _neon var.  │  │ gpu variant│  │
-│  └──────┬───────┘  └──────┬──────┘  └─────┬──────┘  │
-│         │                 │               │          │
-│         └─────────────────┴───────────────┘          │
-│                           │                          │
-│              shared atomic g_next_idx counter        │
-└───────────────────────────┬─────────────────────────┘
-                            │
-              ┌─────────────┴──────────────┐
-              │                            │
-     ┌────────▼────────┐         ┌─────────▼────────┐
-     │   pdf_encrypt.c  │         │  metal_keygen.m   │
-     │                  │         │                   │
-     │ pdf_verify_user_ │         │ MD5 key-derivation│
-     │ password()       │         │ on GPU (R2-R4)    │
-     │ pdf_verify_user_ │         │                   │
-     │ batch4() — NEON  │         │ SHA-256 verify    │
-     │ 4-way parallel   │         │ on GPU (R5)       │
-     │                  │         │                   │
-     │ md5_simd.h       │         │ Algorithm 2.B KDF │
-     │ rc4_inline.h     │         │ on GPU (R6)       │
-     │ sha256_simd.h    │         │                   │
-     │ sha512_simd.h    │         │ pdf_md5.metal     │
-     │ aes_simd.h       │         │ (Metal shader)    │
-     └──────────────────┘         └───────────────────┘
+```mermaid
+flowchart TD
+    subgraph main ["pdfcrack.c"]
+        modes["Attack modes:<br/>brute, dict, mask, rules, hybrid, PRINCE,<br/>smart, combinator, toggle, Markov,<br/>leet, mutate, date, fingerprint, auto"]
+        subgraph workers ["Worker threads"]
+            bw["brute_worker<br/>(+ _neon variant)"]
+            dw["dict_worker<br/>(+ _neon variant)"]
+            rw["rule_worker<br/>(+ gpu variant)"]
+        end
+        modes --> bw
+        modes --> dw
+        modes --> rw
+        bw --> counter["shared atomic g_next_idx counter"]
+        dw --> counter
+        rw --> counter
+    end
+    counter --> cpu
+    counter --> gpu
+    subgraph cpu ["pdf_encrypt.c — CPU"]
+        cpuv["pdf_verify_user_password()<br/>pdf_verify_user_batch4() — NEON 4-way<br/>md5 / rc4 / sha256 / sha512 / aes _simd.h"]
+    end
+    subgraph gpu ["metal_keygen.m — GPU"]
+        gpuv["MD5 key-derivation (R2–R4)<br/>SHA-256 verify (R5)<br/>Algorithm 2.B KDF (R6)<br/>pdf_md5.metal — Metal shader"]
+    end
 ```
 
 ### Key files
