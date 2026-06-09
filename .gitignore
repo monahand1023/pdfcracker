@@ -7,6 +7,10 @@ server
 client
 test_all
 test_crypto
+test_saslprep
+fuzz_rules
+*.profraw
+*.profdata
 
 # Test PDFs
 *.pdf
