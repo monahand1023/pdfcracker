@@ -54,13 +54,19 @@ test: test_all test_saslprep test_crypto
 	./test_crypto
 
 clean:
-	rm -f pdfcrack server client test_all test_crypto test_saslprep fuzz_rules checkpoint.o *.o *.air *.metallib *.profraw *.profdata
+	rm -f pdfcrack server client test_all test_crypto test_saslprep fuzz_rules fuzz_parse checkpoint.o *.o *.air *.metallib *.profraw *.profdata
 
 test-integration: pdfcrack
 	./test_integration.sh
 
 fuzz-rules: fuzz_rules.c
 	clang -fsanitize=fuzzer,address,undefined -o fuzz_rules fuzz_rules.c
+
+FUZZ_CC ?= $(shell command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || echo clang)
+
+fuzz-parse: test_parse_fuzz.c pdf_encrypt.c saslprep.c
+	$(FUZZ_CC) -O1 -g -fsanitize=fuzzer,address,undefined \
+	  -o fuzz_parse test_parse_fuzz.c pdf_encrypt.c saslprep.c $(FRAMEWORKS)
 
 # ── Profile-guided optimization (PGO) ───────────────────────
 pgo:
@@ -70,4 +76,4 @@ pgo:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="$(CFLAGS) -fprofile-use -fprofile-correction"
 
-.PHONY: all clean test test-integration fuzz-rules pgo
+.PHONY: all clean test test-integration fuzz-rules fuzz-parse pgo
