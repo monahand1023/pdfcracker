@@ -289,7 +289,7 @@ PDFEncryptParams pdf_parse_encrypt(const uint8_t *data, size_t len)
 
     /* ── Find << that starts the trailer dict ──────────────────── */
     const uint8_t *dict_start = trailer;
-    if (*dict_start != '<' || *(dict_start + 1) != '<') {
+    if (dict_start + 1 >= end || *dict_start != '<' || *(dict_start + 1) != '<') {
         dict_start = find_forward(data, len, "<<", (size_t)(trailer - data));
         if (!dict_start) return params;
     }
@@ -345,7 +345,8 @@ PDFEncryptParams pdf_parse_encrypt(const uint8_t *data, size_t len)
     /* ── Parse /Encrypt — indirect ref (N G R) or inline dict ──── */
     const uint8_t *enc_dict = NULL;
 
-    if (*encrypt_val == '<' && encrypt_val + 1 < end && *(encrypt_val + 1) == '<') {
+    if (encrypt_val < end && *encrypt_val == '<' &&
+        encrypt_val + 1 < end && *(encrypt_val + 1) == '<') {
         /* Inline encrypt dictionary (rare but valid) */
         enc_dict = encrypt_val + 2;
     } else {
@@ -436,7 +437,7 @@ PDFEncryptParams pdf_parse_encrypt(const uint8_t *data, size_t len)
     /* /EncryptMetadata */
     val = find_dict_value(enc_dict, end, "EncryptMetadata");
     if (val) {
-        if (memcmp(val, "false", 5) == 0)
+        if (end - val >= 5 && memcmp(val, "false", 5) == 0)
             params.encrypt_metadata = 0;
     }
 
