@@ -191,7 +191,9 @@ static inline int test_password_fast_mode(const char *pass)
         return pdf_verify_user_password(&g_enc_params, pass);
     if (g_password_mode == PW_MODE_OWNER)
         return pdf_verify_owner_password(&g_enc_params, pass);
-    return test_password_fast_mode(pass);
+    /* PW_MODE_BOTH */
+    return pdf_verify_user_password(&g_enc_params, pass)
+        || pdf_verify_owner_password(&g_enc_params, pass);
 }
 
 /* ================================================================
