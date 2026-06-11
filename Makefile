@@ -59,10 +59,11 @@ clean:
 test-integration: pdfcrack
 	./test_integration.sh
 
-fuzz-rules: fuzz_rules.c
-	clang -fsanitize=fuzzer,address,undefined -o fuzz_rules fuzz_rules.c
-
+# Apple clang lacks the libFuzzer runtime; prefer Homebrew LLVM, fall back to clang.
 FUZZ_CC ?= $(shell command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || echo clang)
+
+fuzz-rules: fuzz_rules.c
+	$(FUZZ_CC) -fsanitize=fuzzer,address,undefined -o fuzz_rules fuzz_rules.c
 
 fuzz-parse: test_parse_fuzz.c pdf_encrypt.c saslprep.c
 	$(FUZZ_CC) -O1 -g -fsanitize=fuzzer,address,undefined \

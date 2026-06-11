@@ -11,10 +11,17 @@ jobs:
         run: make test
       - name: Integration tests
         run: bash test_integration.sh
-      - name: Build rules fuzzer
-        run: make fuzz-rules
+      - name: Install LLVM (libFuzzer runtime not in Apple clang)
+        run: brew install llvm
       - name: Smoke-fuzz rules (30s)
-        run: ./fuzz_rules -max_total_time=30 || true
+        run: |
+          make fuzz-rules FUZZ_CC="$(brew --prefix llvm)/bin/clang"
+          ./fuzz_rules -max_total_time=30 || true
+      - name: Smoke-fuzz parser (30s)
+        run: |
+          make fuzz-parse FUZZ_CC="$(brew --prefix llvm)/bin/clang"
+          mkdir -p corpus && cp test_*.pdf corpus/
+          ./fuzz_parse corpus -max_total_time=30 || true
   asan:
     runs-on: macos-14
     steps:
