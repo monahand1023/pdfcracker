@@ -387,6 +387,34 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# --- 43. Distributed loopback (server+client, BOTH mode, CPU path) ---
+# Coverage for the client recursion fix (test_password_fast_mode).
+# The server binary is copied to $TMPDIR so its dirname has no sibling 'client'
+# binary — this prevents the server from spawning its own local subprocess,
+# which would race our test client to the password on a 4-word dict.
+echo "distributed loopback test..."
+DPORT=19099
+DWL="$TMPDIR/dwl.txt"
+printf 'wrong1\nwrong2\npassaes\nwrong3\n' > "$DWL"
+cp ./server "$TMPDIR/srvbin"
+"$TMPDIR/srvbin" -f test_r4_aes128.pdf -d "$DWL" -p $DPORT > "$TMPDIR/srv.log" 2>&1 &
+SRVPID=$!
+sleep 1
+timeout 30 ./client -s 127.0.0.1 -p $DPORT -G > "$TMPDIR/cli.log" 2>&1
+CRC=$?
+sleep 1
+kill $SRVPID 2>/dev/null; wait $SRVPID 2>/dev/null
+if grep -qi 'passaes' "$TMPDIR/srv.log" && [ $CRC -ne 124 ]; then
+    echo "  [PASS] Distributed loopback (server+client, BOTH mode, CPU path)"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] Distributed loopback (server+client, BOTH mode, CPU path)"
+    echo "         srv: $(grep -i 'passaes\|password\|found' "$TMPDIR/srv.log" 2>/dev/null | head -3)"
+    echo "         cli: $(head -3 "$TMPDIR/cli.log" 2>/dev/null)"
+    echo "         client exit: $CRC"
+    FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "=== Summary ==="
 echo "Total: $PASS passed, $FAIL failed"
