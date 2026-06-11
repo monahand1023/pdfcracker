@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <assert.h>
 
 /* ── MD5 round constants (T[i] = floor(2^32 * |sin(i+1)|)) ─────── */
 static const uint32_t MD5_T[64] = {
@@ -180,7 +181,10 @@ static inline void md5_block_x4(uint32x4_t M[16],
 /*
  * md5_x4 -- Hash 4 messages in parallel using NEON.
  *
- * Each message can have a different length. Messages are padded internally.
+ * CONTRACT: All four lanes MUST have the same length (same block count after
+ * padding). The re-pad path that normalises lanes to max_blocks is only valid
+ * when every lane already produces the same block count; giving lanes with
+ * differing lengths produces wrong digests for the shorter lanes.
  * Maximum supported message length: 512 bytes (plenty for PDF key derivation
  * where messages are <= 84 bytes).
  *
@@ -190,6 +194,9 @@ static inline void md5_block_x4(uint32x4_t M[16],
 static inline void md5_x4(const uint8_t *data[4], size_t len[4],
                            uint8_t out[4][16])
 {
+    /* Contract: all four lanes must have equal length (same block count).
+     * The re-pad path is only valid under that assumption. */
+    assert(len[0] == len[1] && len[1] == len[2] && len[2] == len[3]);
     /* Pad each message individually into aligned buffers.
      * Max padded size: ceil((512 + 9) / 64) * 64 = 576 bytes = 9 blocks */
     uint8_t padded[4][576];
