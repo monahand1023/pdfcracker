@@ -67,7 +67,9 @@ static volatile sig_atomic_t g_interrupted = 0;
 
 /* ── shared state (cache-line aligned to avoid false sharing) ──── */
 static atomic_int  g_found   __attribute__((aligned(64))) = 0;
-static char        g_password[MAX_PASS_LEN + 1] = {0};
+/* Sized for concatenating modes (rule/hybrid/combinator/mutate) whose
+ * candidate buffers are up to MAX_PASS_LEN*2 + 2. */
+static char        g_password[MAX_PASS_LEN * 2 + 1] = {0};
 static atomic_long g_tested  __attribute__((aligned(64))) = 0;
 static atomic_long g_total   = 0;   /* 0 = unknown */
 
@@ -802,7 +804,7 @@ static void *dict_worker(void *arg)
                                         : test_password_cg(doc, g_words[i]);
                 if (hit) {
                     if (!atomic_exchange(&g_found, 1))
-                        strncpy(g_password, g_words[i], MAX_PASS_LEN);
+                        strncpy(g_password, g_words[i], sizeof(g_password) - 1);
                 }
                 if (!hit && g_reverse_mode) {
                     char rev[MAX_PASS_LEN + 1];
@@ -814,7 +816,7 @@ static void *dict_worker(void *arg)
                                                 : test_password_cg(doc, rev);
                             if (hit) {
                                 if (!atomic_exchange(&g_found, 1))
-                                    strncpy(g_password, rev, MAX_PASS_LEN);
+                                    strncpy(g_password, rev, sizeof(g_password) - 1);
                             }
                         }
                     }
@@ -836,7 +838,7 @@ static void *dict_worker(void *arg)
                                     : test_password_cg(doc, g_words[i]);
             if (hit) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, g_words[i], MAX_PASS_LEN);
+                    strncpy(g_password, g_words[i], sizeof(g_password) - 1);
             }
             if (!hit && g_reverse_mode) {
                 char rev[MAX_PASS_LEN + 1];
@@ -848,7 +850,7 @@ static void *dict_worker(void *arg)
                                             : test_password_cg(doc, rev);
                         if (hit) {
                             if (!atomic_exchange(&g_found, 1))
-                                strncpy(g_password, rev, MAX_PASS_LEN);
+                                strncpy(g_password, rev, sizeof(g_password) - 1);
                         }
                     }
                 }
@@ -929,7 +931,7 @@ static void *dict_worker_neon(void *arg)
                 for (int b = 0; b < 4; b++) {
                     if (hits & (1 << b)) {
                         if (!atomic_exchange(&g_found, 1))
-                            strncpy(g_password, pw[b], MAX_PASS_LEN);
+                            strncpy(g_password, pw[b], sizeof(g_password) - 1);
                     }
                 }
             }
@@ -942,7 +944,7 @@ static void *dict_worker_neon(void *arg)
                         reverse_string(pw[b], rev, wlen);
                         if (strcmp(rev, pw[b]) != 0 && test_password_fast(rev)) {
                             if (!atomic_exchange(&g_found, 1))
-                                strncpy(g_password, rev, MAX_PASS_LEN);
+                                strncpy(g_password, rev, sizeof(g_password) - 1);
                         }
                     }
                 }
@@ -961,7 +963,7 @@ static void *dict_worker_neon(void *arg)
             }
             if (test_password_fast(g_words[i])) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, g_words[i], MAX_PASS_LEN);
+                    strncpy(g_password, g_words[i], sizeof(g_password) - 1);
             } else if (g_reverse_mode) {
                 char rev[MAX_PASS_LEN + 1];
                 size_t wlen = strlen(g_words[i]);
@@ -969,7 +971,7 @@ static void *dict_worker_neon(void *arg)
                     reverse_string(g_words[i], rev, wlen);
                     if (strcmp(rev, g_words[i]) != 0 && test_password_fast(rev)) {
                         if (!atomic_exchange(&g_found, 1))
-                            strncpy(g_password, rev, MAX_PASS_LEN);
+                            strncpy(g_password, rev, sizeof(g_password) - 1);
                     }
                 }
             }
@@ -2137,7 +2139,7 @@ static void *incr_consumer_worker(void *arg)
 
         if (test_password_fast(pass)) {
             if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pass, MAX_PASS_LEN);
+                strncpy(g_password, pass, sizeof(g_password) - 1);
             break;
         }
         if (++local_count >= TESTED_BATCH) {
@@ -2249,7 +2251,7 @@ static void *brute_worker(void *arg)
                                         : test_password_cg(doc, pass);
                 if (hit) {
                     if (!atomic_exchange(&g_found, 1))
-                        strncpy(g_password, pass, MAX_PASS_LEN);
+                        strncpy(g_password, pass, sizeof(g_password) - 1);
                 }
             }
         }
@@ -2275,7 +2277,7 @@ static void *brute_worker(void *arg)
                                     : test_password_cg(doc, pass);
             if (hit) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
             }
         }
     }
@@ -2377,7 +2379,7 @@ static void *brute_worker_neon(void *arg)
                     for (int b = 0; b < 4; b++) {
                         if (hits & (1 << b)) {
                             if (!atomic_exchange(&g_found, 1))
-                                strncpy(g_password, pass[b], MAX_PASS_LEN);
+                                strncpy(g_password, pass[b], sizeof(g_password) - 1);
                         }
                     }
                 }
@@ -2397,7 +2399,7 @@ static void *brute_worker_neon(void *arg)
                 }
                 if (test_password_fast(p)) {
                     if (!atomic_exchange(&g_found, 1))
-                        strncpy(g_password, p, MAX_PASS_LEN);
+                        strncpy(g_password, p, sizeof(g_password) - 1);
                 }
             }
         }
@@ -2461,7 +2463,7 @@ static void *brute_worker_neon(void *arg)
                 for (int b = 0; b < 4; b++) {
                     if (hits & (1 << b)) {
                         if (!atomic_exchange(&g_found, 1))
-                            strncpy(g_password, pass[b], MAX_PASS_LEN);
+                            strncpy(g_password, pass[b], sizeof(g_password) - 1);
                     }
                 }
             }
@@ -2481,7 +2483,7 @@ static void *brute_worker_neon(void *arg)
             }
             if (test_password_fast(p)) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, p, MAX_PASS_LEN);
+                    strncpy(g_password, p, sizeof(g_password) - 1);
             }
         }
     }
@@ -2731,7 +2733,7 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
         /* GPU keygen computes user key (Algorithm 2). Check user match. */
         if (user_match && g_password_mode != PW_MODE_OWNER) {
             if (!atomic_exchange(&g_found, 1)) {
-                strncpy(g_password, passwords[i], MAX_PASS_LEN);
+                strncpy(g_password, passwords[i], sizeof(g_password) - 1);
                 g_found_type = "User";
             }
             return 1;
@@ -2742,7 +2744,7 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
         if (g_password_mode == PW_MODE_OWNER || g_password_mode == PW_MODE_BOTH) {
             if (pdf_verify_owner_password(&g_enc_params, passwords[i])) {
                 if (!atomic_exchange(&g_found, 1)) {
-                    strncpy(g_password, passwords[i], MAX_PASS_LEN);
+                    strncpy(g_password, passwords[i], sizeof(g_password) - 1);
                     g_found_type = "Owner";
                 }
                 return 1;
@@ -2877,7 +2879,7 @@ static void *gpu_dict_worker(void *arg)
                         reverse_string(pw_ptrs[pending_buf][i], rev, wlen);
                         if (strcmp(rev, pw_ptrs[pending_buf][i]) != 0 && test_password_fast(rev)) {
                             if (!atomic_exchange(&g_found, 1))
-                                strncpy(g_password, rev, MAX_PASS_LEN);
+                                strncpy(g_password, rev, sizeof(g_password) - 1);
                         }
                     }
                 }
@@ -2905,7 +2907,7 @@ static void *gpu_dict_worker(void *arg)
                     reverse_string(pw_ptrs[pending_buf][i], rev, wlen);
                     if (strcmp(rev, pw_ptrs[pending_buf][i]) != 0 && test_password_fast(rev)) {
                         if (!atomic_exchange(&g_found, 1))
-                            strncpy(g_password, rev, MAX_PASS_LEN);
+                            strncpy(g_password, rev, sizeof(g_password) - 1);
                     }
                 }
             }
@@ -2969,7 +2971,7 @@ static void *rule_worker(void *arg)
                                     : test_password_cg(doc, pass);
             if (hit) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
             }
         }
     }
@@ -3069,7 +3071,7 @@ static void *hybrid_worker(void *arg)
                                     : test_password_cg(doc, pass);
             if (hit) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
             }
         }
     }
@@ -3138,7 +3140,7 @@ static inline int sha256_wait_and_check(void *handle, int count, const char **pw
         : metal_sha256_wait_results(g_sha256_ctx, handle, count);
     if (match >= 0) {
         if (!atomic_exchange(&g_found, 1)) {
-            strncpy(g_password, pw_buf[match], MAX_PASS_LEN);
+            strncpy(g_password, pw_buf[match], sizeof(g_password) - 1);
             if (match_type == 1) g_found_type = "User";
             else if (match_type == 2) g_found_type = "Owner";
             else g_found_type = (g_password_mode == PW_MODE_OWNER) ? "Owner" : "User";
@@ -3385,7 +3387,7 @@ static inline int r6_wait_and_check(void *handle, int count, const char **pw_buf
         : metal_r6_wait_results(g_r6_ctx, handle, count);
     if (match >= 0) {
         if (!atomic_exchange(&g_found, 1)) {
-            strncpy(g_password, pw_buf[match], MAX_PASS_LEN);
+            strncpy(g_password, pw_buf[match], sizeof(g_password) - 1);
             if (match_type == 1) g_found_type = "User";
             else if (match_type == 2) g_found_type = "Owner";
             else g_found_type = (g_password_mode == PW_MODE_OWNER) ? "Owner" : "User";
@@ -3691,7 +3693,7 @@ static void *prince_worker(void *arg)
             prince_index_to_pass(idx, pass);
             if (pass[0] && test_password_fast(pass)) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
                 break;
             }
             if (++local_count >= TESTED_BATCH) {
@@ -3731,7 +3733,7 @@ static void *prince_rule_worker(void *arg)
             apply_rule(base, rule_idx, pass);
             if (pass[0] && test_password_fast(pass)) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
                 break;
             }
         pr_skip:
@@ -3791,7 +3793,7 @@ static void *toggle_worker(void *arg)
 
             if (test_password_fast(pass)) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
                 break;
             }
         }
@@ -3920,7 +3922,7 @@ static void *combinator_worker(void *arg)
 
             if (test_password_fast(pass)) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
                 break;
             }
         }
@@ -4151,7 +4153,7 @@ static void *dates_worker(void *arg)
 
             if (test_password_fast(pass)) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
                 break;
             }
         }
@@ -4382,7 +4384,7 @@ static void *mutate_worker(void *arg)
 
             if (pass[0] && test_password_fast(pass)) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
                 break;
             }
         }
@@ -4632,7 +4634,7 @@ static void *leet_worker(void *arg)
 
             if (test_password_fast(pass)) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
                 break;
             }
         }
@@ -4775,7 +4777,7 @@ static void *mask_rule_worker(void *arg)
 
             if (pass[0] && test_password_fast(pass)) {
                 if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, MAX_PASS_LEN);
+                    strncpy(g_password, pass, sizeof(g_password) - 1);
                 break;
             }
         }
@@ -4957,7 +4959,7 @@ static int run_fingerprint_attack(int nthreads, pthread_t *threads, int *spawned
             for (int i = 0; i < meta_count && !atomic_load(&g_found); i++) {
                 if (test_password_fast(meta_words[i])) {
                     if (!atomic_exchange(&g_found, 1))
-                        strncpy(g_password, meta_words[i], MAX_PASS_LEN);
+                        strncpy(g_password, meta_words[i], sizeof(g_password) - 1);
                     for (int j = 0; j < meta_count; j++) free(meta_words[j]);
                     free(meta_words);
                     return 1;
@@ -4976,7 +4978,7 @@ static int run_fingerprint_attack(int nthreads, pthread_t *threads, int *spawned
         const char *pw = g_fingerprint_passwords[i];
         if (test_password_fast(pw)) {
             if (!atomic_exchange(&g_found, 1))
-                strncpy(g_password, pw, MAX_PASS_LEN);
+                strncpy(g_password, pw, sizeof(g_password) - 1);
             return 1;
         }
         atomic_fetch_add(&g_tested, 1);
@@ -4993,7 +4995,7 @@ static int run_fingerprint_attack(int nthreads, pthread_t *threads, int *spawned
             for (int i = 0; i < nwalks && !atomic_load(&g_found); i++) {
                 if (test_password_fast(kw_walks[i])) {
                     if (!atomic_exchange(&g_found, 1))
-                        strncpy(g_password, kw_walks[i], MAX_PASS_LEN);
+                        strncpy(g_password, kw_walks[i], sizeof(g_password) - 1);
                     free(kw_walks);
                     return 1;
                 }
@@ -5016,25 +5018,25 @@ static int run_fingerprint_attack(int nthreads, pthread_t *threads, int *spawned
                 /* YYYYMMDD */
                 snprintf(datepw, sizeof(datepw), "%04d%02d%02d", y, m, d);
                 if (test_password_fast(datepw)) {
-                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN);
+                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, sizeof(g_password) - 1);
                     return 1;
                 }
                 /* MMDDYYYY */
                 snprintf(datepw, sizeof(datepw), "%02d%02d%04d", m, d, y);
                 if (test_password_fast(datepw)) {
-                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN);
+                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, sizeof(g_password) - 1);
                     return 1;
                 }
                 /* DDMMYYYY */
                 snprintf(datepw, sizeof(datepw), "%02d%02d%04d", d, m, y);
                 if (test_password_fast(datepw)) {
-                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN);
+                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, sizeof(g_password) - 1);
                     return 1;
                 }
                 /* Short forms: MMDD, DDMM, YYYY */
                 snprintf(datepw, sizeof(datepw), "%02d%02d", m, d);
                 if (test_password_fast(datepw)) {
-                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN);
+                    if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, sizeof(g_password) - 1);
                     return 1;
                 }
                 atomic_fetch_add(&g_tested, 4);
@@ -5043,7 +5045,7 @@ static int run_fingerprint_attack(int nthreads, pthread_t *threads, int *spawned
         /* Just the year */
         snprintf(datepw, sizeof(datepw), "%04d", y);
         if (test_password_fast(datepw)) {
-            if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, MAX_PASS_LEN);
+            if (!atomic_exchange(&g_found, 1)) strncpy(g_password, datepw, sizeof(g_password) - 1);
             return 1;
         }
         atomic_fetch_add(&g_tested, 1);
@@ -5625,7 +5627,7 @@ static inline int smart_try(const char *pw)
 {
     if (test_password_fast(pw)) {
         if (!atomic_exchange(&g_found, 1))
-            strncpy(g_password, pw, MAX_PASS_LEN);
+            strncpy(g_password, pw, sizeof(g_password) - 1);
         return 1;
     }
     atomic_fetch_add(&g_tested, 1);
@@ -6128,9 +6130,9 @@ static int run_pattern_attack(int nthreads, pthread_t *threads, int *spawned_out
         /* name + year, Name + year (1990-2026) */
         for (int y = 1990; y <= 2026 && !atomic_load(&g_found); y++) {
             snprintf(pw, sizeof(pw), "%s%d", name, y);
-            if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); break; }
+            if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, sizeof(g_password) - 1); break; }
             snprintf(pw, sizeof(pw), "%s%d", cap, y);
-            if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); break; }
+            if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, sizeof(g_password) - 1); break; }
             atomic_fetch_add(&g_tested, 2);
         }
         if (atomic_load(&g_found)) break;
@@ -6138,7 +6140,7 @@ static int run_pattern_attack(int nthreads, pthread_t *threads, int *spawned_out
         /* name + 0..999, Name + 0..999 */
         for (int d = 0; d <= 999 && !atomic_load(&g_found); d++) {
             snprintf(pw, sizeof(pw), "%s%d", name, d);
-            if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); break; }
+            if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, sizeof(g_password) - 1); break; }
             atomic_fetch_add(&g_tested, 1);
         }
         if (atomic_load(&g_found)) break;
@@ -6149,7 +6151,7 @@ static int run_pattern_attack(int nthreads, pthread_t *threads, int *spawned_out
             for (int s = 0; syms[s] && !atomic_load(&g_found); s++) {
                 if (nlen + strlen(syms[s]) <= MAX_PASS_LEN) {
                     snprintf(pw, sizeof(pw), "%s%s", cap, syms[s]);
-                    if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, MAX_PASS_LEN); break; }
+                    if (test_password_fast(pw)) { if (!atomic_exchange(&g_found, 1)) strncpy(g_password, pw, sizeof(g_password) - 1); break; }
                     atomic_fetch_add(&g_tested, 1);
                 }
             }
@@ -6168,7 +6170,7 @@ static int run_pattern_attack(int nthreads, pthread_t *threads, int *spawned_out
                     snprintf(pw, sizeof(pw), "%s%s", g_common_names[i], g_common_names[j]);
                     if (test_password_fast(pw)) {
                         if (!atomic_exchange(&g_found, 1))
-                            strncpy(g_password, pw, MAX_PASS_LEN);
+                            strncpy(g_password, pw, sizeof(g_password) - 1);
                         break;
                     }
                     atomic_fetch_add(&g_tested, 1);
