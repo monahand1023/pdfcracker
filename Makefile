@@ -45,6 +45,14 @@ test_all: test_all.c pdf_encrypt.o saslprep.o pdf_encrypt.h
 test_saslprep: test_saslprep.c saslprep.o saslprep.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ test_saslprep.c saslprep.o
 
+test_crypto: test_crypto.c pdf_encrypt.o saslprep.o pdf_encrypt.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ test_crypto.c pdf_encrypt.o saslprep.o
+
+test: test_all test_saslprep test_crypto
+	./test_all
+	./test_saslprep
+	./test_crypto
+
 clean:
 	rm -f pdfcrack server client test_all test_crypto test_saslprep fuzz_rules checkpoint.o *.o *.air *.metallib *.profraw *.profdata
 
@@ -62,4 +70,4 @@ pgo:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="$(CFLAGS) -fprofile-use -fprofile-correction"
 
-.PHONY: all clean test-integration fuzz-rules pgo
+.PHONY: all clean test test-integration fuzz-rules pgo
