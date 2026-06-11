@@ -105,30 +105,38 @@ int main(void)
                (int)(N/our_s), (int)(N/cg_s), cg_s/our_s);
     }
 
-    /* ── Batch4 cross-validation: NEON SIMD must match scalar ──── */
-    printf("━━━ Batch4 NEON vs Scalar cross-validation ━━━\n");
+    /* ── Batch4 NEON vs Scalar cross-validation (R2–R4 only) ────
+     * R5/R6 have no batch4 path; they are validated against
+     * CoreGraphics in the main loop above. */
+    printf("━━━ Batch4 NEON vs Scalar cross-validation (R2–R4) ━━━\n");
     for (int c = 0; cases[c].file; c++) {
         TestCase *tc = &cases[c];
         PDFEncryptParams params = pdf_parse_encrypt_file(tc->file);
-        if (!params.valid || params.revision >= 5) continue;
+        if (!params.valid || params.revision < 2 || params.revision > 4) continue;
 
-        const char *pw_user[4]  = { tc->user_pass,  "WRONG1", "WRONG2", "WRONG3" };
-        const char *pw_owner[4] = { tc->owner_pass, "WRONG1", "WRONG2", "WRONG3" };
-        int ul[4] = { (int)strlen(pw_user[0]),  6, 6, 6 };
-        int ol[4] = { (int)strlen(pw_owner[0]), 6, 6, 6 };
+        const char *pw_user[4]  = { tc->user_pass,  "WRONG1", tc->owner_pass, "" };
+        const char *pw_owner[4] = { tc->owner_pass, "WRONG1", tc->user_pass,  "" };
+        int ul[4], ol[4];
+        for (int i = 0; i < 4; i++) { ul[i] = (int)strlen(pw_user[i]); ol[i] = (int)strlen(pw_owner[i]); }
 
         int u_hits = pdf_verify_user_batch4(&params, pw_user, ul);
         int o_hits = pdf_verify_owner_batch4(&params, pw_owner, ol);
 
-        int u_ok = (u_hits & 1) == 1 && (u_hits & 0xE) == 0;
-        int o_ok = (o_hits & 1) == 1 && (o_hits & 0xE) == 0;
+        for (int i = 0; i < 4; i++) {
+            int scal_u  = pdf_verify_user_password(&params, pw_user[i]);
+            int batch_u = (u_hits >> i) & 1;
+            int ok = (scal_u == batch_u);
+            if (ok) total_pass++; else total_fail++;
+            printf("  [%s] %s user lane %d \"%s\" scalar=%d batch4=%d\n",
+                   ok ? "PASS" : "FAIL", tc->file, i, pw_user[i], scal_u, batch_u);
 
-        if (u_ok) total_pass++; else total_fail++;
-        printf("  [%s] %s batch4 user  \"%s\"\n",
-               u_ok ? "PASS" : "FAIL", tc->file, tc->user_pass);
-        if (o_ok) total_pass++; else total_fail++;
-        printf("  [%s] %s batch4 owner \"%s\"\n",
-               o_ok ? "PASS" : "FAIL", tc->file, tc->owner_pass);
+            int scal_o  = pdf_verify_owner_password(&params, pw_owner[i]);
+            int batch_o = (o_hits >> i) & 1;
+            ok = (scal_o == batch_o);
+            if (ok) total_pass++; else total_fail++;
+            printf("  [%s] %s owner lane %d \"%s\" scalar=%d batch4=%d\n",
+                   ok ? "PASS" : "FAIL", tc->file, i, pw_owner[i], scal_o, batch_o);
+        }
     }
     printf("\n");
 

@@ -306,15 +306,17 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# --- 33. GPU vs CPU consistency ---
-# Verify GPU path finds same password as CPU-only dictionary attack
-echo "passaes" > "$TMPDIR/dict_gpu_check.txt"
-gpu_output=$(timeout 30 $PDFCRACK -f test_r4_aes128.pdf -d "$TMPDIR/dict_gpu_check.txt" --no-pot 2>/dev/null) || true
-if echo "$gpu_output" | grep -qF "passaes"; then
-    echo "  [PASS] GPU vs CPU consistency"
+# --- 33. GPU vs CPU consistency (R5) ---
+# Both GPU and CPU-only paths must find the same password on R5 (AES-256).
+GWL="$TMPDIR/gwl_r5.txt"
+printf 'nope1\npass256\nnope2\n' > "$GWL"
+g_out=$(timeout 30 $PDFCRACK -f test_r5_aes256.pdf -d "$GWL" --no-pot 2>&1 | grep -i 'found') || true
+c_out=$(timeout 30 $PDFCRACK -f test_r5_aes256.pdf -d "$GWL" -G --no-pot 2>&1 | grep -i 'found') || true
+if [ -n "$g_out" ] && [ "$g_out" = "$c_out" ]; then
+    echo "  [PASS] GPU vs CPU consistency (R5)"
     PASS=$((PASS + 1))
 else
-    echo "  [FAIL] GPU vs CPU consistency (GPU path failed to find password)"
+    echo "  [FAIL] GPU vs CPU consistency (R5) g='$g_out' c='$c_out'"
     FAIL=$((FAIL + 1))
 fi
 
