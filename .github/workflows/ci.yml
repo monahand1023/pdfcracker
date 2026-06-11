@@ -1,0 +1,25 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  build-test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Unit tests
+        run: make test
+      - name: Integration tests
+        run: bash test_integration.sh
+      - name: Build rules fuzzer
+        run: make fuzz-rules
+      - name: Smoke-fuzz rules (30s)
+        run: ./fuzz_rules -max_total_time=30 || true
+  asan:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: ASan unit + parser fuzz
+        run: |
+          make CFLAGS="-O1 -g -fsanitize=address,undefined -Wall" test_all test_crypto
+          ./test_all && ./test_crypto
