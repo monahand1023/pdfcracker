@@ -6629,6 +6629,13 @@ int main(int argc, char *argv[])
         if (min_len < 0) min_len = 0;
         if (max_len < 0) max_len = 0;
     }
+    /* Brute-force candidate buffers are MAX_PASS_LEN; the middle we
+     * actually enumerate cannot exceed it (prefix/suffix are separate). */
+    if (max_len > MAX_PASS_LEN - g_prefix_len - g_suffix_len) {
+        max_len = MAX_PASS_LEN - g_prefix_len - g_suffix_len;
+        fprintf(stderr, "Note: max length clamped to %d (buffer limit)\n", max_len);
+    }
+    if (min_len > max_len) min_len = max_len;
 
     /* ── Validate new mode combinations ──────────────────────────── */
     if (g_rule_mode && !dict_path && !g_mask_mode) {
