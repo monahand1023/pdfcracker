@@ -163,7 +163,8 @@ MetalKeygenContext *metal_keygen_init(const PDFEncryptParams *params,
         gpu_params.encrypt_metadata = (uint32_t)params->encrypt_metadata;
         gpu_params.file_id_len      = (uint32_t)params->file_id_len;
         memcpy(gpu_params.o_value, params->o_value, 32);
-        memcpy(gpu_params.file_id, params->file_id, params->file_id_len);
+        size_t fid = params->file_id_len > 48 ? 48 : params->file_id_len;
+        memcpy(gpu_params.file_id, params->file_id, fid);
 
         /* Copy PDF_PASSWORD_PADDING into the GPU struct */
         static const uint8_t pdf_pad[32] = {

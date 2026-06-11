@@ -454,6 +454,7 @@ PDFEncryptParams pdf_parse_encrypt(const uint8_t *data, size_t len)
             id_val = skip_ws(id_val, end);
             params.file_id_len = parse_pdf_string(id_val, end, params.file_id,
                                                    48, NULL);
+            if (params.file_id_len > 48) params.file_id_len = 48;
         }
     }
 
@@ -632,6 +633,7 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
                           const uint8_t *salt, const uint8_t *extra,
                           int extra_len, uint8_t *out)
 {
+    if (pw_len > 127) return; /* normalize_password_r6 caps at 127; defend the buffers */
     /* Step a: SHA-256(password + salt + extra) */
     uint8_t hash[64]; /* large enough for SHA-512 */
 
