@@ -5,7 +5,11 @@
  *   1. Map: non-ASCII spaces → U+0020, "commonly mapped to nothing" → removed
  *   2. Normalize: NFKC via CoreFoundation
  *   3. Prohibit: certain codepoints (return error)
- *   4. Bidi: simplified check (reject if mixed L and R/AL)
+ *   4. Bidi: NOT enforced — RFC 3454 §6 / RFC 4013 bidirectional rules
+ *      (prohibit RandALCat+LCat mixing; require RandALCat strings to start
+ *      and end with RandALCat) are not implemented here.  PDF 2.0 spec
+ *      (ISO 32000-2) does not mandate bidi rejection for passwords, and
+ *      omitting it avoids false rejections on mixed-script passwords.
  *
  * Pure ASCII passwords (the common case) take a fast path with no allocation.
  */

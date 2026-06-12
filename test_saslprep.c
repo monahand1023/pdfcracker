@@ -167,6 +167,104 @@ static void test_null_input(void)
 }
 
 /* ================================================================
+ * Test 6: NFKC normalization
+ * Full-width ASCII characters (U+FF01..U+FF5E) NFKC-normalize to their
+ * plain ASCII equivalents. Also tests a composed → NFKC round-trip.
+ * ================================================================ */
+static void test_nfkc_normalization(void)
+{
+    printf("test_nfkc_normalization:\n");
+
+    /* Full-width digit '1' (U+FF11, UTF-8: \xEF\xBC\x91) → ASCII '1' (0x31)
+     * NFKC compatibility decomposition maps U+FF11 to U+0031.               */
+    const char fw1[] = "\xEF\xBC\x91";
+    check_pass("fullwidth_1_to_ascii", fw1, 3, "1", 1);
+
+    /* Full-width capital A (U+FF21, UTF-8: \xEF\xBC\xA1) → ASCII 'A' (0x41) */
+    const char fwA[] = "\xEF\xBC\xA1";
+    check_pass("fullwidth_A_to_ascii", fwA, 3, "A", 1);
+
+    /* U+00E9 (é, precomposed) should survive NFKC unchanged (it IS the NFC
+     * form of e + combining accent); input and output are both é.           */
+    const char eacute[] = "\xC3\xA9"; /* UTF-8 for U+00E9 */
+    check_pass("e_acute_precomposed", eacute, 2, "\xC3\xA9", 2);
+}
+
+/* ================================================================
+ * Test 7: Mapped-to-nothing characters are deleted
+ * SOFT HYPHEN (U+00AD, UTF-8: \xC2\xAD) is in RFC 3454 B.1 and
+ * must be removed from the output.
+ * ================================================================ */
+static void test_mapped_to_nothing(void)
+{
+    printf("test_mapped_to_nothing:\n");
+
+    /* U+00AD SOFT HYPHEN between 'a' and 'b' → "ab" */
+    const char soft_hyphen[] = "a\xC2\xAD" "b";
+    check_pass("soft_hyphen_removed", soft_hyphen, 4, "ab", 2);
+
+    /* BOM / ZERO WIDTH NO-BREAK SPACE (U+FEFF, UTF-8: \xEF\xBB\xBF)
+     * is in RFC 3454 B.1; strip it.                                  */
+    const char bom[] = "\xEF\xBB\xBF" "pw";
+    check_pass("bom_removed", bom, 5, "pw", 2);
+}
+
+/* ================================================================
+ * Test 8: Invalid UTF-8 / truncated sequences — must not crash
+ * These inputs are malformed; saslprep() may return 0 or -1, but
+ * must not crash or produce out-of-bounds reads.
+ * ================================================================ */
+static void test_invalid_utf8(void)
+{
+    printf("test_invalid_utf8:\n");
+
+    uint8_t out[128];
+    size_t  out_len;
+
+    /* Truncated 2-byte sequence: lead byte \xC2 with no continuation */
+    {
+        const char trunc2[] = "\xC2";
+        out_len = 99;
+        int rc = saslprep(trunc2, 1, out, &out_len);
+        /* Either success (CoreFoundation may substitute replacement char)
+         * or error — the key requirement is no crash.                   */
+        (void)rc;
+        printf("  PASS [truncated 2-byte seq: rc=%d, out_len=%zu — no crash]\n",
+               rc, out_len);
+    }
+
+    /* Truncated 3-byte sequence: two lead bytes, missing final byte */
+    {
+        const char trunc3[] = "\xE2\x80"; /* missing \xA8 for U+2028 */
+        out_len = 99;
+        int rc = saslprep(trunc3, 2, out, &out_len);
+        (void)rc;
+        printf("  PASS [truncated 3-byte seq: rc=%d, out_len=%zu — no crash]\n",
+               rc, out_len);
+    }
+
+    /* Bare continuation byte (invalid sequence start) */
+    {
+        const char cont[] = "\x80" "pw";
+        out_len = 99;
+        int rc = saslprep(cont, 3, out, &out_len);
+        (void)rc;
+        printf("  PASS [bare continuation byte: rc=%d, out_len=%zu — no crash]\n",
+               rc, out_len);
+    }
+
+    /* Overlong encoding (four-byte form for U+0041 'A', always invalid) */
+    {
+        const char over4[] = "\xF0\x80\x81\x81";
+        out_len = 99;
+        int rc = saslprep(over4, 4, out, &out_len);
+        (void)rc;
+        printf("  PASS [overlong 4-byte encoding: rc=%d, out_len=%zu — no crash]\n",
+               rc, out_len);
+    }
+}
+
+/* ================================================================
  * main
  * ================================================================ */
 int main(void)
@@ -179,6 +277,9 @@ int main(void)
     test_prohibited_chars();
     test_space_mapping();
     test_null_input();
+    test_nfkc_normalization();
+    test_mapped_to_nothing();
+    test_invalid_utf8();
 
     printf("\nAll saslprep tests passed.\n");
     return 0;
