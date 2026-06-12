@@ -42,9 +42,10 @@ No external dependencies. Everything uses CommonCrypto, CoreGraphics, and Metal 
 
 ```bash
 git clone <repo-url> && cd pdfcracker
-make          # builds pdfcrack, server, client, test_all
-make test_all && ./test_all   # run unit tests (44 tests, 8 PDF variants)
-bash test_integration.sh      # run end-to-end integration tests (41 tests)
+make          # builds pdfcrack, server, client
+make test     # run all unit suites (test_all 80 assertions + saslprep + test_crypto)
+bash test_integration.sh      # run end-to-end integration tests (45 tests)
+bash bench.sh                 # quick per-engine benchmark across R2–R6 (run on an idle machine)
 ```
 
 ---
@@ -96,10 +97,15 @@ flowchart TD
 | `server.c` | Distributed coordinator: lease-based work distribution + local cracking |
 | `client.c` | Distributed worker node: supports all GPU acceleration |
 | `protocol.h` | Text-line TCP protocol for server↔client communication |
-| `fuzz_rules.c` | Fuzzer for the rules engine |
-| `test_all.c` | Unit test suite: 44 tests across 8 PDF variants |
-| `test_integration.sh` | 41 end-to-end integration tests |
-| `Makefile` | Build system; includes `pgo` target for profile-guided optimization |
+| `rules.c` / `rules.h` | Hashcat-compatible rule engine (shared by the cracker and the fuzzer) |
+| `pdf_gpu_types.h` | GPU parameter structs shared by the Metal host and shader |
+| `fuzz_rules.c` | libFuzzer harness for the rules engine (links the real `rules.c`) |
+| `test_parse_fuzz.c` | ASan/UBSan libFuzzer harness for the PDF encryption parser |
+| `test_all.c` | Unit test suite: 80 assertions across 8 PDF variants (CoreGraphics + NEON/scalar cross-validation) |
+| `test_integration.sh` | 45 end-to-end integration tests (incl. distributed loopback) |
+| `bench.sh` | Repeatable per-engine benchmark across R2–R6 |
+| `.github/workflows/ci.yml` | CI: build, unit + integration tests, ASan/UBSan, fuzz smoke (macOS Apple Silicon) |
+| `Makefile` | Build system; `make test` aggregate, `pgo` target, fuzz targets |
 
 ---
 
@@ -412,11 +418,14 @@ Each client has a persistent UUID (`~/.pdfcracker_id`) so the server recognises 
 ## Testing
 
 ```bash
-make test_all && ./test_all        # 44 unit tests, 8 PDF variants (R2–R6)
-bash test_integration.sh           # 41 end-to-end tests
+make test                          # all unit suites: test_all (80) + saslprep + test_crypto (6)
+bash test_integration.sh           # 45 end-to-end tests (R2–R6)
+make fuzz-parse && ./fuzz_parse corpus   # ASan/UBSan fuzz of the PDF parser
 ```
 
-`test_all.c` verifies every verify function against Apple's CoreGraphics API and tests the NEON batch4 path against scalar results. `test_integration.sh` covers all attack modes end-to-end including checkpoints, GPU/CPU consistency, smart mode, distributed protocol basics, and edge cases.
+CI (`.github/workflows/ci.yml`) runs the build, all unit suites, the integration suite, an ASan/UBSan job, and a fuzz smoke run on every push.
+
+`test_all.c` verifies every verify function against Apple's CoreGraphics API and cross-validates the NEON batch4 path against scalar results per-lane. `test_integration.sh` covers all attack modes end-to-end including checkpoints (corruption + document-mismatch rejection), GPU↔CPU consistency, smart mode, a distributed server↔client loopback, and edge cases.
 
 ---
 

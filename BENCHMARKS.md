@@ -24,6 +24,8 @@ Speeds are measured from the live progress meter during an actual brute-force ru
 | R5 | AES-256 / SHA-256 | **~45M/s** | GPU | GPU does full SHA-256 verification |
 | R6 | AES-256 / SHA-256+KDF | **~15.6K/s** | GPU+CPU cooperative | Metal GPU + 14 CPU threads + NEON SHA-512 |
 
+> **Reproducing these numbers:** run `bash bench.sh` for a quick per-engine snapshot, or read the live progress meter during a real attack for doc-grade figures. Measure on an **idle** machine — a competing GPU/CPU task skews the GPU-bound (R5/R6) and cooperative (R3/R4) numbers low. The R5/R6 KDF path additionally benefits from the on-the-fly R6 K1 generation and Private-storage scratch added in the performance pass; re-measure on idle hardware to capture the current best speeds.
+
 ### Optimization History
 
 | Revision | Phase 1 (CommonCrypto) | Phase 2 (Metal GPU) | Phase 3 (NEON SIMD) | Phase 4 (GPU+NEON simultaneous) |
