@@ -236,7 +236,11 @@ static pthread_cond_t  g_incr_not_empty = PTHREAD_COND_INITIALIZER;
 static int    g_incremental_mode = 0;
 
 /* -- Toggle-case walk mode ------------------------------------ */
-static int    g_toggle_mode = 0;
+static int    g_toggle_mode   = 0;
+/* g_toggle_cumul[w] = sum of variant counts for words 0..w-1 (prefix sum).
+ * Word w covers flat indices [g_toggle_cumul[w], g_toggle_cumul[w+1]).
+ * Allocated once at toggle setup; freed after the attack completes. */
+static long  *g_toggle_cumul  = NULL;
 
 /* -- Combinator attack ---------------------------------------- */
 #define ATTACK_COMBINATOR 8
@@ -2850,27 +2854,46 @@ static void sha256_hybrid_gen(long idx, char *out, void *ctx)
     hybrid_gen_pass(word_idx, suffix_idx, out);
 }
 
-/* ── Toggle generator (flat index decode extracted from gpu_sha256_toggle_worker) */
+/* ── Toggle generator (flat index → word + variant) ────────────────────
+ * When g_toggle_cumul is available (precomputed at toggle setup): O(log n)
+ * binary search maps flat → (word_idx, intra-word variant bits).
+ * Fallback: O(n) linear scan used if the cumul array was not allocated. */
 static void sha256_toggle_gen(long flat, char *out, void *ctx)
 {
     (void)ctx;
     long word_idx = 0;
-    long cumul = 0;
-    for (long w = 0; w < g_nwords; w++) {
-        size_t wlen = strlen(g_words[w]);
-        int na = 0;
-        for (size_t j = 0; j < wlen && j < MAX_PASS_LEN; j++)
-            if (isalpha((unsigned char)g_words[w][j])) na++;
-        if (na > 16) na = 16;
-        long nv = 1L << na;
-        if (flat < cumul + nv) { word_idx = w; flat -= cumul; break; }
-        cumul += nv;
+    long offset   = flat;
+
+    if (g_toggle_cumul) {
+        /* Binary search: find largest w s.t. g_toggle_cumul[w] <= flat */
+        long lo = 0, hi = g_nwords - 1;
+        while (lo < hi) {
+            long mid = lo + (hi - lo + 1) / 2;
+            if (g_toggle_cumul[mid] <= flat) lo = mid;
+            else                              hi = mid - 1;
+        }
+        word_idx = lo;
+        offset   = flat - g_toggle_cumul[lo];
+    } else {
+        /* Fallback O(n) scan (no precomputed table) */
+        long cumul = 0;
+        for (long w = 0; w < g_nwords; w++) {
+            size_t wlen = strlen(g_words[w]);
+            int na = 0;
+            for (size_t j = 0; j < wlen && j < MAX_PASS_LEN; j++)
+                if (isalpha((unsigned char)g_words[w][j])) na++;
+            if (na > 16) na = 16;
+            long nv = 1L << na;
+            if (flat < cumul + nv) { word_idx = w; offset = flat - cumul; break; }
+            cumul += nv;
+        }
     }
+
     const char *word = g_words[word_idx];
     size_t wlen = strlen(word);
     strncpy(out, word, MAX_PASS_LEN);
     out[MAX_PASS_LEN] = '\0';
-    long v = flat;
+    long v = offset;
     int bi = 0;
     for (size_t j = 0; j < wlen && j < MAX_PASS_LEN; j++) {
         if (isalpha((unsigned char)word[j])) {
@@ -6170,9 +6193,14 @@ int main(int argc, char *argv[])
             return 1;
         }
 
-        /* Compute total variants */
+        /* Compute total variants and build cumulative-offset table for
+         * O(log n) flat-index decode in sha256_toggle_gen.
+         * g_toggle_cumul[w] = sum of variant counts for words 0..w-1. */
+        free(g_toggle_cumul);
+        g_toggle_cumul = malloc((size_t)g_nwords * sizeof(long));
         long toggle_total = 0;
         for (long w = 0; w < g_nwords; w++) {
+            if (g_toggle_cumul) g_toggle_cumul[w] = toggle_total;
             size_t wlen = strlen(g_words[w]);
             int na = 0;
             for (size_t j = 0; j < wlen && j < MAX_PASS_LEN; j++)
@@ -6198,6 +6226,7 @@ int main(int argc, char *argv[])
         }
         for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
 
+        free(g_toggle_cumul); g_toggle_cumul = NULL;
         for (long i = 0; i < g_nwords; i++) free(g_words[i]);
         free(g_words);
     }
