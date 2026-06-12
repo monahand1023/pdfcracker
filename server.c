@@ -606,7 +606,7 @@ static void http_serve_file(int fd, const char *path, const char *content_type)
     char buf[8192];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        write(fd, buf, n);
+        if (write_exact(fd, buf, n) < 0) break;
     }
     fclose(fp);
 }
@@ -2121,7 +2121,10 @@ int main(int argc, char *argv[])
             case 'f': pdf_path     = optarg;       break;
             case 'd': dict_path    = optarg;       break;
             case 'b': brute        = 1;            break;
-            case 'l': max_len      = atoi(optarg); break;
+            case 'l': max_len      = atoi(optarg);
+                      if (max_len > MAX_PASS_LEN) max_len = MAX_PASS_LEN;
+                      if (max_len < 1) max_len = 1;
+                      break;
             case 'c': charset      = optarg;       break;
             case 'p': port         = atoi(optarg); break;
             case 'R': restore_path = optarg;       break;

@@ -1247,6 +1247,8 @@ static int run_session(const char *host, int port)
 
     int pw_mode_tmp = PW_MODE_BOTH;
     if (sscanf(line, "CONFIG BRUTE %d %d", &g_max_len, &pw_mode_tmp) >= 1) {
+        if (g_max_len > MAX_PASS_LEN) g_max_len = MAX_PASS_LEN;
+        if (g_max_len < 0) g_max_len = 0;
         g_brute = 1;
         g_password_mode = pw_mode_tmp;
         /* Read CHARSET line */
@@ -1300,6 +1302,10 @@ static int run_session(const char *host, int port)
     long pdf_size = 0;
     if (sscanf(line, "PDF %ld", &pdf_size) != 1 || pdf_size <= 0) {
         fprintf(stderr, "Bad PDF header: %s\n", line);
+        close(fd); g_server_fd = -1; return 1;
+    }
+    if (pdf_size > (512L*1024*1024)) {
+        fprintf(stderr, "PDF too large (%ld)\n", pdf_size);
         close(fd); g_server_fd = -1; return 1;
     }
 
@@ -1427,6 +1433,10 @@ static int run_session(const char *host, int port)
 
         if (sscanf(line, "BRUTE %d %ld %ld %lu", &blen, &bstart, &bend,
                    (unsigned long *)&lease_id) == 4) {
+            if (blen < 1 || blen > MAX_PASS_LEN) {
+                fprintf(stderr, "bad BRUTE length %d\n", blen);
+                continue;
+            }
             g_current_lease_id = lease_id;
             fprintf(stderr, "\r  chunk %d: brute len=%d [%ld..%ld) (%ld passwords) lease=%lu   \n",
                     ++chunks_done, blen, bstart, bend, bend - bstart,
