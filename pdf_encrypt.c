@@ -30,6 +30,10 @@
 /* Inline RC4 — replaces CCCrypt for small inputs (16/32 bytes) */
 #include "rc4_inline.h"
 
+/* ── PDF crypto constants ────────────────────────────────────── */
+#define R3_KEY_ITERATIONS    50  /* MD5 iterations in R3+ key derivation (Alg 2) */
+#define R34_RC4_EXTRA_PASSES 19  /* extra RC4 passes in Alg 5 U-check and owner decrypt */
+
 /* NEON SIMD acceleration for SHA-256/384/512 and AES-128-CBC (R6 path) */
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_SHA2)
 #include "sha256_simd.h"
@@ -527,6 +531,58 @@ static inline void pad_password(const char *password, uint8_t padded[32])
         memcpy(padded + plen, PDF_PASSWORD_PADDING, PDF_PASSWORD_PADDING_LEN - plen);
 }
 
+/* ── Helper: compute key-length in bytes, clamped to [5, 16] ──── */
+static inline int key_bytes_for(const PDFEncryptParams *p)
+{
+    int kb = p->key_length / 8;
+    if (kb < 5)  kb = 5;
+    if (kb > 16) kb = 16;
+    return kb;
+}
+
+/* ── Helper: serialize permissions as 4 bytes little-endian ───── */
+static inline void p_to_le32(int32_t perm, uint8_t out[4])
+{
+    out[0] = (uint8_t)(perm & 0xFF);
+    out[1] = (uint8_t)((perm >> 8) & 0xFF);
+    out[2] = (uint8_t)((perm >> 16) & 0xFF);
+    out[3] = (uint8_t)((perm >> 24) & 0xFF);
+}
+
+/* ── Helper: Algorithm 2 key derivation from a pre-padded 32-byte password ──
+ * Shared by pdf_compute_encryption_key and verify_user_with_padded.       */
+static int compute_key_from_padded(const PDFEncryptParams *p,
+                                    const uint8_t padded[32],
+                                    uint8_t key_out[16])
+{
+    int key_bytes = key_bytes_for(p);
+
+    /* Steps b-f: MD5(padded + O + P(LE) + fileID [+ 0xFFFFFFFF if R>=4 && !meta]) */
+    CC_MD5_CTX md5;
+    CC_MD5_Init(&md5);
+    CC_MD5_Update(&md5, padded, 32);
+    CC_MD5_Update(&md5, p->o_value, 32);
+    uint8_t pb[4];
+    p_to_le32(p->permissions, pb);
+    CC_MD5_Update(&md5, pb, 4);
+    CC_MD5_Update(&md5, p->file_id, (CC_LONG)p->file_id_len);
+    if (p->revision >= 4 && !p->encrypt_metadata) {
+        uint8_t ff[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+        CC_MD5_Update(&md5, ff, 4);
+    }
+    uint8_t hash[CC_MD5_DIGEST_LENGTH];
+    CC_MD5_Final(hash, &md5);
+
+    /* Step g: For R >= 3, iterate MD5 R3_KEY_ITERATIONS times on first key_bytes */
+    if (p->revision >= 3) {
+        for (int i = 0; i < R3_KEY_ITERATIONS; i++)
+            CC_MD5(hash, (CC_LONG)key_bytes, hash);
+    }
+
+    memcpy(key_out, hash, (size_t)key_bytes);
+    return key_bytes;
+}
+
 /* ================================================================
  * Algorithm 2: Compute encryption key from user password
  * (ISO 32000-1 section 7.6.3.3)
@@ -535,54 +591,9 @@ int pdf_compute_encryption_key(const PDFEncryptParams *params,
                                const char *password,
                                uint8_t *key_out)
 {
-    int key_bytes = params->key_length / 8;
-    if (key_bytes < 5)  key_bytes = 5;
-    if (key_bytes > 16) key_bytes = 16;
-
-    /* Step a: Pad or truncate password to 32 bytes */
     uint8_t padded[32];
     pad_password(password, padded);
-
-    /* Step b-f: MD5 hash of padded + O + P(LE) + fileID [+ 0xFFFFFFFF if !encryptMetadata] */
-    CC_MD5_CTX md5;
-    CC_MD5_Init(&md5);
-
-    /* (b) password */
-    CC_MD5_Update(&md5, padded, 32);
-
-    /* (c) O value */
-    CC_MD5_Update(&md5, params->o_value, 32);
-
-    /* (d) P value as 4 bytes little-endian */
-    uint8_t p_bytes[4];
-    int32_t perm = params->permissions;
-    p_bytes[0] = (uint8_t)(perm & 0xFF);
-    p_bytes[1] = (uint8_t)((perm >> 8) & 0xFF);
-    p_bytes[2] = (uint8_t)((perm >> 16) & 0xFF);
-    p_bytes[3] = (uint8_t)((perm >> 24) & 0xFF);
-    CC_MD5_Update(&md5, p_bytes, 4);
-
-    /* (e) File ID (first element) */
-    CC_MD5_Update(&md5, params->file_id, (CC_LONG)params->file_id_len);
-
-    /* (f) If R >= 4 and metadata is not encrypted, hash 0xFFFFFFFF */
-    if (params->revision >= 4 && !params->encrypt_metadata) {
-        uint8_t ff[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-        CC_MD5_Update(&md5, ff, 4);
-    }
-
-    uint8_t hash[CC_MD5_DIGEST_LENGTH];
-    CC_MD5_Final(hash, &md5);
-
-    /* (g) For R >= 3: iterate MD5 50 times on the first key_bytes bytes */
-    if (params->revision >= 3) {
-        for (int i = 0; i < 50; i++) {
-            CC_MD5(hash, (CC_LONG)key_bytes, hash);
-        }
-    }
-
-    memcpy(key_out, hash, (size_t)key_bytes);
-    return key_bytes;
+    return compute_key_from_padded(params, padded, key_out);
 }
 
 /* ================================================================
@@ -615,8 +626,8 @@ static void compute_u_r3(const PDFEncryptParams *params,
     uint8_t encrypted[16];
     rc4_encrypt_16(key, key_len, hash, encrypted);
 
-    /* (c) 19 additional RC4 passes with XOR-modified keys */
-    rc4_multi_pass_16(key, key_len, encrypted, 1, 19, 1);
+    /* (c) R34_RC4_EXTRA_PASSES additional RC4 passes with XOR-modified keys */
+    rc4_multi_pass_16(key, key_len, encrypted, 1, R34_RC4_EXTRA_PASSES, 1);
 
     /* First 16 bytes are the check value, rest is arbitrary */
     memcpy(u_out, encrypted, 16);
@@ -860,6 +871,26 @@ static int verify_owner_r6(const PDFEncryptParams *params, const char *password)
     return memcmp(hash, params->o_value, 32) == 0;
 }
 
+/* ── Length-safe user verification from an already-padded 32-byte password ──
+ * Used by both pdf_verify_user_password (which pads then calls this) and the
+ * owner-recovery path (which feeds the raw 32-byte /O decryption result).
+ * Eliminates the C-string round-trip that would truncate at embedded NULs. */
+static int verify_user_with_padded(const PDFEncryptParams *p, const uint8_t padded[32])
+{
+    uint8_t key[16];
+    int key_bytes = compute_key_from_padded(p, padded, key);
+
+    if (p->revision == 2) {
+        uint8_t computed_u[32];
+        compute_u_r2(key, key_bytes, computed_u);
+        return memcmp(computed_u, p->u_value, 32) == 0;
+    }
+    /* R3/R4 */
+    uint8_t computed_u[16];
+    compute_u_r3(p, key, key_bytes, computed_u);
+    return memcmp(computed_u, p->u_value, 16) == 0;
+}
+
 /* ================================================================
  * Algorithm 6: Verify user password
  * ================================================================ */
@@ -870,23 +901,9 @@ int pdf_verify_user_password(const PDFEncryptParams *params, const char *passwor
     if (params->revision == 5) return verify_user_r5(params, password);
     if (params->revision == 6) return verify_user_r6(params, password);
 
-    uint8_t key[16];
-    int key_len = pdf_compute_encryption_key(params, password, key);
-
-    if (params->revision == 2) {
-        uint8_t computed_u[32];
-        compute_u_r2(key, key_len, computed_u);
-        return memcmp(computed_u, params->u_value, 32) == 0;
-    }
-
-    if (params->revision == 3 || params->revision == 4) {
-        uint8_t computed_u[16];
-        compute_u_r3(params, key, key_len, computed_u);
-        /* Compare first 16 bytes only */
-        return memcmp(computed_u, params->u_value, 16) == 0;
-    }
-
-    return 0;
+    uint8_t padded[32];
+    pad_password(password, padded);
+    return verify_user_with_padded(params, padded);
 }
 
 /* ================================================================
@@ -897,13 +914,30 @@ int pdf_verify_user_password(const PDFEncryptParams *params, const char *passwor
  * ================================================================ */
 static inline void rc4_owner_decrypt(const uint8_t *key, int key_len, uint8_t data[32])
 {
-    for (int r = 19; r >= 0; r--) {
+    for (int r = R34_RC4_EXTRA_PASSES; r >= 0; r--) {
         uint8_t mod_key[16];
         for (int j = 0; j < key_len; j++)
             mod_key[j] = key[j] ^ (uint8_t)r;
         uint8_t temp[32];
         rc4_encrypt(mod_key, key_len, data, temp, 32);
         memcpy(data, temp, 32);
+    }
+}
+
+/* ── Helper: recover padded user password from /O using the owner key ────
+ * Returns the raw 32-byte padded user password without any C-string
+ * conversion, so embedded NUL bytes are preserved (NUL-safe).          */
+static void recover_user_password(const uint8_t *o_value, const uint8_t *key,
+                                   int key_len, int revision,
+                                   uint8_t out_padded[32])
+{
+    if (revision == 2) {
+        /* Single RC4 pass (RC4 is symmetric: encrypt == decrypt) */
+        rc4_encrypt(key, key_len, o_value, out_padded, 32);
+    } else {
+        /* R3/R4: (R34_RC4_EXTRA_PASSES+1) RC4 passes in reverse (19 down to 0) */
+        memcpy(out_padded, o_value, 32);
+        rc4_owner_decrypt(key, key_len, out_padded);
     }
 }
 
@@ -914,62 +948,30 @@ int pdf_verify_owner_password(const PDFEncryptParams *params, const char *passwo
     if (params->revision == 5) return verify_owner_r5(params, password);
     if (params->revision == 6) return verify_owner_r6(params, password);
 
-    int key_bytes = params->key_length / 8;
-    if (key_bytes < 5)  key_bytes = 5;
-    if (key_bytes > 16) key_bytes = 16;
+    int key_bytes = key_bytes_for(params);
 
-    /* Step a: Pad the owner password */
+    /* Step a: Pad the owner password and derive the owner key */
     uint8_t padded[32];
     pad_password(password, padded);
 
-    /* Step b: MD5 hash */
     uint8_t hash[16];
     CC_MD5(padded, 32, hash);
 
-    /* Step c: For R >= 3, iterate MD5 50 times on first key_bytes */
+    /* Step c: For R >= 3, iterate MD5 R3_KEY_ITERATIONS times on first key_bytes */
     if (params->revision >= 3) {
-        for (int i = 0; i < 50; i++)
+        for (int i = 0; i < R3_KEY_ITERATIONS; i++)
             CC_MD5(hash, (CC_LONG)key_bytes, hash);
     }
 
     uint8_t key[16];
     memcpy(key, hash, (size_t)key_bytes);
 
-    /* Step d: RC4-decrypt the O value to recover the user password */
-    uint8_t user_pass[32];
+    /* Step d/e: Recover the 32-byte padded user password from /O (NUL-safe),
+     * then verify it directly without a C-string round-trip. */
+    uint8_t user_padded[32];
+    recover_user_password(params->o_value, key, key_bytes, params->revision, user_padded);
 
-    if (params->revision == 2) {
-        /* Single RC4 decryption (RC4 is symmetric: encrypt == decrypt) */
-        rc4_encrypt(key, key_bytes, params->o_value, user_pass, 32);
-    } else {
-        /* R3/R4: 20 RC4 passes in reverse (19 down to 0) */
-        memcpy(user_pass, params->o_value, 32);
-        rc4_owner_decrypt(key, key_bytes, user_pass);
-    }
-
-    /* Step e: The recovered value is the padded user password.
-     * Use it to verify as a user password. */
-    /* Convert padded user password back to a string (trim padding) */
-    char user_str[33];
-    int ulen = 32;
-    /* Find where padding starts */
-    for (int i = 0; i < 32; i++) {
-        if (user_pass[i] == PDF_PASSWORD_PADDING[0]) {
-            /* Check if the rest matches padding */
-            int is_pad = 1;
-            for (int j = 0; j + i < 32 && j < 32; j++) {
-                if (user_pass[i + j] != PDF_PASSWORD_PADDING[j]) {
-                    is_pad = 0;
-                    break;
-                }
-            }
-            if (is_pad) { ulen = i; break; }
-        }
-    }
-    memcpy(user_str, user_pass, (size_t)ulen);
-    user_str[ulen] = '\0';
-
-    return pdf_verify_user_password(params, user_str);
+    return verify_user_with_padded(params, user_padded);
 }
 
 /* ================================================================
@@ -993,9 +995,7 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
     if (!params->valid) return 0;
     if (params->revision < 2 || params->revision > 4) return 0;
 
-    int key_bytes = params->key_length / 8;
-    if (key_bytes < 5)  key_bytes = 5;
-    if (key_bytes > 16) key_bytes = 16;
+    int key_bytes = key_bytes_for(params);
 
     /* ── Algorithm 2 (key derivation) for all 4 passwords ──────── */
 
@@ -1008,11 +1008,7 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
      * Input = padded(32) + O(32) + P(4) + fileID(N) [+ 0xFFFFFFFF if R>=4 && !encryptMeta]
      * All 4 share the same O, P, fileID, so they differ only in the first 32 bytes. */
     uint8_t p_bytes[4];
-    int32_t perm = params->permissions;
-    p_bytes[0] = (uint8_t)(perm & 0xFF);
-    p_bytes[1] = (uint8_t)((perm >> 8) & 0xFF);
-    p_bytes[2] = (uint8_t)((perm >> 16) & 0xFF);
-    p_bytes[3] = (uint8_t)((perm >> 24) & 0xFF);
+    p_to_le32(params->permissions, p_bytes);
 
     int extra = (params->revision >= 4 && !params->encrypt_metadata) ? 4 : 0;
     size_t msg_len = 32 + 32 + 4 + (size_t)params->file_id_len + (size_t)extra;
@@ -1038,10 +1034,10 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
     uint8_t hash[4][16];
     md5_x4(ptrs, lens, hash);
 
-    /* Step g: For R >= 3, iterate MD5 50 times on first key_bytes */
+    /* Step g: For R >= 3, iterate MD5 R3_KEY_ITERATIONS times on first key_bytes */
     if (params->revision >= 3) {
         uint8_t buf[4][64]; /* key_bytes <= 16, fits in single block */
-        for (int iter = 0; iter < 50; iter++) {
+        for (int iter = 0; iter < R3_KEY_ITERATIONS; iter++) {
             for (int i = 0; i < 4; i++)
                 memcpy(buf[i], hash[i], (size_t)key_bytes);
             md5_x4_short(buf, (size_t)key_bytes, hash);
@@ -1081,7 +1077,7 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
         for (int i = 0; i < 4; i++) {
             uint8_t encrypted[16];
             rc4_encrypt_16(keys[i], key_bytes, base_hash, encrypted);
-            rc4_multi_pass_16(keys[i], key_bytes, encrypted, 1, 19, 1);
+            rc4_multi_pass_16(keys[i], key_bytes, encrypted, 1, R34_RC4_EXTRA_PASSES, 1);
 
             if (memcmp(encrypted, params->u_value, 16) == 0)
                 result |= (1 << i);
@@ -1108,9 +1104,7 @@ int pdf_verify_owner_batch4(const PDFEncryptParams *params,
 
     if (params->revision < 2 || params->revision > 4) return 0;
 
-    int key_bytes = params->key_length / 8;
-    if (key_bytes < 5)  key_bytes = 5;
-    if (key_bytes > 16) key_bytes = 16;
+    int key_bytes = key_bytes_for(params);
 
     /* ── Owner key derivation for all 4 passwords (SIMD MD5) ── */
 
@@ -1125,10 +1119,10 @@ int pdf_verify_owner_batch4(const PDFEncryptParams *params,
     uint8_t hash[4][16];
     md5_x4(ptrs, lens, hash);
 
-    /* Step c: For R >= 3, iterate MD5 50 times on first key_bytes */
+    /* Step c: For R >= 3, iterate MD5 R3_KEY_ITERATIONS times on first key_bytes */
     if (params->revision >= 3) {
         uint8_t buf[4][64];
-        for (int iter = 0; iter < 50; iter++) {
+        for (int iter = 0; iter < R3_KEY_ITERATIONS; iter++) {
             for (int i = 0; i < 4; i++)
                 memcpy(buf[i], hash[i], (size_t)key_bytes);
             md5_x4_short(buf, (size_t)key_bytes, hash);
@@ -1140,40 +1134,14 @@ int pdf_verify_owner_batch4(const PDFEncryptParams *params,
     for (int i = 0; i < 4; i++)
         memcpy(keys[i], hash[i], (size_t)key_bytes);
 
-    /* ── Per-password: RC4-decrypt O value, then verify as user ── */
+    /* ── Per-password: recover padded user password (NUL-safe), verify directly ── */
     int result = 0;
 
     for (int i = 0; i < 4; i++) {
-        uint8_t user_pass[32];
-
-        if (params->revision == 2) {
-            /* Single RC4 decryption (RC4 is symmetric) */
-            rc4_encrypt(keys[i], key_bytes, params->o_value, user_pass, 32);
-        } else {
-            /* R3/R4: 20 RC4 passes in reverse (19 down to 0) */
-            memcpy(user_pass, params->o_value, 32);
-            rc4_owner_decrypt(keys[i], key_bytes, user_pass);
-        }
-
-        /* Convert recovered padded user password to string */
-        char user_str[33];
-        int ulen = 32;
-        for (int k = 0; k < 32; k++) {
-            if (user_pass[k] == PDF_PASSWORD_PADDING[0]) {
-                int is_pad = 1;
-                for (int j = 0; j + k < 32 && j < 32; j++) {
-                    if (user_pass[k + j] != PDF_PASSWORD_PADDING[j]) {
-                        is_pad = 0;
-                        break;
-                    }
-                }
-                if (is_pad) { ulen = k; break; }
-            }
-        }
-        memcpy(user_str, user_pass, (size_t)ulen);
-        user_str[ulen] = '\0';
-
-        if (pdf_verify_user_password(params, user_str))
+        uint8_t user_padded[32];
+        recover_user_password(params->o_value, keys[i], key_bytes,
+                              params->revision, user_padded);
+        if (verify_user_with_padded(params, user_padded))
             result |= (1 << i);
     }
 
