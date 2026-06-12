@@ -76,6 +76,7 @@ typedef struct {
 /* PDF bytes (read-only, sent to each client) */
 static unsigned char *g_pdf_data = NULL;
 static long           g_pdf_size = 0;
+static PDFEncryptParams g_srv_enc;   /* parsed once for FOUND re-verification */
 
 /* Wordlist (dict mode) */
 static char **g_words     = NULL;
@@ -177,6 +178,7 @@ static int load_pdf(const char *path)
         perror("fread"); fclose(f); return 0;
     }
     fclose(f);
+    g_srv_enc = pdf_parse_encrypt(g_pdf_data, (size_t)g_pdf_size);
     return 1;
 }
 
@@ -1125,6 +1127,13 @@ static int handle_protocol_message(int fd, ClientInfo *ci,
         char pw[MAX_PASS_LEN + 1] = {0};
         unsigned long long lid = 0;
         sscanf(line, "FOUND %32s %llu", pw, &lid);
+
+        if (g_srv_enc.valid && !pdf_verify_password(&g_srv_enc, pw)) {
+            fprintf(stderr,
+                "[server] ignoring unverified FOUND \"%s\" from client %d\n",
+                pw, ci_idx);
+            return 0;   /* keep searching; do not set g_found/g_password */
+        }
 
         if (!atomic_exchange(&g_found, 1)) {
             strncpy(g_password, pw, MAX_PASS_LEN);
