@@ -1087,6 +1087,88 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
     return result;
 }
 
+/* ── Batch user-verify from pre-padded 32-byte buffers (SIMD) ────────────
+ * All 4 inputs are already the 32-byte padded form, so message lengths are
+ * identical (32+32+4+file_id_len+extra) and md5_x4 can co-process them.
+ * Used by pdf_verify_owner_batch4 to avoid 4 separate scalar key derivations
+ * for the recovered user passwords. */
+static int verify_user_batch4_from_padded(const PDFEncryptParams *params,
+                                           uint8_t padded[4][32])
+{
+    int key_bytes = key_bytes_for(params);
+
+    uint8_t p_bytes[4];
+    p_to_le32(params->permissions, p_bytes);
+
+    int extra = (params->revision >= 4 && !params->encrypt_metadata) ? 4 : 0;
+    size_t msg_len = 32 + 32 + 4 + (size_t)params->file_id_len + (size_t)extra;
+
+    uint8_t msg[4][256];
+    for (int i = 0; i < 4; i++) {
+        size_t off = 0;
+        memcpy(msg[i] + off, padded[i], 32);         off += 32;
+        memcpy(msg[i] + off, params->o_value, 32);   off += 32;
+        memcpy(msg[i] + off, p_bytes, 4);             off += 4;
+        memcpy(msg[i] + off, params->file_id, (size_t)params->file_id_len);
+        off += (size_t)params->file_id_len;
+        if (extra) {
+            uint8_t ff[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+            memcpy(msg[i] + off, ff, 4);
+        }
+    }
+
+    /* Initial MD5 hash (4-way SIMD) — all 4 messages are msg_len bytes */
+    const uint8_t *ptrs[4] = { msg[0], msg[1], msg[2], msg[3] };
+    size_t lens[4] = { msg_len, msg_len, msg_len, msg_len };
+    uint8_t hash[4][16];
+    md5_x4(ptrs, lens, hash);
+
+    if (params->revision >= 3) {
+        uint8_t buf[4][64];
+        for (int iter = 0; iter < R3_KEY_ITERATIONS; iter++) {
+            for (int i = 0; i < 4; i++)
+                memcpy(buf[i], hash[i], (size_t)key_bytes);
+            md5_x4_short(buf, (size_t)key_bytes, hash);
+        }
+    }
+
+    uint8_t keys[4][16];
+    for (int i = 0; i < 4; i++)
+        memcpy(keys[i], hash[i], (size_t)key_bytes);
+
+    int result = 0;
+    if (params->revision == 2) {
+        for (int i = 0; i < 4; i++) {
+            if (rc4_first_byte(keys[i], key_bytes, PDF_PASSWORD_PADDING[0])
+                != params->u_value[0])
+                continue;
+            uint8_t computed_u[32];
+            rc4_encrypt(keys[i], key_bytes, PDF_PASSWORD_PADDING, computed_u,
+                        PDF_PASSWORD_PADDING_LEN);
+            if (memcmp(computed_u, params->u_value, PDF_PASSWORD_PADDING_LEN) == 0)
+                result |= (1 << i);
+        }
+    } else {
+        /* R3/R4: MD5(padding+fileID) is the same for all 4 — compute once */
+        CC_MD5_CTX md5ctx;
+        CC_MD5_Init(&md5ctx);
+        CC_MD5_Update(&md5ctx, PDF_PASSWORD_PADDING, PDF_PASSWORD_PADDING_LEN);
+        CC_MD5_Update(&md5ctx, params->file_id, (CC_LONG)params->file_id_len);
+        uint8_t base_hash[16];
+        CC_MD5_Final(base_hash, &md5ctx);
+
+        for (int i = 0; i < 4; i++) {
+            uint8_t encrypted[16];
+            rc4_encrypt_16(keys[i], key_bytes, base_hash, encrypted);
+            rc4_multi_pass_16(keys[i], key_bytes, encrypted, 1,
+                              R34_RC4_EXTRA_PASSES, 1);
+            if (memcmp(encrypted, params->u_value, 16) == 0)
+                result |= (1 << i);
+        }
+    }
+    return result;
+}
+
 int pdf_verify_owner_batch4(const PDFEncryptParams *params,
                             const char *pw[4], int pwlen[4])
 {
@@ -1134,18 +1216,15 @@ int pdf_verify_owner_batch4(const PDFEncryptParams *params,
     for (int i = 0; i < 4; i++)
         memcpy(keys[i], hash[i], (size_t)key_bytes);
 
-    /* ── Per-password: recover padded user password (NUL-safe), verify directly ── */
-    int result = 0;
-
-    for (int i = 0; i < 4; i++) {
-        uint8_t user_padded[32];
+    /* ── Recover 4 padded user passwords, then SIMD-verify all at once ──
+     * All recovered buffers are 32 bytes wide so message lengths are equal
+     * and verify_user_batch4_from_padded can co-process them via md5_x4. */
+    uint8_t user_padded[4][32];
+    for (int i = 0; i < 4; i++)
         recover_user_password(params->o_value, keys[i], key_bytes,
-                              params->revision, user_padded);
-        if (verify_user_with_padded(params, user_padded))
-            result |= (1 << i);
-    }
+                              params->revision, user_padded[i]);
 
-    return result;
+    return verify_user_batch4_from_padded(params, user_padded);
 }
 
 #endif /* __ARM_NEON */
