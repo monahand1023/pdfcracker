@@ -5019,6 +5019,48 @@ static void usage(const char *p)
     exit(1);
 }
 
+/* ------------------------------------------------------------------ *
+ * run_brute_lengths — iterate lengths [start_len..max_len], spawning  *
+ * the engine-appropriate GPU worker + CPU/NEON workers per length.    *
+ * Resumes within start_len at start_idx (0 = fresh start).            *
+ * Accumulates g_completed_prior after each length.                    *
+ * ------------------------------------------------------------------ */
+static void run_brute_lengths(int start_len, int max_len, long start_idx,
+                              int nthreads, pthread_t *threads)
+{
+    for (int len = start_len; len <= max_len && !atomic_load(&g_found); len++) {
+        long total = count_for_length(len);
+        long idx0  = (len == start_len && start_idx > 0) ? start_idx : 0;
+        atomic_store(&g_current_len, len);
+        atomic_store(&g_tested, idx0);
+        atomic_store(&g_total, total);
+        atomic_store(&g_next_idx, idx0);
+        int spawned = 0;
+
+        if (g_use_gpu) {
+            GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
+            *ga = (GPUBruteArg){ .length = len, .total = total };
+            pthread_create(&threads[spawned++], NULL,
+                    g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
+        }
+        {
+            void *(*worker_fn)(void *) = brute_worker;
+#ifdef __ARM_NEON
+            if (g_use_neon)
+                worker_fn = brute_worker_neon;
+#endif
+            for (int t = 0; t < nthreads; t++) {
+                BruteArg *a = malloc(sizeof(BruteArg));
+                *a = (BruteArg){ .id = t, .length = len,
+                                 .start = 0, .end = total, .use_shared = 1 };
+                pthread_create(&threads[spawned++], NULL, worker_fn, a);
+            }
+        }
+        for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
+        g_completed_prior += total;
+    }
+}
+
 /* ================================================================
  * main
  * ================================================================ */
@@ -5913,38 +5955,8 @@ int main(int argc, char *argv[])
             g_overall_total = ov_sum;
             g_completed_prior = freq_resume_completed;
 
-            for (int len = freq_start_len; len <= freq_max && !atomic_load(&g_found); len++) {
-                long total = count_for_length(len);
-                long idx0 = (len == freq_start_len && freq_start_idx > 0)
-                            ? freq_start_idx : 0;
-                atomic_store(&g_current_len, len);
-                atomic_store(&g_tested, idx0);
-                atomic_store(&g_total, total);
-                atomic_store(&g_next_idx, idx0);
-                spawned = 0;
-
-                if (g_use_gpu) {
-                    GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
-                    *ga = (GPUBruteArg){ .length = len, .total = total };
-                    pthread_create(&threads[spawned++], NULL,
-                            g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
-                }
-                {
-                    void *(*worker_fn)(void *) = brute_worker;
-#ifdef __ARM_NEON
-                    if (g_use_neon)
-                        worker_fn = brute_worker_neon;
-#endif
-                    for (int t = 0; t < nthreads; t++) {
-                        BruteArg *a = malloc(sizeof(BruteArg));
-                        *a = (BruteArg){ .id = t, .length = len,
-                                         .start = 0, .end = total, .use_shared = 1 };
-                        pthread_create(&threads[spawned++], NULL, worker_fn, a);
-                    }
-                }
-                for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
-                g_completed_prior += total;
-            }
+            run_brute_lengths(freq_start_len, freq_max, freq_start_idx,
+                              nthreads, threads);
 
             /* Restore charset */
             g_charset = saved_charset;
@@ -5983,38 +5995,8 @@ int main(int argc, char *argv[])
             g_overall_total = ov_sum;
             g_completed_prior = bf_resume_completed;
 
-            for (int len = bf_start_len; len <= max_len && !atomic_load(&g_found); len++) {
-                long total = count_for_length(len);
-                long idx0 = (len == bf_start_len && bf_start_idx > 0)
-                            ? bf_start_idx : 0;
-                atomic_store(&g_current_len, len);
-                atomic_store(&g_tested, idx0);
-                atomic_store(&g_total, total);
-                atomic_store(&g_next_idx, idx0);
-                spawned = 0;
-
-                if (g_use_gpu) {
-                    GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
-                    *ga = (GPUBruteArg){ .length = len, .total = total };
-                    pthread_create(&threads[spawned++], NULL,
-                            g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
-                }
-                {
-                    void *(*worker_fn)(void *) = brute_worker;
-#ifdef __ARM_NEON
-                    if (g_use_neon)
-                        worker_fn = brute_worker_neon;
-#endif
-                    for (int t = 0; t < nthreads; t++) {
-                        BruteArg *a = malloc(sizeof(BruteArg));
-                        *a = (BruteArg){ .id = t, .length = len,
-                                         .start = 0, .end = total, .use_shared = 1 };
-                        pthread_create(&threads[spawned++], NULL, worker_fn, a);
-                    }
-                }
-                for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
-                g_completed_prior += total;
-            }
+            run_brute_lengths(bf_start_len, max_len, bf_start_idx,
+                              nthreads, threads);
           }
         }
 
@@ -6667,40 +6649,7 @@ int main(int argc, char *argv[])
                     start_idx > 0 ? " [resuming]" : "");
         }
 
-        for (int len = start_len; len <= max_len && !atomic_load(&g_found); len++) {
-            long total = count_for_length(len);
-            atomic_store(&g_current_len, len);
-
-            /* If resuming into this length, start from saved index */
-            long idx0 = (len == start_len && start_idx > 0) ? start_idx : 0;
-
-            atomic_store(&g_tested, idx0);
-            atomic_store(&g_total, total);
-            atomic_store(&g_next_idx, idx0);
-            spawned = 0;
-
-            if (g_use_gpu) {
-                GPUBruteArg *ga = malloc(sizeof(GPUBruteArg));
-                *ga = (GPUBruteArg){ .length = len, .total = total };
-                pthread_create(&threads[spawned++], NULL,
-                            g_r6_ctx ? gpu_r6_brute_worker : g_sha256_ctx ? gpu_sha256_brute_worker : gpu_brute_worker, ga);
-            }
-            {
-                void *(*worker_fn)(void *) = brute_worker;
-#ifdef __ARM_NEON
-                if (g_use_neon)
-                    worker_fn = brute_worker_neon;
-#endif
-                for (int t = 0; t < nthreads; t++) {
-                    BruteArg *a = malloc(sizeof(BruteArg));
-                    *a = (BruteArg){ .id = t, .length = len,
-                                     .start = 0, .end = total, .use_shared = 1 };
-                    pthread_create(&threads[spawned++], NULL, worker_fn, a);
-                }
-            }
-            for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
-            g_completed_prior += total;
-        }
+        run_brute_lengths(start_len, max_len, start_idx, nthreads, threads);
     }
 
 auto_done:
