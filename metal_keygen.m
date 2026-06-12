@@ -30,17 +30,8 @@ static inline void pack_passwords_gpu(uint8_t *pw_buf, uint8_t *len_buf,
 }
 #include <mach/mach_time.h>
 
-/* Must match the struct in pdf_md5.metal exactly */
-typedef struct __attribute__((packed)) {
-    uint32_t revision;
-    uint32_t key_bytes;
-    int32_t  permissions;
-    uint32_t encrypt_metadata;
-    uint32_t file_id_len;
-    uint8_t  o_value[32];
-    uint8_t  file_id[48];
-    uint8_t  padding[32];
-} PDFEncryptGPU;
+/* GPU parameter structs shared with the Metal shader. */
+#include "pdf_gpu_types.h"
 
 #define MAX_BATCH_SIZE  262144  /* 256K passwords per dispatch */
 #define PW_PACKED_LEN   32      /* each password slot is 32 bytes */
@@ -375,15 +366,7 @@ void metal_keygen_free(MetalKeygenContext *ctx)
  * R5 SHA-256 GPU verification pipeline
  * ================================================================ */
 
-/* Must match the struct in pdf_md5.metal exactly */
-typedef struct __attribute__((packed)) {
-    uint8_t  u_hash[32];
-    uint8_t  u_salt[8];
-    uint8_t  o_hash[32];
-    uint8_t  o_salt[8];
-    uint8_t  u_full[48];
-    uint32_t check_owner;
-} PDFR5GPU;
+/* PDFR5GPU is defined in pdf_gpu_types.h (shared with the Metal shader). */
 
 #define SHA256_PW_PACKED_LEN  128   /* each password slot: max 127 chars + padding */
 
@@ -666,23 +649,8 @@ int metal_sha256_wait_results(MetalSHA256Context *ctx, void *handle, int count)
  * R6 GPU verification context (Algorithm 2.B)
  * ═══════════════════════════════════════════════════════════════ */
 
-/* Must match PDFR6GPU in pdf_md5.metal */
-typedef struct __attribute__((packed)) {
-    uint8_t  target_hash[32];
-    uint8_t  salt[8];
-    uint8_t  extra[48];
-    uint32_t extra_len;
-    uint32_t max_rounds;
-    uint32_t check_both;
-    uint8_t  target_hash2[32];
-    uint8_t  salt2[8];
-    uint8_t  extra2[48];
-    uint32_t extra_len2;
-    uint32_t _pad;
-} PDFR6GPU;
-
+/* PDFR6GPU and R6_SCRATCH_SIZE are defined in pdf_gpu_types.h (shared). */
 #define R6_MAX_BATCH      8192   /* smaller batches: R6 is very compute-heavy */
-#define R6_SCRATCH_SIZE   16384  /* must match Metal kernel */
 
 struct MetalR6Context {
     id<MTLDevice>               device;

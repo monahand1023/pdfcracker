@@ -15,13 +15,13 @@ pdf_encrypt.o: pdf_encrypt.c pdf_encrypt.h saslprep.h sha256_simd.h sha512_simd.
 	$(CC) $(CFLAGS) -c pdf_encrypt.c
 
 # ── Metal GPU key derivation ─────────────────────────────────
-pdf_md5.air: pdf_md5.metal
+pdf_md5.air: pdf_md5.metal pdf_gpu_types.h
 	xcrun -sdk macosx metal -c pdf_md5.metal -o pdf_md5.air
 
 pdf_md5.metallib: pdf_md5.air
 	xcrun -sdk macosx metallib pdf_md5.air -o pdf_md5.metallib
 
-metal_keygen.o: metal_keygen.m metal_keygen.h pdf_encrypt.h
+metal_keygen.o: metal_keygen.m metal_keygen.h pdf_encrypt.h pdf_gpu_types.h
 	$(CC) $(CFLAGS) -fobjc-arc -c metal_keygen.m
 
 # ── Checkpoint module ────────────────────────────────────────

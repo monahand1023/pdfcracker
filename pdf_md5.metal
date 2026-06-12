@@ -308,29 +308,8 @@ static void sha256_hash(thread const uchar *data, uint len, thread uchar *out)
     }
 }
 
-/* ── GPU parameters (set once per PDF) ───────────────────────── */
-
-struct PDFEncryptGPU {
-    uint   revision;          /* 2, 3, or 4 */
-    uint   key_bytes;         /* key_length / 8 (5 or 16) */
-    int    permissions;       /* /P value (signed) */
-    uint   encrypt_metadata;  /* 1 or 0 */
-    uint   file_id_len;
-    uchar  o_value[32];       /* /O */
-    uchar  file_id[48];       /* first /ID element */
-    uchar  padding[32];       /* PDF_PASSWORD_PADDING */
-};
-
-/* ── R5/R6 GPU parameters ────────────────────────────────────── */
-
-struct PDFR5GPU {
-    uchar  u_hash[32];        /* first 32 bytes of U (the target hash) */
-    uchar  u_salt[8];         /* U[32:40] validation salt */
-    uchar  o_hash[32];        /* first 32 bytes of O */
-    uchar  o_salt[8];         /* O[32:40] validation salt */
-    uchar  u_full[48];        /* full U value (for owner password check) */
-    uint   check_owner;       /* 1 = verify owner password, 0 = verify user */
-};
+/* ── GPU parameter structs (shared with the host) ────────────── */
+#include "pdf_gpu_types.h"
 
 /* ── Kernel: PDF MD5 key derivation (Algorithm 2) ────────────── */
 
@@ -931,21 +910,7 @@ static void sha256_hash_dev(device const uchar *data, uint len, thread uchar *ou
  * Each thread gets R6_SCRATCH_SIZE bytes at offset tid * R6_SCRATCH_SIZE.
  */
 
-#define R6_SCRATCH_SIZE  16384  /* enough for K1 (max ~15KB) + AES output */
-
-struct PDFR6GPU {
-    uchar  target_hash[32];   /* U[0:32] or O[0:32] — what we're comparing against */
-    uchar  salt[8];           /* validation salt (U[32:40] or O[32:40]) */
-    uchar  extra[48];         /* extra data: empty for user, U[0:48] for owner */
-    uint   extra_len;         /* 0 for user, 48 for owner */
-    uint   max_rounds;        /* safety limit (default 200) */
-    uint   check_both;        /* 1 = dual mode: try primary, then secondary */
-    uchar  target_hash2[32];  /* secondary target hash (owner when primary is user) */
-    uchar  salt2[8];          /* secondary validation salt */
-    uchar  extra2[48];        /* secondary extra data */
-    uint   extra_len2;        /* secondary extra length */
-    uint   _pad;              /* padding for alignment */
-};
+/* R6_SCRATCH_SIZE and PDFR6GPU are defined in pdf_gpu_types.h (shared). */
 
 kernel void pdf_r6_verify(
     device const uchar    *passwords    [[buffer(0)]],  /* packed, 128 bytes each */
