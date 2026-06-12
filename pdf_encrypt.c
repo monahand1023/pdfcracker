@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
 #include <sys/stat.h>
 /* MD5 is deprecated by Apple for security contexts, but the PDF spec
  * mandates it for R2-R4 password verification. Suppress the warnings. */
@@ -77,7 +78,7 @@ static const uint8_t *find_forward(const uint8_t *data, size_t len,
 static const uint8_t *skip_ws(const uint8_t *p, const uint8_t *end)
 {
     while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' ||
-                       *p == '\n' || *p == '\0'))
+                       *p == '\n' || *p == '\0' || *p == '\f'))
         p++;
     return p;
 }
@@ -93,7 +94,14 @@ static long parse_int(const uint8_t *p, const uint8_t *end, const uint8_t **next
     else if (p < end && *p == '+') { p++; }
     long val = 0;
     while (p < end && *p >= '0' && *p <= '9') {
-        val = val * 10 + (*p - '0');
+        int digit = *p - '0';
+        /* Overflow guard: cap before wrapping; callers bound-check against len */
+        if (val > (LONG_MAX - digit) / 10) {
+            while (p < end && *p >= '0' && *p <= '9') p++;
+            if (next) *next = p;
+            return neg ? LONG_MIN : LONG_MAX;
+        }
+        val = val * 10 + digit;
         p++;
     }
     if (next) *next = p;
@@ -217,12 +225,47 @@ static const uint8_t *find_dict_value(const uint8_t *dict_start,
     int depth = 0; /* track nested << >> */
 
     while (p < end - klen) {
-        /* Track nested dictionaries */
-        if (*p == '<' && p + 1 < end && *(p + 1) == '<') {
-            depth++;
-            p += 2;
+        /* Skip % line comments */
+        if (*p == '%') {
+            while (p < end && *p != '\r' && *p != '\n')
+                p++;
             continue;
         }
+
+        /* Skip literal strings (...) — may contain >> or << */
+        if (*p == '(') {
+            p++;
+            int sdepth = 1;
+            while (p < end && sdepth > 0) {
+                if (*p == '\\' && p + 1 < end) {
+                    p += 2; /* skip escape + next byte */
+                } else if (*p == '(') {
+                    sdepth++;
+                    p++;
+                } else if (*p == ')') {
+                    sdepth--;
+                    p++;
+                } else {
+                    p++;
+                }
+            }
+            continue;
+        }
+
+        /* Track nested dicts (<<) or skip hex strings (<hex...>) */
+        if (*p == '<') {
+            if (p + 1 < end && *(p + 1) == '<') {
+                depth++;
+                p += 2;
+            } else {
+                /* Hex string: advance past the closing > */
+                p++;
+                while (p < end && *p != '>') p++;
+                if (p < end) p++; /* skip '>' */
+            }
+            continue;
+        }
+
         if (*p == '>' && p + 1 < end && *(p + 1) == '>') {
             if (depth > 0) {
                 depth--;
