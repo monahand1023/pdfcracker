@@ -616,178 +616,11 @@ static void http_serve_file(int fd, const char *path, const char *content_type)
 }
 
 /* ================================================================
- * JSON API endpoint — /api/status
+ * Forward declarations — shared renderers defined below in the
+ * "Shared HTTP renderers" section (after the progress-reporter).
  * ================================================================ */
-static void http_serve_api_status(int fd)
-{
-    double now = mono_time();
-    long tested = atomic_load(&g_total_tested);
-    int found = atomic_load(&g_found);
-    long elapsed = (long)(now - g_start_time);
-
-    /* Sum per-client speeds */
-    double total_speed = 0;
-    pthread_mutex_lock(&g_clients_lock);
-    for (int i = 0; i < g_nclient_ids; i++) {
-        if (g_clients[i].active)
-            total_speed += g_clients[i].speed;
-    }
-
-    /* ETA */
-    long eta_secs = -1;
-    long speed = (long)total_speed;
-    if (speed > 0 && g_keyspace > tested)
-        eta_secs = (g_keyspace - tested) / speed;
-
-    double pct = 0;
-    if (g_keyspace > 0)
-        pct = (double)tested / (double)g_keyspace * 100.0;
-    if (pct > 100.0) pct = 100.0;
-
-    /* Build JSON in a buffer */
-    char body[8192];
-    int off = 0;
-    off += snprintf(body + off, sizeof(body) - (size_t)off,
-        "{\"progress_pct\":%.4f,\"tested\":%ld,\"speed\":%ld,"
-        "\"eta_secs\":%ld,\"keyspace\":%ld,\"elapsed\":%ld,"
-        "\"found\":%d,\"password\":\"%s\",\"clients\":[",
-        pct, tested, speed, eta_secs, g_keyspace, elapsed,
-        found, found ? g_password : "");
-
-    for (int i = 0; i < g_nclient_ids; i++) {
-        ClientInfo *ci = &g_clients[i];
-        if (ci->slot_free) continue;
-        int ago = ci->active ? (int)(now - ci->last_seen) : -1;
-        if (off > 0 && body[off - 1] == '}') {
-            off += snprintf(body + off, sizeof(body) - (size_t)off, ",");
-        }
-        off += snprintf(body + off, sizeof(body) - (size_t)off,
-            "{\"id\":%d,\"ip\":\"%s\",\"cores\":%d,\"speed\":%ld,"
-            "\"tested\":%ld,\"last_seen_ago\":%d,\"lease_id\":%llu,\"active\":%d}",
-            ci->id, ci->ip_str, ci->cores, (long)ci->speed,
-            ci->tested, ago,
-            (unsigned long long)ci->current_lease_id,
-            ci->active);
-    }
-    pthread_mutex_unlock(&g_clients_lock);
-
-    off += snprintf(body + off, sizeof(body) - (size_t)off, "]}");
-
-    dprintf(fd, "HTTP/1.0 200 OK\r\n"
-                "Content-Type: application/json\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "Content-Length: %d\r\n"
-                "\r\n%s", off, body);
-}
-
-/* ================================================================
- * Web dashboard — /
- * ================================================================ */
-static void http_serve_dashboard(int fd)
-{
-    static const char html[] =
-        "<!DOCTYPE html>\n"
-        "<html><head><meta charset=\"utf-8\">\n"
-        "<title>pdfcracker dashboard</title>\n"
-        "<style>\n"
-        "  * { box-sizing: border-box; margin: 0; padding: 0; }\n"
-        "  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;\n"
-        "         background: #0d1117; color: #c9d1d9; padding: 24px; }\n"
-        "  h1 { font-size: 1.4em; margin-bottom: 16px; color: #58a6ff; }\n"
-        "  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;\n"
-        "          padding: 16px; margin-bottom: 16px; }\n"
-        "  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); gap: 12px; }\n"
-        "  .stat-label { font-size: 0.75em; color: #8b949e; text-transform: uppercase; }\n"
-        "  .stat-value { font-size: 1.5em; font-weight: 600; color: #f0f6fc; }\n"
-        "  .bar-bg { background: #21262d; border-radius: 4px; height: 20px; margin: 12px 0; overflow: hidden; }\n"
-        "  .bar-fg { background: #238636; height: 100%; border-radius: 4px; transition: width 0.5s; }\n"
-        "  table { width: 100%; border-collapse: collapse; font-size: 0.9em; }\n"
-        "  th { text-align: left; color: #8b949e; font-weight: 500; padding: 8px 12px;\n"
-        "       border-bottom: 1px solid #30363d; }\n"
-        "  td { padding: 8px 12px; border-bottom: 1px solid #21262d; }\n"
-        "  tr:hover td { background: #1c2128; }\n"
-        "  .online { color: #3fb950; }\n"
-        "  .offline { color: #f85149; }\n"
-        "  .found { background: #238636; color: #fff; padding: 8px 16px; border-radius: 6px;\n"
-        "           font-size: 1.2em; font-weight: 700; display: none; text-align: center; }\n"
-        "</style>\n"
-        "</head><body>\n"
-        "<h1>pdfcracker dashboard</h1>\n"
-        "<div id=\"found\" class=\"found\"></div>\n"
-        "<div class=\"card\">\n"
-        "  <div class=\"bar-bg\"><div id=\"bar\" class=\"bar-fg\" style=\"width:0%\"></div></div>\n"
-        "  <div class=\"stats\">\n"
-        "    <div><div class=\"stat-label\">Progress</div><div class=\"stat-value\" id=\"pct\">--</div></div>\n"
-        "    <div><div class=\"stat-label\">Tested</div><div class=\"stat-value\" id=\"tested\">--</div></div>\n"
-        "    <div><div class=\"stat-label\">Speed</div><div class=\"stat-value\" id=\"speed\">--</div></div>\n"
-        "    <div><div class=\"stat-label\">ETA</div><div class=\"stat-value\" id=\"eta\">--</div></div>\n"
-        "    <div><div class=\"stat-label\">Elapsed</div><div class=\"stat-value\" id=\"elapsed\">--</div></div>\n"
-        "    <div><div class=\"stat-label\">Keyspace</div><div class=\"stat-value\" id=\"keyspace\">--</div></div>\n"
-        "  </div>\n"
-        "</div>\n"
-        "<div class=\"card\">\n"
-        "  <table><thead><tr>\n"
-        "    <th>ID</th><th>IP</th><th>Cores</th><th>Speed</th>\n"
-        "    <th>Lease</th><th>Tested</th><th>Last Seen</th><th>Status</th>\n"
-        "  </tr></thead><tbody id=\"clients\"></tbody></table>\n"
-        "</div>\n"
-        "<script>\n"
-        "function fmt(n) {\n"
-        "  if (n >= 1e9) return (n/1e9).toFixed(1)+'G';\n"
-        "  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';\n"
-        "  if (n >= 1e3) return (n/1e3).toFixed(1)+'K';\n"
-        "  return n.toString();\n"
-        "}\n"
-        "function ftime(s) {\n"
-        "  if (s < 0) return '---';\n"
-        "  if (s >= 3600) return Math.floor(s/3600)+'h'+String(Math.floor(s%3600/60)).padStart(2,'0')+'m';\n"
-        "  if (s >= 60) return Math.floor(s/60)+'m'+String(Math.floor(s%60)).padStart(2,'0')+'s';\n"
-        "  return Math.floor(s)+'s';\n"
-        "}\n"
-        "async function refresh() {\n"
-        "  try {\n"
-        "    const r = await fetch('/api/status');\n"
-        "    const d = await r.json();\n"
-        "    document.getElementById('pct').textContent = d.progress_pct.toFixed(2)+'%';\n"
-        "    document.getElementById('bar').style.width = Math.min(d.progress_pct,100)+'%';\n"
-        "    document.getElementById('tested').textContent = fmt(d.tested);\n"
-        "    document.getElementById('speed').textContent = fmt(d.speed)+'/s';\n"
-        "    document.getElementById('eta').textContent = ftime(d.eta_secs);\n"
-        "    document.getElementById('elapsed').textContent = ftime(d.elapsed);\n"
-        "    document.getElementById('keyspace').textContent = fmt(d.keyspace);\n"
-        "    if (d.found) {\n"
-        "      var el = document.getElementById('found');\n"
-        "      el.textContent = 'PASSWORD FOUND: ' + d.password;\n"
-        "      el.style.display = 'block';\n"
-        "    }\n"
-        "    var tb = document.getElementById('clients');\n"
-        "    tb.innerHTML = '';\n"
-        "    d.clients.forEach(function(c) {\n"
-        "      var tr = document.createElement('tr');\n"
-        "      var status = c.active ? '<span class=\"online\">online</span>' : '<span class=\"offline\">offline</span>';\n"
-        "      var seen = c.last_seen_ago >= 0 ? c.last_seen_ago+'s ago' : '---';\n"
-        "      tr.innerHTML = '<td>'+c.id+'</td><td>'+c.ip+'</td><td>'+c.cores+'</td>'\n"
-        "        +'<td>'+fmt(c.speed)+'/s</td><td>'+c.lease_id+'</td>'\n"
-        "        +'<td>'+fmt(c.tested)+'</td><td>'+seen+'</td><td>'+status+'</td>';\n"
-        "      tb.appendChild(tr);\n"
-        "    });\n"
-        "  } catch(e) {}\n"
-        "}\n"
-        "refresh();\n"
-        "setInterval(refresh, 2000);\n"
-        "</script>\n"
-        "</body></html>\n";
-
-    int body_len = (int)sizeof(html) - 1;  /* sizeof includes null terminator */
-    char hdr[128];
-    int hdr_len = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.0 200 OK\r\n"
-        "Content-Type: text/html; charset=utf-8\r\n"
-        "Content-Length: %d\r\n"
-        "\r\n", body_len);
-    write(fd, hdr, hdr_len);
-    write(fd, html, body_len);
-}
+static void render_dashboard(int fd);
+static void render_status_json(int fd);
 
 /* Constant-time token compare — prevents timing side-channels.
  * Returns 1 if a and b are equal (both length n), 0 otherwise. */
@@ -891,13 +724,13 @@ static void handle_http_request(int fd, const char *request_line)
 
     /* GET / — serve the dashboard */
     if (path[0] == '\0') {
-        http_serve_dashboard(fd);
+        render_dashboard(fd);
         return;
     }
 
     /* Only serve known files */
     if (strcmp(path, "api/status") == 0) {
-        http_serve_api_status(fd);
+        render_status_json(fd);
     } else if (strcmp(path, "client") == 0) {
         char fpath[PATH_MAX];
         snprintf(fpath, sizeof(fpath), "%s/client", g_server_dir);
@@ -1790,11 +1623,26 @@ static void *progress_thread(void *arg)
 }
 
 /* ================================================================
- * Web Dashboard — dedicated HTTP server on --web-port
+ * Shared HTTP renderers — used by both the main port and --web-port.
+ *
+ * render_status_json  serves GET /api/status
+ * render_dashboard    serves GET /
+ *
+ * JSON /api/status schema:
+ *   { "mode":string, "charset":string, "max_length":int,
+ *     "total_keyspace":long, "total_tested":long,
+ *     "elapsed_secs":float, "aggregate_rate":float,
+ *     "found":bool, "password":string|null,
+ *     "clients": [
+ *       { "id":string(UUID), "ip":string, "cores":int,
+ *         "speed":float, "tested":long,
+ *         "status":"working"|"offline",
+ *         "last_heartbeat_ago":int }
+ *     ] }
  * ================================================================ */
 
 /* JSON-escape a string into buf (at most buf_sz-1 chars + NUL) */
-static void web_json_escape(const char *in, char *buf, size_t buf_sz)
+static void json_escape_str(const char *in, char *buf, size_t buf_sz)
 {
     size_t j = 0;
     for (size_t i = 0; in[i] && j + 6 < buf_sz; i++) {
@@ -1807,7 +1655,7 @@ static void web_json_escape(const char *in, char *buf, size_t buf_sz)
     buf[j] = '\0';
 }
 
-static void web_serve_api_status(int fd)
+static void render_status_json(int fd)
 {
     double now = mono_time();
     long tested = atomic_load(&g_total_tested);
@@ -1825,8 +1673,8 @@ static void web_serve_api_status(int fd)
     /* JSON-escape strings that may contain special chars */
     char pw_escaped[MAX_PASS_LEN * 2 + 1];
     char cs_escaped[512];
-    web_json_escape(pw_copy, pw_escaped, sizeof(pw_escaped));
-    web_json_escape(g_charset ? g_charset : "", cs_escaped, sizeof(cs_escaped));
+    json_escape_str(pw_copy, pw_escaped, sizeof(pw_escaped));
+    json_escape_str(g_charset ? g_charset : "", cs_escaped, sizeof(cs_escaped));
 
     double total_speed = 0;
     pthread_mutex_lock(&g_clients_lock);
@@ -1893,7 +1741,7 @@ static void web_serve_api_status(int fd)
                 "\r\n%s", off, body);
 }
 
-static void web_serve_dashboard(int fd)
+static void render_dashboard(int fd)
 {
     static const char html[] =
         "<!DOCTYPE html>\n"
@@ -2134,9 +1982,9 @@ static void *web_server_thread(void *arg)
             }
 
             if (strcmp(path, "/") == 0) {
-                web_serve_dashboard(cfd);
+                render_dashboard(cfd);
             } else if (strcmp(path, "/api/status") == 0) {
-                web_serve_api_status(cfd);
+                render_status_json(cfd);
             } else {
                 dprintf(cfd, "HTTP/1.0 404 Not Found\r\n"
                              "Content-Type: text/plain\r\n"
