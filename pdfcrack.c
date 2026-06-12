@@ -2363,6 +2363,8 @@ static int verify_keys_rc4(const uint8_t *keys, const char **passwords,
 /* ================================================================
  * GPU brute-force worker
  * Grabs batches from shared g_next_idx, runs MD5 on GPU, RC4 on CPU.
+ * Kept bespoke: async double-buffered (deliberately NOT folded into the
+ * single-buffered run_gpu_md5 driver).
  * ================================================================ */
 typedef struct { int length; long total; } GPUBruteArg;
 
@@ -2440,6 +2442,8 @@ done:
 /* ================================================================
  * GPU dictionary worker
  * Grabs batches from shared g_next_idx into word list.
+ * Kept bespoke: async double-buffered + reverse-mode (--reverse) handling
+ * that has no cand_gen analogue (deliberately NOT folded into run_gpu_md5).
  * ================================================================ */
 static void *gpu_dict_worker(void *arg)
 {
@@ -2589,46 +2593,19 @@ static void *rule_worker(void *arg)
     return NULL;
 }
 
-/* GPU rule worker */
+/* Candidate generator typedef + single-buffered GPU-MD5 (R3/R4) driver.
+ * Both are defined in the SHA-256 consolidation section below; forward-declared
+ * here so the thin rule/hybrid wrappers can reference them. */
+typedef void (*cand_gen)(long idx, char *out, void *ctx);
+static void run_gpu_md5(cand_gen gen, void *ctx, long total, int stride);
+static void sha256_rule_gen(long idx, char *out, void *ctx);
+static void sha256_hybrid_gen(long idx, char *out, void *ctx);
+
+/* GPU rule worker (single-buffered sync; consolidated into run_gpu_md5) */
 static void *gpu_rule_worker(void *arg)
 {
     (void)arg;
-    int key_bytes = metal_keygen_key_bytes(g_gpu_ctx);
-    long total = g_nwords * g_nrules;
-
-    const char **pw_ptrs = malloc(sizeof(char *) * GPU_BATCH_SIZE);
-    char *pw_storage = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN * 2 + 2));
-    uint8_t *keys = malloc((size_t)GPU_BATCH_SIZE * key_bytes);
-
-    if (!pw_ptrs || !pw_storage || !keys) goto done;
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
-        if (start >= total) break;
-        long end = start + GPU_BATCH_SIZE;
-        if (end > total) end = total;
-        int count = (int)(end - start);
-
-        for (int i = 0; i < count; i++) {
-            long idx = start + i;
-            long word_idx = idx / g_nrules;
-            int  rule_idx = (int)(idx % g_nrules);
-            char *pw = pw_storage + i * (MAX_PASS_LEN * 2 + 2);
-            apply_rule(g_words[word_idx], rule_idx, pw);
-            pw_ptrs[i] = pw;
-        }
-
-        int n = metal_keygen_batch(g_gpu_ctx, pw_ptrs, count, keys);
-        if (n <= 0) break;
-
-        verify_keys_rc4(keys, pw_ptrs, n, key_bytes);
-        atomic_fetch_add_explicit(&g_tested, (long)n, memory_order_relaxed);
-    }
-
-done:
-    free(pw_ptrs);
-    free(pw_storage);
-    free(keys);
+    run_gpu_md5(sha256_rule_gen, NULL, g_nwords * g_nrules, MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
@@ -2689,46 +2666,11 @@ static void *hybrid_worker(void *arg)
     return NULL;
 }
 
-/* GPU hybrid worker */
+/* GPU hybrid worker (single-buffered sync; consolidated into run_gpu_md5) */
 static void *gpu_hybrid_worker(void *arg)
 {
     (void)arg;
-    int key_bytes = metal_keygen_key_bytes(g_gpu_ctx);
-    long total = g_nwords * g_hybrid_suffix_keyspace;
-
-    const char **pw_ptrs = malloc(sizeof(char *) * GPU_BATCH_SIZE);
-    char *pw_storage = malloc((size_t)GPU_BATCH_SIZE * (MAX_PASS_LEN * 2 + 2));
-    uint8_t *keys = malloc((size_t)GPU_BATCH_SIZE * key_bytes);
-
-    if (!pw_ptrs || !pw_storage || !keys) goto done;
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
-        if (start >= total) break;
-        long end = start + GPU_BATCH_SIZE;
-        if (end > total) end = total;
-        int count = (int)(end - start);
-
-        for (int i = 0; i < count; i++) {
-            long idx = start + i;
-            long word_idx = idx / g_hybrid_suffix_keyspace;
-            long suffix_idx = idx % g_hybrid_suffix_keyspace;
-            char *pw = pw_storage + i * (MAX_PASS_LEN * 2 + 2);
-            hybrid_gen_pass(word_idx, suffix_idx, pw);
-            pw_ptrs[i] = pw;
-        }
-
-        int n = metal_keygen_batch(g_gpu_ctx, pw_ptrs, count, keys);
-        if (n <= 0) break;
-
-        verify_keys_rc4(keys, pw_ptrs, n, key_bytes);
-        atomic_fetch_add_explicit(&g_tested, (long)n, memory_order_relaxed);
-    }
-
-done:
-    free(pw_ptrs);
-    free(pw_storage);
-    free(keys);
+    run_gpu_md5(sha256_hybrid_gen, NULL, g_nwords * g_hybrid_suffix_keyspace, MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
@@ -2759,8 +2701,8 @@ static inline int sha256_wait_and_check(void *handle, int count, const char **pw
  * SHA-256 GPU worker consolidation: shared driver + per-mode generators
  * ================================================================ */
 
-/* Generate candidate `idx` of the keyspace into `out`. ctx carries mode params. */
-typedef void (*cand_gen)(long idx, char *out, void *ctx);
+/* Candidate generator signature `cand_gen` is declared earlier, alongside the
+ * GPU-MD5 forward declarations. ctx carries per-mode params. */
 
 /* Shared double-buffered GPU SHA-256 pipeline driver */
 static void run_gpu_sha256(cand_gen gen, void *ctx, long total, int stride)
@@ -2813,6 +2755,47 @@ done:
         free(pw_ptrs[b]);
         free(pw_storage[b]);
     }
+}
+
+/* Shared single-buffered GPU-MD5 (R3/R4) pipeline driver.
+ * Companion to run_gpu_sha256, for the key-derivation + CPU-verify path:
+ * the GPU derives RC4/AES keys via metal_keygen_batch, then the CPU verifies
+ * them with verify_keys_rc4. Single-buffered (no async overlap), matching the
+ * shape the old gpu_rule_worker / gpu_hybrid_worker used. */
+static void run_gpu_md5(cand_gen gen, void *ctx, long total, int stride)
+{
+    int key_bytes = metal_keygen_key_bytes(g_gpu_ctx);
+
+    const char **pw_ptrs = malloc(sizeof(char *) * GPU_BATCH_SIZE);
+    char *pw_storage = malloc((size_t)GPU_BATCH_SIZE * stride);
+    uint8_t *keys = malloc((size_t)GPU_BATCH_SIZE * key_bytes);
+
+    if (!pw_ptrs || !pw_storage || !keys) goto done;
+
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, GPU_BATCH_SIZE);
+        if (start >= total) break;
+        long end = start + GPU_BATCH_SIZE;
+        if (end > total) end = total;
+        int count = (int)(end - start);
+
+        for (int i = 0; i < count; i++) {
+            char *pw = pw_storage + i * stride;
+            gen(start + i, pw, ctx);
+            pw_ptrs[i] = pw;
+        }
+
+        int n = metal_keygen_batch(g_gpu_ctx, pw_ptrs, count, keys);
+        if (n <= 0) break;
+
+        verify_keys_rc4(keys, pw_ptrs, n, key_bytes);
+        atomic_fetch_add_explicit(&g_tested, (long)n, memory_order_relaxed);
+    }
+
+done:
+    free(pw_ptrs);
+    free(pw_storage);
+    free(keys);
 }
 
 /* ── Brute-force generator ───────────────────────────────────────── */
