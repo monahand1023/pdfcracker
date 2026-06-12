@@ -35,6 +35,15 @@ static inline void pack_passwords_gpu(uint8_t *pw_buf, uint8_t *len_buf,
 #define MAX_BATCH_SIZE  262144  /* 256K passwords per dispatch */
 #define PW_PACKED_LEN   32      /* each password slot is 32 bytes */
 
+/* ── Async handle: bundles the command buffer with the buffer-slot index
+ * and the clamped batch count so wait functions never re-derive either
+ * from shared ctx state (removes the latent double-dispatch race).       */
+typedef struct {
+    void *cmd_buf;   /* __bridge_retained id<MTLCommandBuffer> */
+    int   buf_index; /* which double-buffer slot this dispatch used */
+    int   count;     /* clamped batch count sent to the GPU */
+} MetalAsyncHandle;
+
 /* ── Load pdf_md5.metallib with a three-step fallback ───────────────
  * 1. Explicit path provided by caller (may be nil).
  * 2. Directory containing the main executable bundle.
@@ -284,7 +293,13 @@ void *metal_keygen_submit_async(MetalKeygenContext *ctx,
 
         [cmdBuf commit];
 
-        return (__bridge_retained void *)cmdBuf;
+        /* Wrap command buffer + buffer slot + clamped count in a handle struct
+         * so wait never needs to re-derive either from shared ctx state. */
+        MetalAsyncHandle *h = malloc(sizeof(MetalAsyncHandle));
+        h->cmd_buf   = (__bridge_retained void *)cmdBuf;
+        h->buf_index = buf;
+        h->count     = count;
+        return h;
     }
 }
 
@@ -294,7 +309,13 @@ int metal_keygen_wait_results(MetalKeygenContext *ctx, void *handle,
     if (!ctx || !handle) return 0;
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmdBuf = (__bridge_transfer id<MTLCommandBuffer>)handle;
+        MetalAsyncHandle *h = (MetalAsyncHandle *)handle;
+        id<MTLCommandBuffer> cmdBuf =
+            (__bridge_transfer id<MTLCommandBuffer>)h->cmd_buf;
+        int results_buf = h->buf_index;
+        int n           = h->count;
+        free(h);
+
         [cmdBuf waitUntilCompleted];
 
         if (cmdBuf.error) {
@@ -303,13 +324,10 @@ int metal_keygen_wait_results(MetalKeygenContext *ctx, void *handle,
             return 0;
         }
 
-        /* Results are in the OTHER buffer (we toggled current_buf in submit) */
-        int results_buf = ctx->current_buf ^ 1;
-
         uint8_t *gpu_keys = (uint8_t *)[ctx->keys_buf[results_buf] contents];
-        memcpy(keys_out, gpu_keys, (size_t)count * ctx->key_bytes);
+        memcpy(keys_out, gpu_keys, (size_t)n * ctx->key_bytes);
 
-        return count;
+        return n;
     }
 }
 
@@ -626,8 +644,12 @@ void *metal_sha256_submit_async(MetalSHA256Context *ctx, const char **passwords,
 
         [cmdBuf commit];
 
-        /* Return command buffer as opaque handle — retain so it survives autorelease */
-        return (__bridge_retained void *)cmdBuf;
+        /* Wrap command buffer + buffer slot + clamped count in a handle struct. */
+        MetalAsyncHandle *h = malloc(sizeof(MetalAsyncHandle));
+        h->cmd_buf   = (__bridge_retained void *)cmdBuf;
+        h->buf_index = buf;
+        h->count     = count;
+        return h;
     }
 }
 
@@ -638,7 +660,13 @@ int metal_sha256_wait_results_ex(MetalSHA256Context *ctx, void *handle, int coun
     if (!ctx || !handle) return -1;
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmdBuf = (__bridge_transfer id<MTLCommandBuffer>)handle;
+        MetalAsyncHandle *h = (MetalAsyncHandle *)handle;
+        id<MTLCommandBuffer> cmdBuf =
+            (__bridge_transfer id<MTLCommandBuffer>)h->cmd_buf;
+        int results_buf = h->buf_index;
+        int n           = h->count;
+        free(h);
+
         [cmdBuf waitUntilCompleted];
 
         if (cmdBuf.error) {
@@ -647,11 +675,8 @@ int metal_sha256_wait_results_ex(MetalSHA256Context *ctx, void *handle, int coun
             return -1;
         }
 
-        /* Results are in the OTHER buffer (we toggled current_buf in submit) */
-        int results_buf = ctx->current_buf ^ 1;
-
         uint8_t *results = (uint8_t *)[ctx->results_buf[results_buf] contents];
-        for (int i = 0; i < count; i++) {
+        for (int i = 0; i < n; i++) {
             if (results[i]) {
                 if (match_type) *match_type = (int)results[i];
                 return i;
@@ -908,8 +933,12 @@ void *metal_r6_submit_async(MetalR6Context *ctx, const char **passwords, int cou
 
         [cmdBuf commit];
 
-        /* Return command buffer as opaque handle — retain so it survives autorelease */
-        return (__bridge_retained void *)cmdBuf;
+        /* Wrap command buffer + buffer slot + clamped count in a handle struct. */
+        MetalAsyncHandle *h = malloc(sizeof(MetalAsyncHandle));
+        h->cmd_buf   = (__bridge_retained void *)cmdBuf;
+        h->buf_index = buf;
+        h->count     = count;
+        return h;
     }
 }
 
@@ -920,7 +949,13 @@ int metal_r6_wait_results_ex(MetalR6Context *ctx, void *handle, int count,
     if (!ctx || !handle) return -1;
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmdBuf = (__bridge_transfer id<MTLCommandBuffer>)handle;
+        MetalAsyncHandle *h = (MetalAsyncHandle *)handle;
+        id<MTLCommandBuffer> cmdBuf =
+            (__bridge_transfer id<MTLCommandBuffer>)h->cmd_buf;
+        int results_buf = h->buf_index;  /* captured at submit time — no ctx state needed */
+        int n           = h->count;
+        free(h);
+
         [cmdBuf waitUntilCompleted];
 
         if (cmdBuf.error) {
@@ -929,16 +964,8 @@ int metal_r6_wait_results_ex(MetalR6Context *ctx, void *handle, int count,
             return -1;
         }
 
-        /* Results are in the OTHER buffer (we toggled current_buf in submit) */
-        int results_buf = ctx->current_buf; /* after toggle, this points to the one we just used */
-        /* Actually, we toggled current_buf at submit time. The buffer we used was
-         * (current_buf ^ 1) at this point. Let's track it properly:
-         * At submit: buf = old current_buf, then current_buf ^= 1
-         * So now current_buf = old ^ 1, meaning the buffer we submitted to = current_buf ^ 1 */
-        results_buf = ctx->current_buf ^ 1;
-
         uint8_t *results = (uint8_t *)[ctx->results_buf[results_buf] contents];
-        for (int i = 0; i < count; i++) {
+        for (int i = 0; i < n; i++) {
             if (results[i]) {
                 if (match_type) *match_type = (int)results[i];
                 return i;
