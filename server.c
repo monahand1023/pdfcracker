@@ -25,6 +25,10 @@
 #include <sys/wait.h>
 #include <libgen.h>
 #include <dns_sd.h>
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#include <CommonCrypto/CommonDigest.h>
+#pragma clang diagnostic pop
 
 /* Named constant for the lease-recheck nanosleep interval (~200 ms) */
 #define LEASE_RECHECK_NS 200000000
@@ -785,6 +789,16 @@ static void http_serve_dashboard(int fd)
     write(fd, html, body_len);
 }
 
+/* Constant-time token compare — prevents timing side-channels.
+ * Returns 1 if a and b are equal (both length n), 0 otherwise. */
+static int ct_memeq(const char *a, const char *b, size_t n)
+{
+    volatile unsigned int diff = 0;
+    for (size_t i = 0; i < n; i++)
+        diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    return diff == 0;
+}
+
 /* Check HTTP auth token in query string. Returns 1 if OK, 0 if denied. */
 static int http_check_auth(const char *path)
 {
@@ -799,7 +813,11 @@ static int http_check_auth(const char *path)
             p += 6;
             const char *end = strchr(p, '&');
             size_t tlen = end ? (size_t)(end - p) : strlen(p);
-            if (tlen == strlen(g_auth_token) && memcmp(p, g_auth_token, tlen) == 0)
+            size_t alen = strlen(g_auth_token);
+            /* Use constant-time compare; also compare lengths without early exit */
+            volatile unsigned int len_diff = (unsigned int)(tlen ^ alen);
+            size_t cmplen = tlen < alen ? tlen : alen;
+            if (ct_memeq(p, g_auth_token, cmplen) && len_diff == 0)
                 return 1;
             return 0;
         }
@@ -807,6 +825,31 @@ static int http_check_auth(const char *path)
         if (!amp) break;
         p = amp + 1;
     }
+    return 0;
+}
+
+/* Compute SHA-256 of a file and store the lowercase hex digest in out[65].
+ * Returns 0 on success, -1 on failure (file unreadable, etc.). */
+static int sha256_file_hex(const char *path, char out[65])
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+
+    unsigned char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        CC_SHA256_Update(&ctx, buf, (CC_LONG)n);
+    fclose(f);
+
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &ctx);
+
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+        snprintf(out + i * 2, 3, "%02x", digest[i]);
+    out[64] = '\0';
     return 0;
 }
 
@@ -884,7 +927,15 @@ static void handle_http_request(int fd, const char *request_line)
             }
         }
 
-        char body[2048];
+        /* Compute SHA-256 of the client binary we will serve */
+        char client_sha256[65] = "0000000000000000000000000000000000000000000000000000000000000000";
+        {
+            char client_fpath[PATH_MAX];
+            snprintf(client_fpath, sizeof(client_fpath), "%s/client", g_server_dir);
+            sha256_file_hex(client_fpath, client_sha256);
+        }
+
+        char body[4096];
         int blen = snprintf(body, sizeof(body),
             "#!/bin/bash\n"
             "set -euo pipefail\n"
@@ -893,6 +944,23 @@ static void handle_http_request(int fd, const char *request_line)
             "echo \"Downloading client...\"\n"
             "curl -sL http://%s:%d/client -o \"$DIR/client\"\n"
             "curl -sL http://%s:%d/pdf_md5.metallib -o \"$DIR/pdf_md5.metallib\"\n"
+            "# Verify binary integrity before executing\n"
+            "EXPECTED_SHA=\"%s\"\n"
+            "if command -v shasum >/dev/null 2>&1; then\n"
+            "  ACTUAL_SHA=$(shasum -a 256 \"$DIR/client\" | awk '{print $1}')\n"
+            "elif command -v sha256sum >/dev/null 2>&1; then\n"
+            "  ACTUAL_SHA=$(sha256sum \"$DIR/client\" | awk '{print $1}')\n"
+            "else\n"
+            "  echo 'WARNING: no sha256 tool found — skipping integrity check' >&2\n"
+            "  ACTUAL_SHA=\"$EXPECTED_SHA\"\n"
+            "fi\n"
+            "if [ \"$ACTUAL_SHA\" != \"$EXPECTED_SHA\" ]; then\n"
+            "  echo 'ERROR: client binary checksum mismatch — aborting.' >&2\n"
+            "  echo \"  expected: $EXPECTED_SHA\" >&2\n"
+            "  echo \"  actual:   $ACTUAL_SHA\" >&2\n"
+            "  rm -f \"$DIR/client\"\n"
+            "  exit 1\n"
+            "fi\n"
             "chmod +x \"$DIR/client\"\n"
             "echo \"Starting pdfcracker client -> %s:%d\"\n"
             "echo \"Press Ctrl+C to stop.\"\n"
@@ -901,6 +969,7 @@ static void handle_http_request(int fd, const char *request_line)
             "exec ./client -s %s -p %d\n",
             server_ip, server_port,
             server_ip, server_port,
+            client_sha256,
             server_ip, server_port,
             server_ip, server_port);
         dprintf(fd, "HTTP/1.0 200 OK\r\n"
@@ -2034,7 +2103,8 @@ static void *web_server_thread(void *arg)
         buf[total] = '\0';
 
         if (header_done || total > 0) {
-            /* Extract path from "GET /path HTTP/1.x" */
+            /* Extract full URI (path+query) from "GET /path?q HTTP/1.x" */
+            char full_uri[512] = "";
             char path[256] = "";
             if (strncmp(buf, "GET ", 4) == 0) {
                 char *p = buf + 4;
@@ -2042,9 +2112,25 @@ static void *web_server_thread(void *arg)
                 if (!end) end = strchr(p, '\r');
                 if (!end) end = p + strlen(p);
                 size_t len = (size_t)(end - p);
-                if (len >= sizeof(path)) len = sizeof(path) - 1;
-                memcpy(path, p, len);
-                path[len] = '\0';
+                if (len >= sizeof(full_uri)) len = sizeof(full_uri) - 1;
+                memcpy(full_uri, p, len);
+                full_uri[len] = '\0';
+                /* Strip query string for path matching */
+                const char *qmark = strchr(full_uri, '?');
+                size_t plen = qmark ? (size_t)(qmark - full_uri) : len;
+                if (plen >= sizeof(path)) plen = sizeof(path) - 1;
+                memcpy(path, full_uri, plen);
+                path[plen] = '\0';
+            }
+
+            /* Auth check — uses the same http_check_auth as the main port */
+            if (!http_check_auth(full_uri)) {
+                dprintf(cfd, "HTTP/1.0 403 Forbidden\r\n"
+                             "Content-Type: text/plain\r\n"
+                             "Content-Length: 0\r\n"
+                             "\r\n");
+                close(cfd);
+                continue;
             }
 
             if (strcmp(path, "/") == 0) {

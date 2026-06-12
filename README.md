@@ -344,6 +344,17 @@ See `BENCHMARKS.md` for full engine comparison tables and detailed methodology.
 
 For large keyspaces, multiple Macs on the same network can share work. The server coordinates all work and also cracks locally; clients join and add capacity.
 
+### Security model
+
+**This protocol is designed for a trusted LAN only.**
+
+- The work protocol is unauthenticated: any machine that can reach the server port can register as a worker and receive chunks of the keyspace.
+- The target PDF and the downloaded `client` binary both cross the network in cleartext HTTP.
+- Do not expose the server port to an untrusted network.
+- **Preferred bootstrap**: use `deploy.sh` (SSH push) instead of the `curl|bash` HTTP pull wherever possible — SSH encrypts both the binary and the PDF.
+- If you must use HTTP, run the session inside a VPN or trusted subnet, and use `--auth-token` to at least gate the dashboard and API endpoints.
+- The `join.sh` bootstrap script is intentionally exempt from the `--auth-token` check (it is the unauthenticated entry point for new workers), so it must only be reachable on a trusted network.
+
 ### Protocol
 
 The server↔client protocol (`protocol.h`) is text-line TCP:
