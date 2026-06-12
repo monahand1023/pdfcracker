@@ -2954,18 +2954,17 @@ static inline int r6_wait_and_check(void *handle, int count, const char **pw_buf
     return match;
 }
 
-static void *gpu_r6_brute_worker(void *arg)
+/* Shared double-buffered GPU R6 pipeline driver (companion to run_gpu_sha256) */
+static void run_gpu_r6(cand_gen gen, void *ctx, long total, int stride)
 {
-    GPUBruteArg *a = (GPUBruteArg *)arg;
     int batch = metal_r6_max_batch(g_r6_ctx);
     if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
 
-    /* Double-buffered password arrays for pipelining */
-    const char **pw_ptrs[2];
-    char *pw_storage[2];
+    const char **pw_ptrs[2] = {NULL, NULL};
+    char *pw_storage[2] = {NULL, NULL};
     for (int b = 0; b < 2; b++) {
         pw_ptrs[b] = malloc(sizeof(char *) * batch);
-        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN + 1));
+        pw_storage[b] = malloc((size_t)batch * stride);
         if (!pw_ptrs[b] || !pw_storage[b]) goto done;
     }
 
@@ -2976,33 +2975,29 @@ static void *gpu_r6_brute_worker(void *arg)
 
     while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
         long start = atomic_fetch_add(&g_next_idx, batch);
-        if (start >= a->total) break;
+        if (start >= total) break;
         long end = start + batch;
-        if (end > a->total) end = a->total;
+        if (end > total) end = total;
         int count = (int)(end - start);
 
-        /* Prepare passwords on current buffer */
         for (int i = 0; i < count; i++) {
-            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
-            g_idx_to_pass(start + i, a->length, pw);
+            char *pw = pw_storage[cur_buf] + i * stride;
+            gen(start + i, pw, ctx);
             pw_ptrs[cur_buf][i] = pw;
         }
 
-        /* Wait for previous batch if any */
         if (pending_handle) {
             r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
             pending_handle = NULL;
             atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
         }
 
-        /* Submit current batch asynchronously */
         pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
         pending_count = count;
         pending_buf = cur_buf;
         cur_buf ^= 1;
     }
 
-    /* Wait for final batch */
     if (pending_handle) {
         r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
         atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
@@ -3013,6 +3008,13 @@ done:
         free(pw_ptrs[b]);
         free(pw_storage[b]);
     }
+}
+
+static void *gpu_r6_brute_worker(void *arg)
+{
+    GPUBruteArg *a = (GPUBruteArg *)arg;
+    BruteCtx bctx = { a->length };
+    run_gpu_r6(sha256_brute_gen, &bctx, a->total, MAX_PASS_LEN + 1);
     free(arg);
     return NULL;
 }
@@ -3020,49 +3022,7 @@ done:
 static void *gpu_r6_dict_worker(void *arg)
 {
     (void)arg;
-    int batch = metal_r6_max_batch(g_r6_ctx);
-    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
-
-    const char **pw_ptrs[2];
-    for (int b = 0; b < 2; b++) {
-        pw_ptrs[b] = malloc(sizeof(char *) * batch);
-        if (!pw_ptrs[b]) goto done;
-    }
-
-    int cur_buf = 0;
-    void *pending_handle = NULL;
-    int pending_count = 0;
-    int pending_buf = 0;
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, batch);
-        if (start >= g_nwords) break;
-        long end = start + batch;
-        if (end > g_nwords) end = g_nwords;
-        int count = (int)(end - start);
-
-        for (int i = 0; i < count; i++)
-            pw_ptrs[cur_buf][i] = g_words[start + i];
-
-        if (pending_handle) {
-            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-            pending_handle = NULL;
-            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-        }
-
-        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
-        pending_count = count;
-        pending_buf = cur_buf;
-        cur_buf ^= 1;
-    }
-
-    if (pending_handle) {
-        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-    }
-
-done:
-    for (int b = 0; b < 2; b++) free(pw_ptrs[b]);
+    run_gpu_r6(sha256_dict_gen, NULL, g_nwords, MAX_PASS_LEN + 1);
     free(arg);
     return NULL;
 }
@@ -3070,61 +3030,7 @@ done:
 static void *gpu_r6_rule_worker(void *arg)
 {
     (void)arg;
-    long total = g_nwords * g_nrules;
-    int batch = metal_r6_max_batch(g_r6_ctx);
-    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
-
-    const char **pw_ptrs[2];
-    char *pw_storage[2];
-    for (int b = 0; b < 2; b++) {
-        pw_ptrs[b] = malloc(sizeof(char *) * batch);
-        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
-        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
-    }
-
-    int cur_buf = 0;
-    void *pending_handle = NULL;
-    int pending_count = 0;
-    int pending_buf = 0;
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, batch);
-        if (start >= total) break;
-        long end = start + batch;
-        if (end > total) end = total;
-        int count = (int)(end - start);
-
-        for (int i = 0; i < count; i++) {
-            long idx = start + i;
-            long word_idx = idx / g_nrules;
-            int  rule_idx = (int)(idx % g_nrules);
-            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
-            apply_rule(g_words[word_idx], rule_idx, pw);
-            pw_ptrs[cur_buf][i] = pw;
-        }
-
-        if (pending_handle) {
-            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-            pending_handle = NULL;
-            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-        }
-
-        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
-        pending_count = count;
-        pending_buf = cur_buf;
-        cur_buf ^= 1;
-    }
-
-    if (pending_handle) {
-        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-    }
-
-done:
-    for (int b = 0; b < 2; b++) {
-        free(pw_ptrs[b]);
-        free(pw_storage[b]);
-    }
+    run_gpu_r6(sha256_rule_gen, NULL, g_nwords * g_nrules, MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
@@ -3132,61 +3038,7 @@ done:
 static void *gpu_r6_hybrid_worker(void *arg)
 {
     (void)arg;
-    long total = g_nwords * g_hybrid_suffix_keyspace;
-    int batch = metal_r6_max_batch(g_r6_ctx);
-    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
-
-    const char **pw_ptrs[2];
-    char *pw_storage[2];
-    for (int b = 0; b < 2; b++) {
-        pw_ptrs[b] = malloc(sizeof(char *) * batch);
-        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
-        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
-    }
-
-    int cur_buf = 0;
-    void *pending_handle = NULL;
-    int pending_count = 0;
-    int pending_buf = 0;
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, batch);
-        if (start >= total) break;
-        long end = start + batch;
-        if (end > total) end = total;
-        int count = (int)(end - start);
-
-        for (int i = 0; i < count; i++) {
-            long idx = start + i;
-            long word_idx = idx / g_hybrid_suffix_keyspace;
-            long suffix_idx = idx % g_hybrid_suffix_keyspace;
-            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
-            hybrid_gen_pass(word_idx, suffix_idx, pw);
-            pw_ptrs[cur_buf][i] = pw;
-        }
-
-        if (pending_handle) {
-            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-            pending_handle = NULL;
-            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-        }
-
-        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
-        pending_count = count;
-        pending_buf = cur_buf;
-        cur_buf ^= 1;
-    }
-
-    if (pending_handle) {
-        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-    }
-
-done:
-    for (int b = 0; b < 2; b++) {
-        free(pw_ptrs[b]);
-        free(pw_storage[b]);
-    }
+    run_gpu_r6(sha256_hybrid_gen, NULL, g_nwords * g_hybrid_suffix_keyspace, MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
@@ -3427,62 +3279,7 @@ static void *gpu_sha256_combinator_worker(void *arg)
 static void *gpu_r6_combinator_worker(void *arg)
 {
     (void)arg;
-    long total = g_nwords * g_nwords2;
-    int batch = metal_r6_max_batch(g_r6_ctx);
-    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
-
-    const char **pw_ptrs[2];
-    char *pw_storage[2];
-    for (int b = 0; b < 2; b++) {
-        pw_ptrs[b] = malloc(sizeof(char *) * batch);
-        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
-        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
-    }
-
-    int cur_buf = 0;
-    void *pending_handle = NULL;
-    int pending_count = 0, pending_buf = 0;
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, batch);
-        if (start >= total) break;
-        long end = start + batch;
-        if (end > total) end = total;
-        int count = (int)(end - start);
-
-        for (int i = 0; i < count; i++) {
-            long idx = start + i;
-            long w1 = idx / g_nwords2;
-            long w2 = idx % g_nwords2;
-            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
-            size_t l1 = strlen(g_words[w1]);
-            size_t l2 = strlen(g_words2[w2]);
-            if (l1 + l2 <= MAX_PASS_LEN) {
-                memcpy(pw, g_words[w1], l1);
-                memcpy(pw + l1, g_words2[w2], l2);
-                pw[l1 + l2] = '\0';
-            } else {
-                pw[0] = '\0';
-            }
-            pw_ptrs[cur_buf][i] = pw;
-        }
-
-        if (pending_handle) {
-            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-            pending_handle = NULL;
-            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-        }
-        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
-        pending_count = count;
-        pending_buf = cur_buf;
-        cur_buf ^= 1;
-    }
-    if (pending_handle) {
-        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-    }
-done:
-    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    run_gpu_r6(sha256_combinator_gen, NULL, g_nwords * g_nwords2, MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
@@ -3610,51 +3407,7 @@ static void *gpu_sha256_dates_worker(void *arg)
 static void *gpu_r6_dates_worker(void *arg)
 {
     (void)arg;
-    long total = atomic_load(&g_total);
-    int batch = metal_r6_max_batch(g_r6_ctx);
-    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
-
-    const char **pw_ptrs[2];
-    char *pw_storage[2];
-    for (int b = 0; b < 2; b++) {
-        pw_ptrs[b] = malloc(sizeof(char *) * batch);
-        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN + 1));
-        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
-    }
-
-    int cur_buf = 0;
-    void *pending_handle = NULL;
-    int pending_count = 0, pending_buf = 0;
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, batch);
-        if (start >= total) break;
-        long end = start + batch;
-        if (end > total) end = total;
-        int count = (int)(end - start);
-
-        for (int i = 0; i < count; i++) {
-            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
-            dates_index_to_pass(start + i, pw);
-            pw_ptrs[cur_buf][i] = pw;
-        }
-
-        if (pending_handle) {
-            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-            pending_handle = NULL;
-            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-        }
-        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
-        pending_count = count;
-        pending_buf = cur_buf;
-        cur_buf ^= 1;
-    }
-    if (pending_handle) {
-        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-    }
-done:
-    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    run_gpu_r6(sha256_dates_gen, NULL, atomic_load(&g_total), MAX_PASS_LEN + 1);
     free(arg);
     return NULL;
 }
@@ -3808,54 +3561,7 @@ static void *gpu_sha256_mutate_worker(void *arg)
 static void *gpu_r6_mutate_worker(void *arg)
 {
     (void)arg;
-    long total = atomic_load(&g_total);
-    int batch = metal_r6_max_batch(g_r6_ctx);
-    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
-
-    const char **pw_ptrs[2];
-    char *pw_storage[2];
-    for (int b = 0; b < 2; b++) {
-        pw_ptrs[b] = malloc(sizeof(char *) * batch);
-        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
-        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
-    }
-
-    int cur_buf = 0;
-    void *pending_handle = NULL;
-    int pending_count = 0, pending_buf = 0;
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, batch);
-        if (start >= total) break;
-        long end = start + batch;
-        if (end > total) end = total;
-        int count = (int)(end - start);
-
-        for (int i = 0; i < count; i++) {
-            long idx = start + i;
-            long word_idx = idx / MUTATE_NMUTATIONS;
-            int  mut_idx  = (int)(idx % MUTATE_NMUTATIONS);
-            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
-            mutate_index_to_pass(word_idx, mut_idx, pw);
-            pw_ptrs[cur_buf][i] = pw;
-        }
-
-        if (pending_handle) {
-            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-            pending_handle = NULL;
-            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-        }
-        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
-        pending_count = count;
-        pending_buf = cur_buf;
-        cur_buf ^= 1;
-    }
-    if (pending_handle) {
-        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-    }
-done:
-    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    run_gpu_r6(sha256_mutate_gen, NULL, atomic_load(&g_total), MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
@@ -4020,51 +3726,7 @@ static void *gpu_sha256_leet_worker(void *arg)
 static void *gpu_r6_leet_worker(void *arg)
 {
     (void)arg;
-    long total = atomic_load(&g_total);
-    int batch = metal_r6_max_batch(g_r6_ctx);
-    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
-
-    const char **pw_ptrs[2];
-    char *pw_storage[2];
-    for (int b = 0; b < 2; b++) {
-        pw_ptrs[b] = malloc(sizeof(char *) * batch);
-        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN + 1));
-        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
-    }
-
-    int cur_buf = 0;
-    void *pending_handle = NULL;
-    int pending_count = 0, pending_buf = 0;
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, batch);
-        if (start >= total) break;
-        long end = start + batch;
-        if (end > total) end = total;
-        int count = (int)(end - start);
-
-        for (int i = 0; i < count; i++) {
-            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN + 1);
-            leet_index_to_pass(start + i, pw);
-            pw_ptrs[cur_buf][i] = pw;
-        }
-
-        if (pending_handle) {
-            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-            pending_handle = NULL;
-            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-        }
-        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
-        pending_count = count;
-        pending_buf = cur_buf;
-        cur_buf ^= 1;
-    }
-    if (pending_handle) {
-        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-    }
-done:
-    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    run_gpu_r6(sha256_leet_gen, NULL, atomic_load(&g_total), MAX_PASS_LEN + 1);
     free(arg);
     return NULL;
 }
@@ -4134,55 +3796,7 @@ static void *gpu_sha256_mask_rule_worker(void *arg)
 static void *gpu_r6_mask_rule_worker(void *arg)
 {
     (void)arg;
-    long total = g_mask_keyspace * g_nrules;
-    int batch = metal_r6_max_batch(g_r6_ctx);
-    if (g_gpu_batch > 0 && g_gpu_batch < batch) batch = g_gpu_batch;
-
-    const char **pw_ptrs[2];
-    char *pw_storage[2];
-    for (int b = 0; b < 2; b++) {
-        pw_ptrs[b] = malloc(sizeof(char *) * batch);
-        pw_storage[b] = malloc((size_t)batch * (MAX_PASS_LEN * 2 + 2));
-        if (!pw_ptrs[b] || !pw_storage[b]) goto done;
-    }
-    int cur_buf = 0;
-    void *pending_handle = NULL;
-    int pending_count = 0, pending_buf = 0;
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, batch);
-        if (start >= total) break;
-        long end = start + batch;
-        if (end > total) end = total;
-        int count = (int)(end - start);
-
-        for (int i = 0; i < count; i++) {
-            long idx = start + i;
-            long mask_idx = idx / g_nrules;
-            int  rule_idx = (int)(idx % g_nrules);
-            char base[MAX_PASS_LEN + 1];
-            mask_index_to_pass(mask_idx, 0, base);
-            char *pw = pw_storage[cur_buf] + i * (MAX_PASS_LEN * 2 + 2);
-            apply_rule(base, rule_idx, pw);
-            pw_ptrs[cur_buf][i] = pw;
-        }
-
-        if (pending_handle) {
-            r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-            pending_handle = NULL;
-            atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-        }
-        pending_handle = metal_r6_submit_async(g_r6_ctx, pw_ptrs[cur_buf], count);
-        pending_count = count;
-        pending_buf = cur_buf;
-        cur_buf ^= 1;
-    }
-    if (pending_handle) {
-        r6_wait_and_check(pending_handle, pending_count, pw_ptrs[pending_buf]);
-        atomic_fetch_add_explicit(&g_tested, (long)pending_count, memory_order_relaxed);
-    }
-done:
-    for (int b = 0; b < 2; b++) { free(pw_ptrs[b]); free(pw_storage[b]); }
+    run_gpu_r6(sha256_mask_rule_gen, NULL, g_mask_keyspace * g_nrules, MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
