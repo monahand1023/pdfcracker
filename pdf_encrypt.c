@@ -812,6 +812,10 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
  * R5 user password verification (Algorithm 2.A simplified)
  * SHA-256(password + validation_salt) == U[0:32]
  * validation_salt = U[32:40]
+ *
+ * When /Perms is present, also cross-validates the decrypted /Perms
+ * block: derives the file key via SHA-256(pw + U_key_salt) → AES-256-ECB-
+ * decrypt(UE), then decrypts /Perms and asserts bytes [9:11] == 'a','d','b'.
  * ================================================================ */
 static int verify_user_r5(const PDFEncryptParams *params, const char *password)
 {
@@ -820,6 +824,7 @@ static int verify_user_r5(const PDFEncryptParams *params, const char *password)
     size_t pw_len = password ? strlen(password) : 0;
     if (pw_len > 127) pw_len = 127;
 
+    /* Primary validation: SHA-256(pw + U_validation_salt) == U[0:32] */
     uint8_t hash[32];
     CC_SHA256_CTX sha256;
     CC_SHA256_Init(&sha256);
@@ -827,7 +832,44 @@ static int verify_user_r5(const PDFEncryptParams *params, const char *password)
     CC_SHA256_Update(&sha256, params->u_value + 32, 8); /* validation salt */
     CC_SHA256_Final(hash, &sha256);
 
-    return memcmp(hash, params->u_value, 32) == 0;
+    if (memcmp(hash, params->u_value, 32) != 0) return 0;
+
+    /* /Perms cross-check (extra correctness gate, only when data is present):
+     * intermediate_key = SHA-256(pw + U_key_salt)
+     * file_key         = AES-256-CBC-decrypt(UE, intermediate_key, IV=0)
+     * perms_plain      = AES-256-ECB-decrypt(Perms, file_key)
+     * assert perms_plain[9:12] == 'a', 'd', 'b'  (ISO 32000-2 §7.6.5.2)  */
+    if (params->has_perms && params->has_ue) {
+        uint8_t int_key[32];
+        CC_SHA256_CTX sha2;
+        CC_SHA256_Init(&sha2);
+        if (pw_len > 0) CC_SHA256_Update(&sha2, (const uint8_t *)password, (CC_LONG)pw_len);
+        CC_SHA256_Update(&sha2, params->u_value + 40, 8); /* key salt */
+        CC_SHA256_Final(int_key, &sha2);
+
+        /* UE is encrypted with AES-256-CBC, zero IV (ISO 32000-2 §7.6.4.4) */
+        uint8_t file_key[32] = {0};
+        uint8_t iv_zero[16]  = {0};
+        size_t fk_out = 0;
+        CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0 /* CBC, no padding */,
+                int_key, kCCKeySizeAES256, iv_zero,
+                params->ue_value, 32,
+                file_key, 32, &fk_out);
+
+        /* /Perms is encrypted with AES-256-ECB */
+        uint8_t perms_plain[16] = {0};
+        size_t pp_out = 0;
+        CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode,
+                file_key, kCCKeySizeAES256, NULL,
+                params->perms_value, 16,
+                perms_plain, 16, &pp_out);
+
+        if (pp_out != 16 ||
+            perms_plain[9] != 'a' || perms_plain[10] != 'd' || perms_plain[11] != 'b')
+            return 0;
+    }
+
+    return 1;
 }
 
 /* ================================================================
@@ -875,6 +917,12 @@ static inline void normalize_password_r6(const char *password,
 /* ================================================================
  * R6 user password verification (Algorithm 2.A with 2.B hash)
  * Algorithm2B(password, U_validation_salt, "") == U[0:32]
+ *
+ * When /Perms is present, also cross-validates via:
+ * intermediate_key = Algorithm2B(pw, U_key_salt, "")
+ * file_key         = AES-256-ECB-decrypt(UE, intermediate_key)
+ * perms_plain      = AES-256-ECB-decrypt(Perms, file_key)
+ * assert perms_plain[9:12] == 'a', 'd', 'b'
  * ================================================================ */
 static int verify_user_r6(const PDFEncryptParams *params, const char *password)
 {
@@ -884,13 +932,46 @@ static int verify_user_r6(const PDFEncryptParams *params, const char *password)
     size_t pw_len;
     normalize_password_r6(password, &pw_data, &pw_len);
 
+    /* Primary validation */
     uint8_t hash[32];
     algorithm_2b(pw_data, pw_len,
                  params->u_value + 32, /* validation salt */
-                 NULL, 0,              /* no extra data for user */
+                 NULL, 0,
                  hash);
 
-    return memcmp(hash, params->u_value, 32) == 0;
+    if (memcmp(hash, params->u_value, 32) != 0) return 0;
+
+    /* /Perms cross-check: same structure as R5 but uses Algorithm2B for key */
+    if (params->has_perms && params->has_ue) {
+        uint8_t int_key[32];
+        algorithm_2b(pw_data, pw_len,
+                     params->u_value + 40, /* key salt */
+                     NULL, 0,
+                     int_key);
+
+        /* UE is encrypted with AES-256-CBC, zero IV */
+        uint8_t file_key[32] = {0};
+        uint8_t iv_zero[16]  = {0};
+        size_t fk_out = 0;
+        CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0 /* CBC, no padding */,
+                int_key, kCCKeySizeAES256, iv_zero,
+                params->ue_value, 32,
+                file_key, 32, &fk_out);
+
+        /* /Perms is encrypted with AES-256-ECB */
+        uint8_t perms_plain[16] = {0};
+        size_t pp_out = 0;
+        CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode,
+                file_key, kCCKeySizeAES256, NULL,
+                params->perms_value, 16,
+                perms_plain, 16, &pp_out);
+
+        if (pp_out != 16 ||
+            perms_plain[9] != 'a' || perms_plain[10] != 'd' || perms_plain[11] != 'b')
+            return 0;
+    }
+
+    return 1;
 }
 
 /* ================================================================
