@@ -28,9 +28,13 @@ metal_keygen.o: metal_keygen.m metal_keygen.h pdf_encrypt.h
 checkpoint.o: checkpoint.c checkpoint.h
 	$(CC) $(CFLAGS) -c checkpoint.c
 
+# ── Rule engine ──────────────────────────────────────────────
+rules.o: rules.c rules.h
+	$(CC) $(CFLAGS) -c rules.c
+
 # ── Targets ──────────────────────────────────────────────────
-pdfcrack: pdfcrack.c checkpoint.o pdf_encrypt.o saslprep.o metal_keygen.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h checkpoint.h
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ pdfcrack.c checkpoint.o pdf_encrypt.o saslprep.o metal_keygen.o
+pdfcrack: pdfcrack.c checkpoint.o pdf_encrypt.o saslprep.o metal_keygen.o rules.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h checkpoint.h rules.h
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ pdfcrack.c checkpoint.o pdf_encrypt.o saslprep.o metal_keygen.o rules.o
 
 server: server.c protocol.h pdf_encrypt.o saslprep.o pdf_encrypt.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LIBS) -o $@ server.c pdf_encrypt.o saslprep.o
@@ -54,7 +58,7 @@ test: test_all test_saslprep test_crypto
 	./test_crypto
 
 clean:
-	rm -f pdfcrack server client test_all test_crypto test_saslprep fuzz_rules fuzz_parse checkpoint.o *.o *.air *.metallib *.profraw *.profdata
+	rm -f pdfcrack server client test_all test_crypto test_saslprep fuzz_rules fuzz_parse checkpoint.o rules.o *.o *.air *.metallib *.profraw *.profdata
 
 test-integration: pdfcrack
 	./test_integration.sh
@@ -62,8 +66,8 @@ test-integration: pdfcrack
 # Apple clang lacks the libFuzzer runtime; prefer Homebrew LLVM, fall back to clang.
 FUZZ_CC ?= $(shell command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || echo clang)
 
-fuzz-rules: fuzz_rules.c
-	$(FUZZ_CC) -fsanitize=fuzzer,address,undefined -o fuzz_rules fuzz_rules.c
+fuzz-rules: fuzz_rules.c rules.c rules.h
+	$(FUZZ_CC) -fsanitize=fuzzer,address,undefined -o fuzz_rules fuzz_rules.c rules.c
 
 fuzz-parse: test_parse_fuzz.c pdf_encrypt.c saslprep.c
 	$(FUZZ_CC) -O1 -g -fsanitize=fuzzer,address,undefined \
