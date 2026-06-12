@@ -105,7 +105,8 @@ static inline ssize_t read_exact(int fd, void *buf, size_t n)
     size_t done = 0;
     while (done < n) {
         ssize_t r = read(fd, (char *)buf + done, n - done);
-        if (r <= 0) return -1;
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) return -1;
         done += (size_t)r;
     }
     return (ssize_t)done;
@@ -117,7 +118,8 @@ static inline ssize_t write_exact(int fd, const void *buf, size_t n)
     size_t done = 0;
     while (done < n) {
         ssize_t w = write(fd, (const char *)buf + done, n - done);
-        if (w <= 0) return -1;
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        if (w == 0) return -1;
         done += (size_t)w;
     }
     return (ssize_t)done;
@@ -130,7 +132,8 @@ static inline int sock_readline(int fd, char *buf, int maxlen)
     char c;
     while (i < maxlen - 1) {
         ssize_t r = read(fd, &c, 1);
-        if (r <= 0) return -1;
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) return -1;
         if (c == '\n') break;
         if (c != '\r') buf[i++] = c;
     }

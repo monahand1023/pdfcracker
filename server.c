@@ -2301,6 +2301,10 @@ int main(int argc, char *argv[])
         int flag = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
+        /* 120s read timeout so a silent peer cannot park a thread forever */
+        struct timeval rcvto = { .tv_sec = 120, .tv_usec = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof(rcvto));
+
         /* Pass fd to handler thread */
         int *fdp = malloc(sizeof(int));
         if (!fdp) { close(fd); continue; }
