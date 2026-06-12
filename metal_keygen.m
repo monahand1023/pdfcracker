@@ -19,7 +19,6 @@ static inline void pack_passwords_gpu(uint8_t *pw_buf, uint8_t *len_buf,
                                        const char **passwords, int count,
                                        int packed_len, int max_len)
 {
-    memset(pw_buf, 0, (size_t)count * packed_len);
     for (int i = 0; i < count; i++) {
         if (!passwords[i]) { len_buf[i] = 0; continue; }
         size_t plen = strlen(passwords[i]);
