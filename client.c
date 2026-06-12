@@ -1562,6 +1562,15 @@ static int run_session(const char *host, int port)
             return 0;
         }
 
+        /* ── WAIT — server has active leases, retry later ────── */
+        else if (strcmp(line, "WAIT") == 0) {
+            /* Work is still in-flight on other clients; sleep briefly and
+             * send another GETWORK on the next loop iteration. */
+            struct timespec ts = {0, 300000000L};  /* 300 ms */
+            nanosleep(&ts, NULL);
+            /* prev_tested / prev_elapsed unchanged — no work done */
+        }
+
         /* ── DONE ─────────────────────────────────────────────── */
         else if (strcmp(line, "DONE") == 0) {
             fprintf(stderr,

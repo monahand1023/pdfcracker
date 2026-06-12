@@ -1035,7 +1035,7 @@ static int handle_protocol_message(int fd, ClientInfo *ci,
             }
             pthread_mutex_unlock(&g_lease_lock);
 
-            if (!any_active) break;  /* truly done */
+            if (!any_active) break;  /* truly done — no more work and no active leases */
 
             /* Active leases exist — wait for possible requeue */
             retries++;
@@ -1044,8 +1044,29 @@ static int handle_protocol_message(int fd, ClientInfo *ci,
         }
 
         if (lid == 0) {
-            sock_printf(fd, "DONE");
-            return 1;
+            /* Re-check any_active under lock for a fresh decision.
+             * If retries were exhausted but leases are still in flight we must
+             * NOT send the terminal DONE — tell the client to retry later. */
+            int any_active = 0;
+            pthread_mutex_lock(&g_lease_lock);
+            {
+                int lcount2 = g_lease_count < MAX_LEASES ? g_lease_count : MAX_LEASES;
+                for (int li = 0; li < lcount2; li++) {
+                    int lslot = ((g_lease_count - 1 - li) % MAX_LEASES + MAX_LEASES) % MAX_LEASES;
+                    if (g_leases[lslot].active) { any_active = 1; break; }
+                }
+            }
+            pthread_mutex_unlock(&g_lease_lock);
+
+            if (!any_active) {
+                /* Truly done: no work remaining and no active leases */
+                sock_printf(fd, "DONE");
+                return 1;
+            } else {
+                /* Work is in-flight in other leases — client should retry */
+                sock_printf(fd, "WAIT");
+                return 0;
+            }
         }
 
         if (is_brute) {
