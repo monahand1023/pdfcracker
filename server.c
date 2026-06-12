@@ -547,11 +547,28 @@ static int alloc_client_slot(void)
         }
     }
     /* Append if room */
-    if (g_nclient_ids >= MAX_CLIENTS) return -1;
-    int idx = g_nclient_ids++;
-    memset(&g_clients[idx], 0, sizeof(ClientInfo));
-    g_clients[idx].id = idx;
-    return idx;
+    if (g_nclient_ids < MAX_CLIENTS) {
+        int idx = g_nclient_ids++;
+        memset(&g_clients[idx], 0, sizeof(ClientInfo));
+        g_clients[idx].id = idx;
+        return idx;
+    }
+
+    /* Out of slots: evict the stalest disconnected (inactive) client. */
+    int victim = -1;
+    double oldest = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].active) continue;          /* never evict a live worker */
+        if (victim < 0 || g_clients[i].last_seen < oldest) {
+            victim = i; oldest = g_clients[i].last_seen;
+        }
+    }
+    if (victim >= 0) {
+        memset(&g_clients[victim], 0, sizeof(ClientInfo));
+        g_clients[victim].id = victim;
+        return victim;
+    }
+    return -1;  /* all slots are active — genuinely full */
 }
 
 static int find_client_by_uuid(const char *uuid)
