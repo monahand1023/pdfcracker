@@ -803,31 +803,6 @@ static void aes128_encrypt_block(thread const uint *rk, thread uchar *block)
     block[14] = st[14] ^ uchar(rk[43] >> 16); block[15] = st[15] ^ uchar(rk[43] >> 24);
 }
 
-/* AES-128-CBC encrypt: no padding, len must be multiple of 16 */
-static void aes128_cbc_encrypt(thread const uchar *key, thread const uchar *iv,
-                                device const uchar *input, uint len,
-                                device uchar *output)
-{
-    uint rk[44];
-    aes128_expand_key(key, rk);
-
-    uchar prev[16];
-    for (uint i = 0; i < 16; i++) prev[i] = iv[i];
-
-    for (uint off = 0; off < len; off += 16) {
-        uchar block[16];
-        for (uint i = 0; i < 16; i++)
-            block[i] = input[off + i] ^ prev[i];
-
-        aes128_encrypt_block(rk, block);
-
-        for (uint i = 0; i < 16; i++) {
-            output[off + i] = block[i];
-            prev[i] = block[i];
-        }
-    }
-}
-
 /*
  * AES-128-CBC encrypt where the plaintext is seq[0..seq_len-1] repeated
  * indefinitely (i.e. plaintext byte at position p is seq[p % seq_len]).
