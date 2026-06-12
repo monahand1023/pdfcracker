@@ -28,3 +28,4 @@ dan_dates.txt
 
 # macOS
 .DS_Store
+*.dSYM/
