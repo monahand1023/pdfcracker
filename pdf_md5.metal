@@ -828,6 +828,42 @@ static void aes128_cbc_encrypt(thread const uchar *key, thread const uchar *iv,
     }
 }
 
+/*
+ * AES-128-CBC encrypt where the plaintext is seq[0..seq_len-1] repeated
+ * indefinitely (i.e. plaintext byte at position p is seq[p % seq_len]).
+ * This avoids materialising the full replicated K1 in device memory:
+ * each 16-byte input block is generated on-the-fly from the thread-local
+ * seq[] buffer.  Ciphertext is still written to device memory (output)
+ * so that the subsequent SHA step can read it unchanged.
+ * len must be a multiple of 16; caller guarantees seq_len > 0.
+ */
+static void aes128_cbc_encrypt_from_seq(thread const uchar *key,
+                                         thread const uchar *iv,
+                                         thread const uchar *seq,
+                                         uint seq_len,
+                                         uint len,
+                                         device uchar *output)
+{
+    uint rk[44];
+    aes128_expand_key(key, rk);
+
+    uchar prev[16];
+    for (uint i = 0; i < 16; i++) prev[i] = iv[i];
+
+    for (uint off = 0; off < len; off += 16) {
+        uchar block[16];
+        for (uint i = 0; i < 16; i++)
+            block[i] = seq[(off + i) % seq_len] ^ prev[i];
+
+        aes128_encrypt_block(rk, block);
+
+        for (uint i = 0; i < 16; i++) {
+            output[off + i] = block[i];
+            prev[i] = block[i];
+        }
+    }
+}
+
 /* SHA-256 hash of data in device memory */
 static void sha256_hash_dev(device const uchar *data, uint len, thread uchar *out)
 {
@@ -946,32 +982,28 @@ kernel void pdf_r6_verify(
     uint round = 0;
 
     for (;;) {
-        /* Build sequence: password + hash + extra */
+        /* Build sequence: password + hash + extra — in thread-local storage.
+         * Max seq_len = 127 (pw) + 64 (hash) + 48 (extra) = 239 < 256. */
         uint seq_len = pw_len + hash_len + params.extra_len;
-        /* Build one copy of sequence in K1 */
+        uchar seq[256];
         uint pos = 0;
         for (uint i = 0; i < pw_len; i++)
-            K1[pos++] = passwords[pw_offset + i];
+            seq[pos++] = passwords[pw_offset + i];
         for (uint i = 0; i < hash_len; i++)
-            K1[pos++] = hash[i];
+            seq[pos++] = hash[i];
         for (uint i = 0; i < params.extra_len; i++)
-            K1[pos++] = params.extra[i];
+            seq[pos++] = params.extra[i];
 
-        /* Repeat 64 times */
-        uint K1_len = seq_len * 64;
-        for (uint rep = 1; rep < 64; rep++) {
-            for (uint i = 0; i < seq_len; i++)
-                K1[rep * seq_len + i] = K1[i];
-        }
-
-        /* AES-128-CBC encrypt K1 with key=hash[0:16], iv=hash[16:32] */
+        /* AES-128-CBC encrypt: generate each plaintext block on-the-fly from
+         * seq[] (eliminating the 64× device-memory replication of K1).
+         * 64*seq_len is always a multiple of 16 because 64 = 4*16.
+         * Ciphertext is written to device-memory aes_out so SHA can read it. */
         uchar aes_key[16], aes_iv[16];
         for (uint i = 0; i < 16; i++) aes_key[i] = hash[i];
         for (uint i = 0; i < 16; i++) aes_iv[i]  = hash[16 + i];
 
-        /* Round K1_len down to multiple of 16 */
-        uint aes_len = (K1_len / 16) * 16;
-        aes128_cbc_encrypt(aes_key, aes_iv, K1, aes_len, aes_out);
+        uint aes_len = seq_len * 64;
+        aes128_cbc_encrypt_from_seq(aes_key, aes_iv, seq, seq_len, aes_len, aes_out);
 
         /* Choose hash based on sum of first 16 bytes mod 3 */
         uint sum = 0;
@@ -1028,26 +1060,21 @@ kernel void pdf_r6_verify(
         round = 0;
         for (;;) {
             uint seq_len = pw_len + hash_len + params.extra_len2;
+            uchar seq2[256];
             uint pos2 = 0;
             for (uint i = 0; i < pw_len; i++)
-                K1[pos2++] = passwords[pw_offset + i];
+                seq2[pos2++] = passwords[pw_offset + i];
             for (uint i = 0; i < hash_len; i++)
-                K1[pos2++] = hash[i];
+                seq2[pos2++] = hash[i];
             for (uint i = 0; i < params.extra_len2; i++)
-                K1[pos2++] = params.extra2[i];
-
-            uint K1_len2 = seq_len * 64;
-            for (uint rep = 1; rep < 64; rep++) {
-                for (uint i = 0; i < seq_len; i++)
-                    K1[rep * seq_len + i] = K1[i];
-            }
+                seq2[pos2++] = params.extra2[i];
 
             uchar aes_key2[16], aes_iv2[16];
             for (uint i = 0; i < 16; i++) aes_key2[i] = hash[i];
             for (uint i = 0; i < 16; i++) aes_iv2[i]  = hash[16 + i];
 
-            uint aes_len2 = (K1_len2 / 16) * 16;
-            aes128_cbc_encrypt(aes_key2, aes_iv2, K1, aes_len2, aes_out);
+            uint aes_len2 = seq_len * 64;
+            aes128_cbc_encrypt_from_seq(aes_key2, aes_iv2, seq2, seq_len, aes_len2, aes_out);
 
             uint sum2 = 0;
             for (uint i = 0; i < 16; i++) sum2 += uint(aes_out[i]);
