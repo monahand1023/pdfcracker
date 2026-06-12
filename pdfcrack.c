@@ -6895,6 +6895,17 @@ int main(int argc, char *argv[])
     Checkpoint ck = {0};
     if (resume) {
         ck = ckpt_load();
+        /* Resume safely: g_next_idx is the next-claimed index, but chunked
+         * claims + GPU double-buffering leave [floor, g_next_idx) in flight.
+         * Rewind by the max possible in-flight window so we never skip a
+         * candidate (we may re-test up to `margin`, which is cheap). */
+        if (ck.valid && ck.resume_idx > 0) {
+            long margin = 2L * g_gpu_batch
+                        + (long)g_nthreads * NEON_WORK_CHUNK
+                        + CPU_WORK_CHUNK;
+            ck.resume_idx = ck.resume_idx > margin ? ck.resume_idx - margin : 0;
+            ck.dict_idx   = ck.dict_idx   > margin ? ck.dict_idx   - margin : 0;
+        }
         if (ck.valid) {
             static const char *mode_labels[] = {
                 "brute-force", "dictionary", "mask", "rule", "hybrid", "auto",
