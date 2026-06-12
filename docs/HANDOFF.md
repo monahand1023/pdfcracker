@@ -4,9 +4,11 @@ Read this first if you're a future Claude session picking up this project. It te
 
 ## TL;DR
 
-A large hardening/refactor effort is **complete and merged to `master`** (49 commits, pushed to `origin`). Everything builds clean and passes: `make test` → 80 + saslprep + 6, `bash test_integration.sh` → 45/0, cracks verified R2–R6. The full plan and its checkboxes are in [`docs/superpowers/plans/2026-06-11-pdfcracker-hardening.md`](superpowers/plans/2026-06-11-pdfcracker-hardening.md).
+A large hardening/refactor effort is **complete and merged to `master`** (~50 commits, pushed to `origin`). Everything builds clean and passes: `make test` → 80 + saslprep + 6, `bash test_integration.sh` → 45/0, cracks verified R2–R6.
 
-**Three things were deliberately deferred and are the open work** — all GPU-related and all gated on the machine being idle (the owner had a heavy GPU task — Topaz + Python — running, which skews GPU benchmarks low and makes perf work unmeasurable). Do them when the GPU is free.
+> **This handoff is the authoritative status, not the plan's checkboxes.** The full plan is in [`docs/superpowers/plans/2026-06-11-pdfcracker-hardening.md`](superpowers/plans/2026-06-11-pdfcracker-hardening.md), but its `- [ ]` checkboxes were never ticked off as work landed — do NOT "execute the plan" from scratch. Phases 1–7 are DONE except the items explicitly listed below as deferred or scoped-down. Use the plan only as the detailed spec for the remaining tasks.
+
+**Open work = a benchmark re-run (finishing Phase 8) + three deferred GPU tasks** — all gated on the machine being idle (the owner had a heavy GPU task — Topaz + Python — running, which skews GPU benchmarks low and makes perf work unmeasurable). Do them when the GPU is free.
 
 ## How to build & verify (always do this before and after changes)
 
@@ -61,6 +63,13 @@ Owner recovery (Algorithm 3 → decrypt `/O` → verify against `/U`) is CPU-onl
 ### 4. Deferred Task 7.6 — distributed TLS + PDF content-addressed caching
 
 The distributed protocol is unauthenticated cleartext (Phase 4 added a trusted-LAN warning, a bootstrap-binary checksum in `join.sh`, web-port auth, and an optional shared-secret handshake — but no transport encryption). Adding optional TLS (Security.framework) and skipping PDF re-send/re-benchmark for reconnecting clients (key by `pdf_sha256`) are the remaining items. Plan Task 7.6 (line ~1366). Larger, lower urgency.
+
+### Intentionally scoped down — NOT pending, do not "finish" these
+Two Phase 5 items in the plan were deliberately reduced because they were high-churn / low-value with real regression risk (the win was already captured elsewhere):
+- **5.4 (main() decomposition):** only the valuable, safe part was done — the triplicated brute length-loop was extracted into `run_brute_lengths`. The broader `dispatch_attack` helper / per-mode `setup_*` restructuring was **skipped** (low value, high risk in the central dispatch). main() is shorter but still long; that's fine.
+- **5.6 (group ~100 globals into structs):** **skipped.** The one part with real value — funneling checkpoint state — was already handled in Phase 3 (the `CKPT_MODES` table + versioned format). Bulk global-struct grouping is pure churn; don't do it unless a concrete need arises.
+
+Don't treat these as open work. If you genuinely want them, they're optional cleanups, not obligations.
 
 ---
 
