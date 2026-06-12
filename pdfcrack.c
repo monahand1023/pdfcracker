@@ -85,7 +85,7 @@ static int         g_cs_len   = 0;
 static int         g_nthreads = 0;
 
 /* ── fast crypto path (bypasses CGPDFDocument) ────────────────── */
-static PDFEncryptParams g_enc_params;
+PDFEncryptParams g_enc_params;
 static int              g_fast_crypto = 0; /* 1 = use direct MD5+RC4 */
 
 /* ── GPU acceleration ──────────────────────────────────────────── */

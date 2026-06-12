@@ -21,6 +21,9 @@
 #define MAX_PASS_LEN 32
 #endif
 
+/* Checkpoint format version — bump on incompatible format changes. */
+#define CKPT_VERSION 2
+
 /* ── Attack mode identifiers ─────────────────────────────────── */
 #define ATTACK_BRUTE        0
 #define ATTACK_DICT         1
