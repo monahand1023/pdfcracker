@@ -36,6 +36,42 @@ static inline void pack_passwords_gpu(uint8_t *pw_buf, uint8_t *len_buf,
 #define MAX_BATCH_SIZE  262144  /* 256K passwords per dispatch */
 #define PW_PACKED_LEN   32      /* each password slot is 32 bytes */
 
+/* ── Load pdf_md5.metallib with a three-step fallback ───────────────
+ * 1. Explicit path provided by caller (may be nil).
+ * 2. Directory containing the main executable bundle.
+ * 3. Current working directory.
+ * Returns nil on failure; *err_out describes the last error.        */
+static id<MTLLibrary> load_pdf_library(id<MTLDevice> device,
+                                        const char *metallib_path,
+                                        NSError **err_out)
+{
+    id<MTLLibrary> library = nil;
+    if (err_out) *err_out = nil;
+
+    if (metallib_path) {
+        NSString *path = [NSString stringWithUTF8String:metallib_path];
+        library = [device newLibraryWithURL:[NSURL fileURLWithPath:path]
+                                      error:err_out];
+    }
+
+    if (!library) {
+        NSString *execPath = [[NSBundle mainBundle] executablePath];
+        if (execPath) {
+            NSString *dir     = [execPath stringByDeletingLastPathComponent];
+            NSString *libPath = [dir stringByAppendingPathComponent:@"pdf_md5.metallib"];
+            library = [device newLibraryWithURL:[NSURL fileURLWithPath:libPath]
+                                          error:err_out];
+        }
+    }
+
+    if (!library) {
+        library = [device newLibraryWithURL:[NSURL fileURLWithPath:@"pdf_md5.metallib"]
+                                      error:err_out];
+    }
+
+    return library;
+}
+
 struct MetalKeygenContext {
     id<MTLDevice>              device;
     id<MTLCommandQueue>        queue;
@@ -68,31 +104,7 @@ MetalKeygenContext *metal_keygen_init(const PDFEncryptParams *params,
 
         /* Load shader library */
         NSError *error = nil;
-        id<MTLLibrary> library = nil;
-
-        if (metallib_path) {
-            NSString *path = [NSString stringWithUTF8String:metallib_path];
-            NSURL *url = [NSURL fileURLWithPath:path];
-            library = [device newLibraryWithURL:url error:&error];
-        }
-
-        /* Try alongside executable if no path given or load failed */
-        if (!library) {
-            NSString *execPath = [[NSBundle mainBundle] executablePath];
-            if (execPath) {
-                NSString *dir = [execPath stringByDeletingLastPathComponent];
-                NSString *libPath = [dir stringByAppendingPathComponent:@"pdf_md5.metallib"];
-                NSURL *url = [NSURL fileURLWithPath:libPath];
-                library = [device newLibraryWithURL:url error:&error];
-            }
-        }
-
-        /* Try current directory */
-        if (!library) {
-            NSURL *url = [NSURL fileURLWithPath:@"pdf_md5.metallib"];
-            library = [device newLibraryWithURL:url error:&error];
-        }
-
+        id<MTLLibrary> library = load_pdf_library(device, metallib_path, &error);
         if (!library) {
             fprintf(stderr, "Metal: failed to load shader library: %s\n",
                     error ? [[error localizedDescription] UTF8String] : "unknown");
@@ -140,6 +152,11 @@ MetalKeygenContext *metal_keygen_init(const PDFEncryptParams *params,
                                  options:MTLResourceStorageModeShared];
             if (!ctx->pw_buf[i] || !ctx->len_buf[i] || !ctx->keys_buf[i]) {
                 fprintf(stderr, "Metal: failed to allocate buffers\n");
+                /* Nil out __strong ObjC fields so ARC releases them before free. */
+                ctx->device = nil; ctx->queue = nil; ctx->pipeline = nil;
+                for (int j = 0; j < 2; j++) {
+                    ctx->pw_buf[j] = nil; ctx->len_buf[j] = nil; ctx->keys_buf[j] = nil;
+                }
                 free(ctx);
                 return NULL;
             }
@@ -358,7 +375,19 @@ double metal_keygen_benchmark(MetalKeygenContext *ctx, int bench_count)
 void metal_keygen_free(MetalKeygenContext *ctx)
 {
     if (!ctx) return;
-    /* ARC handles Metal objects; just free the struct */
+    /* Nil out all __strong ObjC id fields before free so ARC runs their
+     * releases.  free() does NOT trigger ARC releases — without this,
+     * the MTLDevice, MTLCommandQueue, MTLComputePipelineState, and all
+     * MTLBuffer objects would leak. */
+    ctx->device   = nil;
+    ctx->queue    = nil;
+    ctx->pipeline = nil;
+    for (int i = 0; i < 2; i++) {
+        ctx->pw_buf[i]   = nil;
+        ctx->len_buf[i]  = nil;
+        ctx->keys_buf[i] = nil;
+    }
+    ctx->params_buf = nil;
     free(ctx);
 }
 
@@ -397,29 +426,7 @@ MetalSHA256Context *metal_sha256_init(const PDFEncryptParams *params,
 
         /* Load shader library (same search order as MD5 pipeline) */
         NSError *error = nil;
-        id<MTLLibrary> library = nil;
-
-        if (metallib_path) {
-            NSString *path = [NSString stringWithUTF8String:metallib_path];
-            NSURL *url = [NSURL fileURLWithPath:path];
-            library = [device newLibraryWithURL:url error:&error];
-        }
-
-        if (!library) {
-            NSString *execPath = [[NSBundle mainBundle] executablePath];
-            if (execPath) {
-                NSString *dir = [execPath stringByDeletingLastPathComponent];
-                NSString *libPath = [dir stringByAppendingPathComponent:@"pdf_md5.metallib"];
-                NSURL *url = [NSURL fileURLWithPath:libPath];
-                library = [device newLibraryWithURL:url error:&error];
-            }
-        }
-
-        if (!library) {
-            NSURL *url = [NSURL fileURLWithPath:@"pdf_md5.metallib"];
-            library = [device newLibraryWithURL:url error:&error];
-        }
-
+        id<MTLLibrary> library = load_pdf_library(device, metallib_path, &error);
         if (!library) {
             fprintf(stderr, "Metal SHA-256: failed to load shader library: %s\n",
                     error ? [[error localizedDescription] UTF8String] : "unknown");
@@ -463,6 +470,11 @@ MetalSHA256Context *metal_sha256_init(const PDFEncryptParams *params,
                                     options:MTLResourceStorageModeShared];
             if (!ctx->pw_buf[i] || !ctx->len_buf[i] || !ctx->results_buf[i]) {
                 fprintf(stderr, "Metal SHA-256: failed to allocate buffers\n");
+                /* Nil out __strong ObjC fields so ARC releases them before free. */
+                ctx->device = nil; ctx->queue = nil; ctx->pipeline = nil;
+                for (int j = 0; j < 2; j++) {
+                    ctx->pw_buf[j] = nil; ctx->len_buf[j] = nil; ctx->results_buf[j] = nil;
+                }
                 free(ctx);
                 return NULL;
             }
@@ -564,6 +576,16 @@ int metal_sha256_verify_batch(MetalSHA256Context *ctx,
 void metal_sha256_free(MetalSHA256Context *ctx)
 {
     if (!ctx) return;
+    /* Nil out all __strong ObjC id fields before free so ARC runs their releases. */
+    ctx->device   = nil;
+    ctx->queue    = nil;
+    ctx->pipeline = nil;
+    for (int i = 0; i < 2; i++) {
+        ctx->pw_buf[i]      = nil;
+        ctx->len_buf[i]     = nil;
+        ctx->results_buf[i] = nil;
+    }
+    ctx->params_buf = nil;
     free(ctx);
 }
 
@@ -676,24 +698,7 @@ MetalR6Context *metal_r6_init(const PDFEncryptParams *params,
         if (!device) return NULL;
 
         NSError *error = nil;
-        id<MTLLibrary> library = nil;
-
-        if (metallib_path) {
-            NSString *path = [NSString stringWithUTF8String:metallib_path];
-            NSURL *url = [NSURL fileURLWithPath:path];
-            library = [device newLibraryWithURL:url error:&error];
-        }
-        if (!library) {
-            NSString *execPath = [[NSBundle mainBundle] executablePath];
-            if (execPath) {
-                NSString *dir = [execPath stringByDeletingLastPathComponent];
-                NSString *libPath = [dir stringByAppendingPathComponent:@"pdf_md5.metallib"];
-                library = [device newLibraryWithURL:[NSURL fileURLWithPath:libPath] error:&error];
-            }
-        }
-        if (!library) {
-            library = [device newLibraryWithURL:[NSURL fileURLWithPath:@"pdf_md5.metallib"] error:&error];
-        }
+        id<MTLLibrary> library = load_pdf_library(device, metallib_path, &error);
         if (!library) {
             fprintf(stderr, "Metal R6: failed to load shader library: %s\n",
                     error ? [[error localizedDescription] UTF8String] : "unknown");
@@ -740,6 +745,12 @@ MetalR6Context *metal_r6_init(const PDFEncryptParams *params,
             if (!ctx->pw_buf[i] || !ctx->len_buf[i] || !ctx->results_buf[i] || !ctx->scratch_buf[i]) {
                 fprintf(stderr, "Metal R6: failed to allocate buffers (scratch: %lu MB)\n",
                         (unsigned long)(scratch_size / (1024 * 1024)));
+                /* Nil out __strong ObjC fields so ARC releases them before free. */
+                ctx->device = nil; ctx->queue = nil; ctx->pipeline = nil;
+                for (int j = 0; j < 2; j++) {
+                    ctx->pw_buf[j] = nil; ctx->len_buf[j] = nil;
+                    ctx->results_buf[j] = nil; ctx->scratch_buf[j] = nil;
+                }
                 free(ctx);
                 return NULL;
             }
@@ -1027,5 +1038,16 @@ int metal_r6_verify_batch_sub(MetalR6Context *ctx,
 void metal_r6_free(MetalR6Context *ctx)
 {
     if (!ctx) return;
+    /* Nil out all __strong ObjC id fields before free so ARC runs their releases. */
+    ctx->device   = nil;
+    ctx->queue    = nil;
+    ctx->pipeline = nil;
+    for (int i = 0; i < 2; i++) {
+        ctx->pw_buf[i]      = nil;
+        ctx->len_buf[i]     = nil;
+        ctx->results_buf[i] = nil;
+        ctx->scratch_buf[i] = nil;
+    }
+    ctx->params_buf = nil;
     free(ctx);
 }
