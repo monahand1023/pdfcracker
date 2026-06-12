@@ -734,6 +734,7 @@ static void reverse_string(const char *src, char *dst, size_t len)
  * ================================================================ */
 typedef struct { int id; int use_shared; } DictArg;
 
+/* kept bespoke: --reverse mode, interleaved (non-shared) partition mode, CG fallback */
 static void *dict_worker(void *arg)
 {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -1810,6 +1811,7 @@ static void hybrid_gen_pass(long word_idx, long suffix_idx, char *out)
 
 typedef struct { int id; int length; long start; long end; int use_shared; } BruteArg;
 
+/* kept bespoke: multi-length / shared vs. pre-partitioned modes / inc_pass optimisation */
 static void *brute_worker(void *arg)
 {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -2537,6 +2539,7 @@ done:
 /* ================================================================
  * Rule-based mutation worker
  * ================================================================ */
+/* kept bespoke: rule_dedup_check() inside inner loop cannot be modelled by run_cpu */
 static void *rule_worker(void *arg)
 {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -2594,12 +2597,17 @@ static void *rule_worker(void *arg)
 }
 
 /* Candidate generator typedef + single-buffered GPU-MD5 (R3/R4) driver.
- * Both are defined in the SHA-256 consolidation section below; forward-declared
- * here so the thin rule/hybrid wrappers can reference them. */
+ * Defined below; forward-declared here so the thin CPU/GPU wrappers can
+ * reference them before the generator definitions appear in the file. */
 typedef void (*cand_gen)(long idx, char *out, void *ctx);
 static void run_gpu_md5(cand_gen gen, void *ctx, long total, int stride);
 static void sha256_rule_gen(long idx, char *out, void *ctx);
 static void sha256_hybrid_gen(long idx, char *out, void *ctx);
+static void sha256_dates_gen(long idx, char *out, void *ctx);
+static void sha256_mutate_gen(long idx, char *out, void *ctx);
+static void sha256_leet_gen(long idx, char *out, void *ctx);
+static void sha256_mask_rule_gen(long idx, char *out, void *ctx);
+static void sha256_combinator_gen(long idx, char *out, void *ctx);
 
 /* GPU rule worker (single-buffered sync; consolidated into run_gpu_md5) */
 static void *gpu_rule_worker(void *arg)
@@ -2611,45 +2619,44 @@ static void *gpu_rule_worker(void *arg)
 }
 
 /* ================================================================
- * Hybrid attack worker (dict + brute-force suffix)
+ * CPU scalar driver — shared scaffold for clean single-candidate workers.
+ * Preserves: QoS, !g_fast_crypto CG fallback, chunk-fetch loop,
+ * TESTED_BATCH accounting, winner-guard on g_found.
+ * Empty candidates (pass[0]=='\0') are counted but not tested.
+ * stride is informational only; the stack buffer covers all modes.
  * ================================================================ */
-static void *hybrid_worker(void *arg)
+static void run_cpu(cand_gen gen, void *ctx, long total, int stride)
 {
+    (void)stride;
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
-    (void)arg;
     CGPDFDocumentRef doc = NULL;
     if (!g_fast_crypto) {
         doc = open_pdf();
-        if (!doc) { free(arg); return NULL; }
+        if (!doc) return;
     }
 
-    long total = g_nwords * g_hybrid_suffix_keyspace;
     long local_count = 0;
     char pass[MAX_PASS_LEN * 2 + 2];
 
-    for (;;) {
-        if (__builtin_expect(atomic_load_explicit(&g_found,
-                             memory_order_relaxed), 0))
-            break;
-        long chunk_start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
-        if (chunk_start >= total) break;
-        long chunk_end = chunk_start + CPU_WORK_CHUNK;
-        if (chunk_end > total) chunk_end = total;
+    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
+        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
+        if (start >= total) break;
+        long end = start + CPU_WORK_CHUNK;
+        if (end > total) end = total;
 
-        for (long i = chunk_start; i < chunk_end; i++) {
-            if (__builtin_expect(atomic_load_explicit(&g_found,
-                                 memory_order_relaxed), 0))
-                break;
-            long word_idx = i / g_hybrid_suffix_keyspace;
-            long suffix_idx = i % g_hybrid_suffix_keyspace;
-            hybrid_gen_pass(word_idx, suffix_idx, pass);
+        for (long i = start; i < end &&
+             !atomic_load_explicit(&g_found, memory_order_relaxed); i++) {
+            gen(i, pass, ctx);
 
-            if (++local_count == TESTED_BATCH) {
+            if (++local_count >= TESTED_BATCH) {
                 atomic_fetch_add_explicit(&g_tested, local_count,
                                           memory_order_relaxed);
                 local_count = 0;
             }
+
+            if (!pass[0]) continue; /* skip empty candidates (still counted) */
+
             int hit = g_fast_crypto ? test_password_fast(pass)
                                     : test_password_cg(doc, pass);
             if (hit) {
@@ -2662,6 +2669,15 @@ static void *hybrid_worker(void *arg)
         atomic_fetch_add(&g_tested, local_count);
 
     if (doc) CGPDFDocumentRelease(doc);
+}
+
+/* ================================================================
+ * Hybrid attack worker (dict + brute-force suffix)
+ * ================================================================ */
+static void *hybrid_worker(void *arg)
+{
+    run_cpu(sha256_hybrid_gen, NULL,
+            g_nwords * g_hybrid_suffix_keyspace, MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
@@ -3144,6 +3160,7 @@ static void *prince_rule_worker(void *arg)
 /* ================================================================
  * Toggle-case walk: enumerate all case variations of dict words
  * ================================================================ */
+/* kept bespoke: per-word loop structure — inline alpha-position scan + variant fan-out per word */
 static void *toggle_worker(void *arg)
 {
     (void)arg;
@@ -3210,41 +3227,8 @@ static void *gpu_sha256_toggle_worker(void *arg)
  * ================================================================ */
 static void *combinator_worker(void *arg)
 {
-    (void)arg;
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    long total = g_nwords * g_nwords2;
-    long local_count = 0;
-    char pass[MAX_PASS_LEN * 2 + 2];
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
-        if (start >= total) break;
-        long end = start + CPU_WORK_CHUNK;
-        if (end > total) end = total;
-
-        for (long i = start; i < end && !atomic_load_explicit(&g_found, memory_order_relaxed); i++) {
-            long w1 = i / g_nwords2;
-            long w2 = i % g_nwords2;
-            size_t l1 = strlen(g_words[w1]);
-            size_t l2 = strlen(g_words2[w2]);
-            if (l1 + l2 > MAX_PASS_LEN) { if (++local_count >= TESTED_BATCH) { atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed); local_count = 0; } continue; }
-            memcpy(pass, g_words[w1], l1);
-            memcpy(pass + l1, g_words2[w2], l2);
-            pass[l1 + l2] = '\0';
-
-            if (++local_count >= TESTED_BATCH) {
-                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
-                local_count = 0;
-            }
-
-            if (test_password_fast(pass)) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, sizeof(g_password) - 1);
-                break;
-            }
-        }
-    }
-    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    run_cpu(sha256_combinator_gen, NULL,
+            g_nwords * g_nwords2, MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
@@ -3340,34 +3324,7 @@ static void dates_index_to_pass(long idx, char *out)
 
 static void *dates_worker(void *arg)
 {
-    (void)arg;
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    long total = atomic_load(&g_total);
-    long local_count = 0;
-    char pass[MAX_PASS_LEN + 1];
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
-        if (start >= total) break;
-        long end = start + CPU_WORK_CHUNK;
-        if (end > total) end = total;
-
-        for (long i = start; i < end && !atomic_load_explicit(&g_found, memory_order_relaxed); i++) {
-            dates_index_to_pass(i, pass);
-
-            if (++local_count >= TESTED_BATCH) {
-                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
-                local_count = 0;
-            }
-
-            if (test_password_fast(pass)) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, sizeof(g_password) - 1);
-                break;
-            }
-        }
-    }
-    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    run_cpu(sha256_dates_gen, NULL, atomic_load(&g_total), MAX_PASS_LEN + 1);
     free(arg);
     return NULL;
 }
@@ -3490,36 +3447,7 @@ static void mutate_index_to_pass(long word_idx, int mut_idx, char *out)
 
 static void *mutate_worker(void *arg)
 {
-    (void)arg;
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    long total = atomic_load(&g_total);
-    long local_count = 0;
-    char pass[MAX_PASS_LEN * 2 + 2];
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
-        if (start >= total) break;
-        long end = start + CPU_WORK_CHUNK;
-        if (end > total) end = total;
-
-        for (long i = start; i < end && !atomic_load_explicit(&g_found, memory_order_relaxed); i++) {
-            long word_idx = i / MUTATE_NMUTATIONS;
-            int  mut_idx  = (int)(i % MUTATE_NMUTATIONS);
-            mutate_index_to_pass(word_idx, mut_idx, pass);
-
-            if (++local_count >= TESTED_BATCH) {
-                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
-                local_count = 0;
-            }
-
-            if (pass[0] && test_password_fast(pass)) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, sizeof(g_password) - 1);
-                break;
-            }
-        }
-    }
-    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    run_cpu(sha256_mutate_gen, NULL, atomic_load(&g_total), MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
@@ -3659,34 +3587,7 @@ static void leet_index_to_pass(long idx, char *out)
 
 static void *leet_worker(void *arg)
 {
-    (void)arg;
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    long total = atomic_load(&g_total);
-    long local_count = 0;
-    char pass[MAX_PASS_LEN + 1];
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
-        if (start >= total) break;
-        long end = start + CPU_WORK_CHUNK;
-        if (end > total) end = total;
-
-        for (long i = start; i < end && !atomic_load_explicit(&g_found, memory_order_relaxed); i++) {
-            leet_index_to_pass(i, pass);
-
-            if (++local_count >= TESTED_BATCH) {
-                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
-                local_count = 0;
-            }
-
-            if (test_password_fast(pass)) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, sizeof(g_password) - 1);
-                break;
-            }
-        }
-    }
-    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    run_cpu(sha256_leet_gen, NULL, atomic_load(&g_total), MAX_PASS_LEN + 1);
     free(arg);
     return NULL;
 }
@@ -3719,38 +3620,8 @@ static void *gpu_r6_leet_worker(void *arg)
  * ================================================================ */
 static void *mask_rule_worker(void *arg)
 {
-    (void)arg;
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    long total = g_mask_keyspace * g_nrules;
-    long local_count = 0;
-    char base[MAX_PASS_LEN + 1];
-    char pass[MAX_PASS_LEN * 2 + 2];
-
-    while (!atomic_load_explicit(&g_found, memory_order_relaxed)) {
-        long start = atomic_fetch_add(&g_next_idx, CPU_WORK_CHUNK);
-        if (start >= total) break;
-        long end = start + CPU_WORK_CHUNK;
-        if (end > total) end = total;
-
-        for (long idx = start; idx < end && !atomic_load_explicit(&g_found, memory_order_relaxed); idx++) {
-            long mask_idx = idx / g_nrules;
-            int  rule_idx = (int)(idx % g_nrules);
-            mask_index_to_pass(mask_idx, 0, base);
-            apply_rule(base, rule_idx, pass);
-
-            if (++local_count >= TESTED_BATCH) {
-                atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
-                local_count = 0;
-            }
-
-            if (pass[0] && test_password_fast(pass)) {
-                if (!atomic_exchange(&g_found, 1))
-                    strncpy(g_password, pass, sizeof(g_password) - 1);
-                break;
-            }
-        }
-    }
-    atomic_fetch_add_explicit(&g_tested, local_count, memory_order_relaxed);
+    run_cpu(sha256_mask_rule_gen, NULL,
+            g_mask_keyspace * g_nrules, MAX_PASS_LEN * 2 + 2);
     free(arg);
     return NULL;
 }
