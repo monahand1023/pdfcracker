@@ -740,7 +740,7 @@ MetalR6Context *metal_r6_init(const PDFEncryptParams *params,
             ctx->results_buf[i] = [device newBufferWithLength:results_size
                                     options:MTLResourceStorageModeShared];
             ctx->scratch_buf[i] = [device newBufferWithLength:scratch_size
-                                    options:MTLResourceStorageModeShared];
+                                    options:MTLResourceStorageModePrivate];
             if (!ctx->pw_buf[i] || !ctx->len_buf[i] || !ctx->results_buf[i] || !ctx->scratch_buf[i]) {
                 fprintf(stderr, "Metal R6: failed to allocate buffers (scratch: %lu MB)\n",
                         (unsigned long)(scratch_size / (1024 * 1024)));
