@@ -87,6 +87,13 @@ static char          g_client_uuid[UUID_LEN + 1] = {0};
 static uint64_t      g_current_lease_id = 0;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
+/* ── Heartbeat / socket-serialization state ───────────────────── */
+/* g_sock_lock serialises every request+response exchange on the work
+ * socket so the heartbeat thread and the main work loop never overlap. */
+static pthread_mutex_t g_sock_lock   = PTHREAD_MUTEX_INITIALIZER;
+/* Set to 1 while crack_*_chunk is running; heartbeat fires only then. */
+static volatile int    g_chunk_active = 0;
+
 /* ── Helper: record a found password ─────────────────────────── */
 static inline void set_found_password(const char *pass)
 {
@@ -1219,6 +1226,50 @@ static void reset_session_state(void)
 }
 
 /* ================================================================
+ * heartbeat_thread — sends HEARTBEAT to the server every 15 s while
+ * a chunk is being processed.
+ *
+ * Safety guarantee: all socket sends+reads are wrapped in g_sock_lock.
+ * The heartbeat acquires the lock and re-checks g_chunk_active while
+ * holding it, so it never races with the main loop's socket operations.
+ * The main loop sets g_chunk_active=0 BEFORE doing any post-chunk socket
+ * I/O (COMPLETE, FOUND, PARTIAL), so by the time the main loop re-acquires
+ * the socket, the heartbeat will see chunk_active=0 and do nothing.
+ * ================================================================ */
+static void *heartbeat_thread(void *arg)
+{
+    (void)arg;
+    char hb_line[MAX_LINE];
+
+    while (g_server_fd >= 0 && !g_shutdown_requested) {
+        struct timespec ts = {15, 0};
+        nanosleep(&ts, NULL);
+
+        if (g_server_fd < 0 || g_shutdown_requested)
+            break;
+
+        pthread_mutex_lock(&g_sock_lock);
+        /* Re-check under lock: main loop may have cleared g_chunk_active
+         * (and may be about to do COMPLETE/FOUND/PARTIAL socket I/O). */
+        if (g_chunk_active && g_current_lease_id > 0 && g_server_fd >= 0
+                && !g_shutdown_requested) {
+            long tested = atomic_load(&g_chunk_tested);
+            sock_printf(g_server_fd, "HEARTBEAT %lu %ld",
+                        (unsigned long)g_current_lease_id, tested);
+            if (sock_readline(g_server_fd, hb_line, sizeof(hb_line)) > 0) {
+                if (strcmp(hb_line, "ABORT") == 0) {
+                    /* Password found by another client — stop our workers */
+                    atomic_store(&g_chunk_found, 1);
+                }
+                /* OK: lease extended, continue cracking */
+            }
+        }
+        pthread_mutex_unlock(&g_sock_lock);
+    }
+    return NULL;
+}
+
+/* ================================================================
  * run_session — single connection lifecycle
  * Returns: 0 = done/found, 1 = disconnected (retry), 2 = shutdown
  * ================================================================ */
@@ -1399,6 +1450,14 @@ static int run_session(const char *host, int port)
     sock_printf(fd, "READY");
     fprintf(stderr, "Using %d threads. Requesting work...\n\n", g_nthreads);
 
+    /* ── Spawn heartbeat thread (detached; exits when g_server_fd < 0) ── */
+    g_chunk_active = 0;
+    {
+        pthread_t hb_tid;
+        if (pthread_create(&hb_tid, NULL, heartbeat_thread, NULL) == 0)
+            pthread_detach(hb_tid);
+    }
+
     /* ── Work loop ─────────────────────────────────────────────── */
     long   prev_tested  = 0;
     double prev_elapsed = 0.0;
@@ -1422,10 +1481,15 @@ static int run_session(const char *host, int port)
             return 2;
         }
 
-        /* Request next chunk, reporting stats from previous */
+        /* Request next chunk, reporting stats from previous.
+         * Acquire g_sock_lock for the GETWORK + response exchange so the
+         * heartbeat thread cannot interleave while we are on the socket. */
+        pthread_mutex_lock(&g_sock_lock);
         sock_printf(fd, "GETWORK %ld %.2f", prev_tested, prev_elapsed);
+        int _rr = sock_readline(fd, line, sizeof(line));
+        pthread_mutex_unlock(&g_sock_lock);
 
-        if (sock_readline(fd, line, sizeof(line)) < 0) {
+        if (_rr < 0) {
             fprintf(stderr, "\nLost connection to server\n");
             close(fd); g_server_fd = -1;
             return 1;
@@ -1448,15 +1512,22 @@ static int run_session(const char *host, int port)
                     (unsigned long)lease_id);
             fflush(stderr);
 
+            /* Allow heartbeat to fire while crack_brute_chunk is running */
+            g_chunk_active = 1;
             double t0 = mono_time();
             int found = crack_brute_chunk(blen, bstart, bend);
             double elapsed = mono_time() - t0;
+            /* Stop heartbeat before any subsequent socket I/O */
+            g_chunk_active = 0;
 
             if (found) {
+                /* FOUND + read OK: lock so heartbeat cannot interleave */
+                pthread_mutex_lock(&g_sock_lock);
                 sock_printf(fd, "FOUND %s %lu", g_chunk_pass,
                             (unsigned long)lease_id);
                 /* Wait for OK */
                 sock_readline(fd, line, sizeof(line));
+                pthread_mutex_unlock(&g_sock_lock);
                 fprintf(stderr,
                     "\n\n  *** PASSWORD FOUND: %s ***\n\n", g_chunk_pass);
                 close(fd); g_server_fd = -1;
@@ -1476,7 +1547,7 @@ static int run_session(const char *host, int port)
             prev_tested = atomic_load(&g_chunk_tested);
             prev_elapsed = elapsed;
 
-            /* Send COMPLETE for this lease */
+            /* Send COMPLETE for this lease (fire-and-forget, no response) */
             sock_printf(fd, "COMPLETE %lu %ld",
                         (unsigned long)lease_id, prev_tested);
             g_current_lease_id = 0;
@@ -1518,14 +1589,21 @@ static int run_session(const char *host, int port)
                     ++chunks_done, loaded, (unsigned long)lease_id);
             fflush(stderr);
 
+            /* Allow heartbeat to fire while crack_dict_chunk is running */
+            g_chunk_active = 1;
             double t0 = mono_time();
             int found = crack_dict_chunk(words, loaded);
             double elapsed = mono_time() - t0;
+            /* Stop heartbeat before any subsequent socket I/O */
+            g_chunk_active = 0;
 
             if (found) {
+                /* FOUND + read OK: lock so heartbeat cannot interleave */
+                pthread_mutex_lock(&g_sock_lock);
                 sock_printf(fd, "FOUND %s %lu", g_chunk_pass,
                             (unsigned long)lease_id);
                 sock_readline(fd, line, sizeof(line));
+                pthread_mutex_unlock(&g_sock_lock);
                 fprintf(stderr,
                     "\n\n  *** PASSWORD FOUND: %s ***\n\n", g_chunk_pass);
                 for (long i = 0; i < loaded; i++) free(words[i]);
@@ -1549,7 +1627,7 @@ static int run_session(const char *host, int port)
             prev_tested = atomic_load(&g_chunk_tested);
             prev_elapsed = elapsed;
 
-            /* Send COMPLETE for this lease */
+            /* Send COMPLETE for this lease (fire-and-forget, no response) */
             sock_printf(fd, "COMPLETE %lu %ld",
                         (unsigned long)lease_id, prev_tested);
             g_current_lease_id = 0;
