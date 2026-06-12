@@ -103,8 +103,11 @@ atomic_long                g_next_idx   __attribute__((aligned(64))) = 0; /* sha
 static int                 g_use_neon  = 0;
 
 /* ── dictionary word list ─────────────────────────────────────── */
-static char **g_words  = NULL;
-static long   g_nwords = 0;
+static char **g_words     = NULL;
+static long   g_nwords    = 0;
+/* Cached word lengths (immutable after load); avoids repeated strlen in
+ * hot loops (dict_worker_neon batch path, combinator generator, etc.).  */
+static int   *g_word_lens = NULL;
 
 /* ── checkpoint/resume ────────────────────────────────────────── */
 char g_ckpt_path[1024] = {0};
@@ -244,8 +247,9 @@ static long  *g_toggle_cumul  = NULL;
 
 /* -- Combinator attack ---------------------------------------- */
 #define ATTACK_COMBINATOR 8
-static char  **g_words2 = NULL;
-static long    g_nwords2 = 0;
+static char  **g_words2     = NULL;
+static long    g_nwords2    = 0;
+static int    *g_word_lens2 = NULL;  /* cached lengths for g_words2 */
 static const char *g_dict2_path = NULL;
 
 /* -- Mask+rules hybrid attack --------------------------------- */
@@ -782,7 +786,7 @@ static void *dict_worker(void *arg)
                 }
                 if (!hit && g_reverse_mode) {
                     char rev[MAX_PASS_LEN + 1];
-                    size_t wlen = strlen(g_words[i]);
+                    size_t wlen = (size_t)g_word_lens[i];
                     if (wlen > 0 && wlen <= MAX_PASS_LEN) {
                         reverse_string(g_words[i], rev, wlen);
                         if (strcmp(rev, g_words[i]) != 0) {
@@ -816,7 +820,7 @@ static void *dict_worker(void *arg)
             }
             if (!hit && g_reverse_mode) {
                 char rev[MAX_PASS_LEN + 1];
-                size_t wlen = strlen(g_words[i]);
+                size_t wlen = (size_t)g_word_lens[i];
                 if (wlen > 0 && wlen <= MAX_PASS_LEN) {
                     reverse_string(g_words[i], rev, wlen);
                     if (strcmp(rev, g_words[i]) != 0) {
@@ -870,8 +874,8 @@ static void *dict_worker_neon(void *arg)
             const char *pw[4] = { g_words[i], g_words[i+1],
                                   g_words[i+2], g_words[i+3] };
             int pwlen[4] = {
-                (int)strlen(pw[0]), (int)strlen(pw[1]),
-                (int)strlen(pw[2]), (int)strlen(pw[3])
+                g_word_lens[i], g_word_lens[i+1],
+                g_word_lens[i+2], g_word_lens[i+3]
             };
 
             int hits = 0;
@@ -940,7 +944,7 @@ static void *dict_worker_neon(void *arg)
                     strncpy(g_password, g_words[i], sizeof(g_password) - 1);
             } else if (g_reverse_mode) {
                 char rev[MAX_PASS_LEN + 1];
-                size_t wlen = strlen(g_words[i]);
+                size_t wlen = (size_t)g_word_lens[i];
                 if (wlen > 0 && wlen <= MAX_PASS_LEN) {
                     reverse_string(g_words[i], rev, wlen);
                     if (strcmp(rev, g_words[i]) != 0 && test_password_fast(rev)) {
@@ -2830,7 +2834,7 @@ static void sha256_brute_gen(long idx, char *out, void *ctx)
 static void sha256_dict_gen(long idx, char *out, void *ctx)
 {
     (void)ctx;
-    size_t wlen = strlen(g_words[idx]);
+    size_t wlen = (size_t)g_word_lens[idx];
     if (wlen > MAX_PASS_LEN) wlen = MAX_PASS_LEN;
     memcpy(out, g_words[idx], wlen);
     out[wlen] = '\0';
@@ -2910,8 +2914,8 @@ static void sha256_combinator_gen(long idx, char *out, void *ctx)
     (void)ctx;
     long w1 = idx / g_nwords2;
     long w2 = idx % g_nwords2;
-    size_t l1 = strlen(g_words[w1]);
-    size_t l2 = strlen(g_words2[w2]);
+    size_t l1 = (size_t)g_word_lens[w1];
+    size_t l2 = (size_t)g_word_lens2[w2];
     if (l1 + l2 <= MAX_PASS_LEN) {
         memcpy(out, g_words[w1], l1);
         memcpy(out + l1, g_words2[w2], l2);
@@ -4113,6 +4117,14 @@ static int load_wordlist(const char *path)
     long dups = idx - unique;
     g_nwords = unique;
 
+    /* Cache word lengths — hot loops read these instead of calling strlen */
+    free(g_word_lens);
+    g_word_lens = malloc((size_t)g_nwords * sizeof(int));
+    if (g_word_lens) {
+        for (long i = 0; i < g_nwords; i++)
+            g_word_lens[i] = (int)strlen(g_words[i]);
+    }
+
     fprintf(stderr, "Loaded %ld words (%ld duplicates removed, sorted by length)\n",
             unique, dups);
     return 1;
@@ -4401,15 +4413,16 @@ static const char *g_common_names[] = {
  * 11. Alphanumeric brute 6-7 (days — last resort)
  * ================================================================ */
 
-/* Helper: try one candidate, return 1 if found */
+/* Helper: try one candidate, return 1 if found.
+ * Counts every attempt (hit or miss) so progress tracking is accurate. */
 static inline int smart_try(const char *pw)
 {
+    atomic_fetch_add_explicit(&g_tested, 1, memory_order_relaxed);
     if (test_password_fast(pw)) {
         if (!atomic_exchange(&g_found, 1))
             strncpy(g_password, pw, sizeof(g_password) - 1);
         return 1;
     }
-    atomic_fetch_add(&g_tested, 1);
     return 0;
 }
 
@@ -6265,6 +6278,14 @@ int main(int argc, char *argv[])
         }
         fclose(f2);
 
+        /* Cache lengths for the second wordlist */
+        free(g_word_lens2);
+        g_word_lens2 = malloc((size_t)g_nwords2 * sizeof(int));
+        if (g_word_lens2) {
+            for (long i = 0; i < g_nwords2; i++)
+                g_word_lens2[i] = (int)strlen(g_words2[i]);
+        }
+
         long combo_total = g_nwords * g_nwords2;
         fprintf(stderr, "Mode   : combinator (%ld x %ld = %ld combos)\n\n",
                 g_nwords, g_nwords2, combo_total);
@@ -6287,8 +6308,10 @@ int main(int argc, char *argv[])
 
         for (long i = 0; i < g_nwords; i++) free(g_words[i]);
         free(g_words);
+        free(g_word_lens);  g_word_lens  = NULL;
         for (long i = 0; i < g_nwords2; i++) free(g_words2[i]);
         free(g_words2);
+        free(g_word_lens2); g_word_lens2 = NULL;
     }
 
     /* ── Mask+rules hybrid attack ─────────────────────────────── */
