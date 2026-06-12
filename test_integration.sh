@@ -417,6 +417,45 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# --- 44. Corrupt checkpoint must be rejected gracefully (start fresh, no abort) ---
+# ckpt_make_path derives test_r2_40bit.ckpt from test_r2_40bit.pdf
+echo "totally not a valid checkpoint" > test_r2_40bit.ckpt
+out=$(./pdfcrack -f test_r2_40bit.pdf -b -l 1 -c "p" -r --no-pot 2>&1); rc=$?
+rm -f test_r2_40bit.ckpt
+# Must have run to completion (rc 0 = found, rc 1 = not-found), not crashed/aborted.
+if [ $rc -le 1 ]; then
+    echo "  [PASS] Corrupt checkpoint rejected gracefully (exit=$rc)"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] Corrupt checkpoint rejected gracefully (exit=$rc, expected 0 or 1)"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- 45. Checkpoint bound to its document: fingerprint mismatch starts fresh ---
+# ckpt_make_path derives test_r4_aes128.ckpt from test_r4_aes128.pdf
+rm -f test_r4_aes128.ckpt
+# Run brute on the R4 PDF long enough for a checkpoint to be saved.
+timeout 2 $PDFCRACK -f test_r4_aes128.pdf -b -l 8 --no-pot >/dev/null 2>/dev/null || true
+sleep 1
+if [ -f test_r4_aes128.ckpt ]; then
+    # Reuse R4's checkpoint under the R2 PDF's expected checkpoint path.
+    # ckpt_make_path for test_r2_40bit.pdf → test_r2_40bit.ckpt
+    cp test_r4_aes128.ckpt test_r2_40bit.ckpt
+    out=$(./pdfcrack -f test_r2_40bit.pdf -b -l 1 -c "p" -r --no-pot 2>&1)
+    rm -f test_r4_aes128.ckpt test_r2_40bit.ckpt
+    if echo "$out" | grep -qi "different document"; then
+        echo "  [PASS] Checkpoint document-mismatch rejection"
+        PASS=$((PASS + 1))
+    else
+        echo "  [FAIL] Checkpoint document-mismatch rejection (expected 'different document' in output)"
+        echo "         got: $(echo "$out" | grep -i 'checkpoint\|document\|fingerprint' | head -3)"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo "  [FAIL] Checkpoint document-mismatch rejection (checkpoint not created in 2s)"
+    FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "=== Summary ==="
 echo "Total: $PASS passed, $FAIL failed"
