@@ -1408,9 +1408,14 @@ static int run_session(const char *host, int port)
         if (g_shutdown_requested) {
             /* Stop worker threads from main thread (async-signal-safe) */
             atomic_store(&g_chunk_found, 1);
-            /* If we have an active lease, send PARTIAL with high-water mark */
+            /* If we have an active lease, send PARTIAL with the number of
+             * passwords tested within this chunk (relative to chunk start).
+             * g_chunk_tested is reset to 0 at the start of every chunk, so it
+             * is always chunk-relative.  Using g_next_idx here would send an
+             * absolute keyspace index in brute mode, causing double-counting
+             * on the server (server treats the value as a relative offset). */
             if (g_current_lease_id > 0) {
-                long hwm = atomic_load(&g_next_idx);
+                long hwm = atomic_load(&g_chunk_tested);
                 sock_printf(fd, "PARTIAL %lu %ld", (unsigned long)g_current_lease_id, hwm);
             }
             close(fd); g_server_fd = -1;
@@ -1459,7 +1464,9 @@ static int run_session(const char *host, int port)
             }
 
             if (g_shutdown_requested) {
-                long hwm = atomic_load(&g_next_idx);
+                /* Send chunk-relative count (g_chunk_tested is reset to 0 at
+                 * chunk start, so it is already relative to brute_start). */
+                long hwm = atomic_load(&g_chunk_tested);
                 sock_printf(fd, "PARTIAL %lu %ld",
                             (unsigned long)lease_id, hwm);
                 close(fd); g_server_fd = -1;
@@ -1528,7 +1535,9 @@ static int run_session(const char *host, int port)
             }
 
             if (g_shutdown_requested) {
-                long hwm = atomic_load(&g_next_idx);
+                /* g_chunk_tested is reset to 0 at chunk start and counts words
+                 * actually verified; it is already chunk-relative for dict mode. */
+                long hwm = atomic_load(&g_chunk_tested);
                 sock_printf(fd, "PARTIAL %lu %ld",
                             (unsigned long)lease_id, hwm);
                 for (long i = 0; i < loaded; i++) free(words[i]);
