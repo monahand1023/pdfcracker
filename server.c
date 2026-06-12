@@ -138,7 +138,7 @@ static int              g_nclient_ids = 0;
 static pthread_mutex_t  g_clients_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Shutdown */
-static volatile int g_shutdown = 0;
+static volatile sig_atomic_t g_shutdown = 0;
 
 /* PDF path (for checkpoint naming) */
 static const char *g_pdf_path = NULL;
@@ -528,7 +528,9 @@ static uint64_t assign_work(ClientInfo *ci, int *is_brute,
     }
     pthread_mutex_unlock(&g_lease_lock);
 
+    pthread_mutex_lock(&g_clients_lock);
     ci->current_lease_id = lid;
+    pthread_mutex_unlock(&g_clients_lock);
     return lid;
 }
 
@@ -957,8 +959,8 @@ static int handle_protocol_message(int fd, ClientInfo *ci,
 
         /* Compute speed and adaptive chunk size */
         if (elapsed > 0.1 && tested > 0) {
-            ci->speed = (double)tested / elapsed;
-            double raw_size = ci->speed * TARGET_SECS;
+            double new_speed = (double)tested / elapsed;
+            double raw_size = new_speed * TARGET_SECS;
             if (raw_size > (double)MAX_CHUNK_BRUTE) raw_size = (double)MAX_CHUNK_BRUTE;
             long new_size = (long)raw_size;
             if (g_brute) {
@@ -973,7 +975,10 @@ static int handle_protocol_message(int fd, ClientInfo *ci,
                 if (new_size < MIN_CHUNK_DICT) new_size = MIN_CHUNK_DICT;
                 if (new_size > MAX_CHUNK_DICT) new_size = MAX_CHUNK_DICT;
             }
+            pthread_mutex_lock(&g_clients_lock);
+            ci->speed = new_speed;
             ci->chunk_size = new_size;
+            pthread_mutex_unlock(&g_clients_lock);
         }
 
         /* Check if found */
@@ -1070,14 +1075,18 @@ static int handle_protocol_message(int fd, ClientInfo *ci,
 
         if (tested > 0) {
             atomic_fetch_add(&g_total_tested, tested);
+            pthread_mutex_lock(&g_clients_lock);
             ci->tested += tested;
+            pthread_mutex_unlock(&g_clients_lock);
         }
 
         pthread_mutex_lock(&g_lease_lock);
         complete_lease((uint64_t)lid, tested);
         pthread_mutex_unlock(&g_lease_lock);
 
+        pthread_mutex_lock(&g_clients_lock);
         ci->current_lease_id = 0;
+        pthread_mutex_unlock(&g_clients_lock);
         return 0;
     }
 
@@ -1100,7 +1109,9 @@ static int handle_protocol_message(int fd, ClientInfo *ci,
                 long credited = hwm;
                 if (credited > 0) {
                     atomic_fetch_add(&g_total_tested, credited);
+                    pthread_mutex_lock(&g_clients_lock);
                     ci->tested += credited;
+                    pthread_mutex_unlock(&g_clients_lock);
                 }
                 if (new_start < le->brute_end) {
                     push_requeue_brute(le->brute_len, new_start, le->brute_end);
@@ -1110,7 +1121,9 @@ static int handle_protocol_message(int fd, ClientInfo *ci,
                 long credited = hwm;
                 if (credited > 0) {
                     atomic_fetch_add(&g_total_tested, credited);
+                    pthread_mutex_lock(&g_clients_lock);
                     ci->tested += credited;
+                    pthread_mutex_unlock(&g_clients_lock);
                 }
                 push_requeue_dict(le->dict_start, le->dict_count);
             }
@@ -1118,7 +1131,9 @@ static int handle_protocol_message(int fd, ClientInfo *ci,
         }
         pthread_mutex_unlock(&g_lease_lock);
 
+        pthread_mutex_lock(&g_clients_lock);
         ci->current_lease_id = 0;
+        pthread_mutex_unlock(&g_clients_lock);
         return 0;
     }
 
@@ -1255,7 +1270,9 @@ static void *client_handler(void *arg)
 
     /* ── Work loop ─────────────────────────────────────────────── */
     while (!g_shutdown && sock_readline(fd, line, sizeof(line)) >= 0) {
+        pthread_mutex_lock(&g_clients_lock);
         ci->last_seen = mono_time();
+        pthread_mutex_unlock(&g_clients_lock);
         if (handle_protocol_message(fd, ci, ci_idx, line))
             break;
     }
