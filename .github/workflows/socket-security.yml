@@ -1,0 +1,48 @@
+name: Socket Security
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+# Supply-chain scanning via Socket.dev. Needs two repo settings:
+#   - secret  SOCKET_API_TOKEN : a Socket API token  (gh secret set SOCKET_API_TOKEN --body '<token>')
+#   - variable SOCKET_ORG      : the Socket org slug  (gh variable set SOCKET_ORG --body '<org>')
+# When the token is absent the scan step skips (job goes green) instead of failing
+# every push. `socket ci` needs the org slug explicitly in CI (the local CLI
+# default-org config isn't present on the runner).
+
+jobs:
+  socket_security:
+    name: Socket Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+      - name: Check for Socket token
+        id: token
+        env:
+          SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}
+        run: |
+          if [ -n "$SOCKET_API_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SOCKET_API_TOKEN not set — skipping Socket scan. Add the secret to enable it."
+          fi
+      - name: Install Socket CLI
+        if: steps.token.outputs.present == 'true'
+        run: npm install -g @socketsecurity/cli
+      - name: Socket Security Scan
+        if: steps.token.outputs.present == 'true'
+        # Non-blocking for now: `socket ci` resolves the org by display name
+        # instead of slug on runners (known CLI bug — see the identical note in
+        # three-humans-and-brian), so the scan stays visible but continue-on-error
+        # until the CLI resolves orgs by slug; then drop continue-on-error.
+        continue-on-error: true
+        run: socket ci --org "${SOCKET_ORG:-gaijin-smash}"
+        env:
+          SOCKET_CLI_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}
+          SOCKET_ORG: ${{ vars.SOCKET_ORG }}
