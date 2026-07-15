@@ -1,0 +1,21 @@
+# Socket.dev — supply-chain security review on every PR. Activate by installing the Socket
+# Security GitHub app (https://github.com/apps/socket-security) on this repo; it then flags risky
+# dependency changes (install scripts, network/filesystem/shell access, typosquats, malware,
+# obfuscation). This file tunes that behaviour.
+version: 2
+projectIgnorePaths:
+  - "**/tests/**"
+  - "**/test/**"
+  - "**/node_modules/**"
+  - "**/.venv/**"
+  - "**/dist/**"
+  - "**/build/**"
+issueRules:
+  installScripts: true
+  networkAccess: true
+  shellAccess: true
+  filesystemAccess: true
+  envVars: true
+  malware: true
+  typosquat: true
+  obfuscatedRequire: true
