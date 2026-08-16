@@ -50,6 +50,34 @@ bash bench.sh                 # quick per-engine benchmark across R2–R6 (run o
 
 ---
 
+## Quick decrypt: `pdfunlock`
+
+`pdfcrack` recovers the *password*; it does not write a decrypted file.
+`pdfunlock` is a small companion binary that does both in one command —
+run it in a folder and it cracks and decrypts everything encrypted there:
+
+```bash
+make pdfunlock          # build it (also built by `make all`)
+./pdfunlock             # scan the current directory
+./pdfunlock "some/folder/"          # a folder
+./pdfunlock -d hints.txt file.pdf   # try a personal wordlist first
+./pdfunlock --no-decrypt file.pdf   # just print/save the password
+```
+
+For each encrypted PDF it recovers the user password (pot cache → fingerprint
+sweep → optional `-d` wordlist → optional `--deep`), writes
+`"<name> (decrypted).pdf"` beside the original (originals are untouched), and
+logs the password to a file. The recovered password is passed to `qpdf` over
+stdin, so it never appears in `ps`.
+
+**Dependency:** the decrypt step shells out to **`qpdf`** (`brew install qpdf`) —
+one small, stable tool. `pdfcrack` itself keeps its zero-external-dependency
+design; `qpdf` is only used by this optional wrapper, and only when actually
+decrypting (`--no-decrypt` needs nothing but `pdfcrack`). See
+[`PDFUNLOCK.md`](PDFUNLOCK.md) for full documentation.
+
+---
+
 ## Architecture
 
 ```mermaid

@@ -4,7 +4,7 @@ FRAMEWORKS = -framework CoreGraphics -framework Foundation -framework Security
 METAL_FRAMEWORKS = -framework Metal -framework Foundation
 LIBS       = -lpthread
 
-all: pdfcrack server client
+all: pdfcrack server client pdfunlock
 
 # ── SASLprep Unicode normalization ─────────────────────────────
 saslprep.o: saslprep.c saslprep.h
@@ -42,6 +42,11 @@ server: server.c protocol.h pdf_encrypt.o saslprep.o pdf_encrypt.h
 client: client.c pdf_encrypt.o saslprep.o metal_keygen.o pdf_md5.metallib pdf_encrypt.h metal_keygen.h protocol.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(METAL_FRAMEWORKS) $(LIBS) -o $@ client.c pdf_encrypt.o saslprep.o metal_keygen.o
 
+# ── pdfunlock: one-command crack + decrypt wrapper ───────────
+# Pure C; no frameworks. Shells out to pdfcrack (crack) and qpdf (decrypt).
+pdfunlock: pdfunlock.c
+	$(CC) $(CFLAGS) -o $@ pdfunlock.c
+
 # ── Test suite ───────────────────────────────────────────────
 test_all: test_all.c pdf_encrypt.o saslprep.o pdf_encrypt.h
 	$(CC) $(CFLAGS) $(FRAMEWORKS) -o $@ test_all.c pdf_encrypt.o saslprep.o
@@ -58,7 +63,7 @@ test: test_all test_saslprep test_crypto
 	./test_crypto
 
 clean:
-	rm -f pdfcrack server client test_all test_crypto test_saslprep fuzz_rules fuzz_parse checkpoint.o rules.o *.o *.air *.metallib *.profraw *.profdata
+	rm -f pdfcrack server client pdfunlock test_all test_crypto test_saslprep fuzz_rules fuzz_parse checkpoint.o rules.o *.o *.air *.metallib *.profraw *.profdata
 
 test-integration: pdfcrack
 	./test_integration.sh
@@ -81,4 +86,4 @@ pgo:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="$(CFLAGS) -fprofile-use -fprofile-correction"
 
-.PHONY: all clean test test-integration fuzz-rules fuzz-parse pgo
+.PHONY: all clean test test-integration fuzz-rules fuzz-parse pgo pdfunlock-clean

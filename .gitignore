@@ -5,6 +5,7 @@
 pdfcrack
 server
 client
+pdfunlock
 test_all
 test_crypto
 test_saslprep
