@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #define MAX_PW      512
 #define MAX_PATH    4096
@@ -96,7 +97,8 @@ static int run_capture(char *const argv[], char *buf, size_t bufsz,
         ssize_t off = 0;
         while ((size_t)off < n) {
             ssize_t w = write(inpipe[1], stdin_data + off, n - (size_t)off);
-            if (w <= 0) break;
+            if (w < 0) { if (errno == EINTR) continue; break; }  /* EPIPE if child died */
+            if (w == 0) break;
             off += w;
         }
         close(inpipe[1]);
@@ -105,10 +107,12 @@ static int run_capture(char *const argv[], char *buf, size_t bufsz,
     size_t total = 0;
     if (buf) {
         close(outpipe[1]);
-        ssize_t r;
-        while (total + 1 < bufsz &&
-               (r = read(outpipe[0], buf + total, bufsz - 1 - total)) > 0)
+        while (total + 1 < bufsz) {
+            ssize_t r = read(outpipe[0], buf + total, bufsz - 1 - total);
+            if (r < 0) { if (errno == EINTR) continue; break; }
+            if (r == 0) break;
             total += (size_t)r;
+        }
         buf[total] = '\0';
         close(outpipe[0]);
     }
@@ -124,35 +128,36 @@ static int run_capture(char *const argv[], char *buf, size_t bufsz,
  * Returns 1 and fills pw if found (pw may be empty for owner-locked
  * files with an empty user password), 0 if not found.
  * ================================================================ */
+/* Match a prefix only at the start of a line (start of buffer, or right
+ * after a newline) so text elsewhere in the output can't spoof a match. */
+static const char *find_prefix(const char *out, const char *pfx)
+{
+    const char *p = out;
+    while ((p = strstr(p, pfx)) != NULL) {
+        if (p == out || p[-1] == '\n' || p[-1] == '\r') return p;
+        p += 1;
+    }
+    return NULL;
+}
+
 static int parse_password(const char *out, char *pw, size_t pwsz)
 {
-    /* Prefixes pdfcrack prints on stdout when it succeeds. Order
-     * matters: the "(empty)" case must be checked before the generic
-     * "Password found: " prefix. */
+    /* Owner-locked file with an empty user password. Checked before the
+     * generic "Password found: " prefix, which it also begins with. */
+    if (find_prefix(out, "Password found: (empty)")) { pw[0] = '\0'; return 1; }
+
+    /* Prefixes pdfcrack prints on stdout when it succeeds; generic form last. */
     static const char *pfx[] = {
         "User password found: ",
         "Owner password found: ",
         "Found in pot file: ",
+        "Password found: ",
         NULL
     };
-
-    /* Empty-password (owner-locked) case. */
-    if (strstr(out, "Password found: (empty)")) { pw[0] = '\0'; return 1; }
-
     for (int i = 0; pfx[i]; i++) {
-        const char *p = strstr(out, pfx[i]);
+        const char *p = find_prefix(out, pfx[i]);
         if (!p) continue;
         p += strlen(pfx[i]);
-        size_t j = 0;
-        while (*p && *p != '\n' && *p != '\r' && j + 1 < pwsz) pw[j++] = *p++;
-        pw[j] = '\0';
-        return 1;
-    }
-
-    /* Generic "Password found: <pw>" fallback. */
-    const char *p = strstr(out, "Password found: ");
-    if (p) {
-        p += strlen("Password found: ");
         size_t j = 0;
         while (*p && *p != '\n' && *p != '\r' && j + 1 < pwsz) pw[j++] = *p++;
         pw[j] = '\0';
@@ -216,7 +221,7 @@ static int decrypt(const char *pdf, const char *pw, const char *outpath)
 {
     char *argv[] = {
         (char *)g_qpdf, "--decrypt", "--password-file=-",
-        (char *)pdf, (char *)outpath, NULL
+        "--", (char *)pdf, (char *)outpath, NULL   /* -- : paths, not options */
     };
     /* qpdf reads the first line of stdin as the password (newline stripped). */
     char stdin_data[MAX_PW + 2];
@@ -258,11 +263,16 @@ static void log_password(const char *pdf, const char *pw)
     fclose(f);
 }
 
+/* qpdf --is-encrypted exit codes: 0 = encrypted, 2 = not encrypted (also
+ * returned for missing/invalid files). Returns 1 = encrypted, 0 = not,
+ * -1 = qpdf could not be run (should not happen: verified at startup). */
 static int is_encrypted(const char *pdf)
 {
-    /* qpdf --is-encrypted: exit 0 = encrypted, 2 = not encrypted. */
-    char *argv[] = { (char *)g_qpdf, "--is-encrypted", (char *)pdf, NULL };
-    return run_capture(argv, NULL, 0, NULL) == 0;
+    char *argv[] = { (char *)g_qpdf, "--is-encrypted", "--", (char *)pdf, NULL };
+    int rc = run_capture(argv, NULL, 0, NULL);
+    if (rc == 0) return 1;
+    if (rc == 2) return 0;
+    return -1;
 }
 
 /* Process one PDF file end-to-end. Returns 1 on success, 0 otherwise. */
@@ -275,7 +285,10 @@ static int process_file(const char *pdf)
     size_t l = strlen(base);
     if (l >= 16 && strcasecmp(base + l - 16, " (decrypted).pdf") == 0) return 0;
 
-    if (g_qpdf && !is_encrypted(pdf)) {
+    /* Pre-filter non-encrypted files. This uses qpdf, which we already
+     * require for decrypting — so skip it in --no-decrypt mode, keeping
+     * that path dependent on nothing but pdfcrack. */
+    if (!g_no_decrypt && is_encrypted(pdf) == 0) {
         printf("  •  %-50s not encrypted — skipped\n", base);
         return 0;
     }
@@ -323,7 +336,11 @@ static void gather_dir(const char *dir, char targets[][MAX_PATH], int *n)
     while ((e = readdir(d)) && *n < MAX_TARGETS) {
         if (e->d_name[0] == '.') continue;
         char path[MAX_PATH];
-        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        int wn = snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        if (wn < 0 || wn >= (int)sizeof(path)) {
+            fprintf(stderr, "pdfunlock: path too long, skipped: %s/%s\n", dir, e->d_name);
+            continue;
+        }
         struct stat st;
         if (stat(path, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
@@ -406,29 +423,41 @@ static const char *resolve_pdfcrack(const char *argv0)
 
 int main(int argc, char **argv)
 {
+    /* A child (qpdf) that closes its stdin before we finish writing the
+     * password must not kill us with SIGPIPE — the write loop handles EPIPE. */
+    signal(SIGPIPE, SIG_IGN);
+
     const char *pdfcrack_override = NULL;
     const char *targets_in[MAX_TARGETS];
     int n_in = 0;
 
+    /* Guard options that consume the next argv token. */
+    #define NEED_ARG(opt) do { if (i + 1 >= argc) { \
+        fprintf(stderr, "pdfunlock: option %s needs an argument\n", (opt)); \
+        return 2; } } while (0)
+
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
-        else if (!strcmp(a, "-d") || !strcmp(a, "--dict"))       g_dict   = argv[++i];
-        else if (!strcmp(a, "-o") || !strcmp(a, "--outdir"))     g_outdir = argv[++i];
-        else if (!strcmp(a, "-P") || !strcmp(a, "--passwords"))  g_logpath = argv[++i];
+        else if (!strcmp(a, "-d") || !strcmp(a, "--dict"))      { NEED_ARG(a); g_dict = argv[++i]; }
+        else if (!strcmp(a, "-o") || !strcmp(a, "--outdir"))    { NEED_ARG(a); g_outdir = argv[++i]; }
+        else if (!strcmp(a, "-P") || !strcmp(a, "--passwords")) { NEED_ARG(a); g_logpath = argv[++i]; }
         else if (!strcmp(a, "--deep"))                           g_deep = 1;
         else if (!strcmp(a, "--no-decrypt"))                     g_no_decrypt = 1;
         else if (!strcmp(a, "-r") || !strcmp(a, "--recursive"))  g_recursive = 1;
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet"))      g_quiet = 1;
-        else if (!strcmp(a, "--pdfcrack"))                       pdfcrack_override = argv[++i];
-        else if (!strcmp(a, "--qpdf"))                           g_qpdf = argv[++i];
+        else if (!strcmp(a, "--pdfcrack"))                      { NEED_ARG(a); pdfcrack_override = argv[++i]; }
+        else if (!strcmp(a, "--qpdf"))                          { NEED_ARG(a); g_qpdf = argv[++i]; }
         else if (a[0] == '-') {
             fprintf(stderr, "pdfunlock: unknown option '%s' (see --help)\n", a);
             return 2;
         } else if (n_in < MAX_TARGETS) {
             targets_in[n_in++] = a;
+        } else {
+            fprintf(stderr, "pdfunlock: too many targets, ignoring '%s'\n", a);
         }
     }
+    #undef NEED_ARG
 
     /* No path given → just go: scan the current directory. Running
      * `pdfunlock` on its own should decrypt everything it finds here. */
@@ -449,6 +478,20 @@ int main(int argc, char **argv)
         return 3;
     }
 
+    /* Decryption needs qpdf — verify it up front so a missing qpdf is one
+     * clear error, not every file silently mislabeled "not encrypted". */
+    if (!g_no_decrypt) {
+        char ver[128];
+        char *av[] = { (char *)g_qpdf, "--version", NULL };
+        if (run_capture(av, ver, sizeof(ver), NULL) != 0) {
+            fprintf(stderr,
+                "pdfunlock: qpdf not found or not runnable (%s).\n"
+                "           install it (brew install qpdf), pass --qpdf <path>,\n"
+                "           or use --no-decrypt to only recover passwords.\n", g_qpdf);
+            return 3;
+        }
+    }
+
     /* Expand targets (files + directories) into a flat PDF list. */
     static char targets[MAX_TARGETS][MAX_PATH];
     int n = 0;
@@ -465,8 +508,14 @@ int main(int argc, char **argv)
 
     /* Default password log: <dir-of-first-target>/pdfunlock-passwords.txt */
     static char logbuf[MAX_PATH];
-    if (!g_logpath && !g_no_decrypt) g_logpath = "pdfunlock-passwords.txt";
-    if (g_logpath && !strchr(g_logpath, '/')) {
+    int logpath_is_default = 0;
+    if (!g_logpath && !g_no_decrypt) {
+        g_logpath = "pdfunlock-passwords.txt";
+        logpath_is_default = 1;
+    }
+    /* Place only the *default* log beside the documents; an explicit -P is
+     * honored verbatim (relative to the current directory, as users expect). */
+    if (logpath_is_default && !strchr(g_logpath, '/')) {
         char first[MAX_PATH];
         snprintf(first, sizeof(first), "%s", targets[0]);
         char *slash = strrchr(first, '/');
