@@ -7,7 +7,9 @@
  */
 
 #include "pdf_encrypt.h"
+#include "saslprep.h"
 #include <CoreGraphics/CoreGraphics.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -137,6 +139,93 @@ int main(void)
             printf("  [%s] %s owner lane %d \"%s\" scalar=%d batch4=%d\n",
                    ok ? "PASS" : "FAIL", tc->file, i, pw_owner[i], scal_o, batch_o);
         }
+    }
+    printf("\n");
+
+    /* ── Regression tests for the review-hardening fixes ────────────
+     * These exercise behavior CoreGraphics cannot be an oracle for, and
+     * that the file+CG cross-check above therefore cannot catch:
+     *   #1 nonconforming /Perms must NOT reject a confirmed R5/R6 password
+     *   #4 R5 applies SASLprep to the password
+     *   #3 R2 key length is pinned to 40-bit regardless of /Length
+     * Each asserts the *fixed* behavior, so a future regression fails here. */
+    printf("━━━ Regression: review-hardening fixes ━━━\n");
+
+    /* #1 — corrupt /Perms on a real R5/R6 fixture; the correct password must
+     * still verify (the primary hash is authoritative, /Perms is advisory). */
+    {
+        struct { const char *file; const char *pw; } pc[] = {
+            {"test_r5_aes256.pdf",  "pass256"},
+            {"test_pikepdf_r6.pdf", "user_r6"},
+            {NULL, NULL}
+        };
+        for (int i = 0; pc[i].file; i++) {
+            PDFEncryptParams p = pdf_parse_encrypt_file(pc[i].file);
+            if (!p.valid) { printf("  [SKIP] %s did not parse\n", pc[i].file); continue; }
+
+            int before = pdf_verify_user_password(&p, pc[i].pw);
+            /* Force a /Perms block that the removed hard-gate would reject. */
+            p.has_perms = 1; p.has_ue = 1;
+            memset(p.perms_value, 0xEE, sizeof(p.perms_value));
+            int after = pdf_verify_user_password(&p, pc[i].pw);
+            int wrong = pdf_verify_user_password(&p, "definitely_wrong_pw");
+
+            int ok = (before == 1 && after == 1);
+            if (ok) total_pass++; else total_fail++;
+            printf("  [%s] %-22s correct pw verifies with corrupt /Perms (before=%d after=%d)\n",
+                   ok ? "PASS" : "FAIL", pc[i].file, before, after);
+
+            ok = (wrong == 0);
+            if (ok) total_pass++; else total_fail++;
+            printf("  [%s] %-22s wrong pw still rejected (=%d)\n",
+                   ok ? "PASS" : "FAIL", pc[i].file, wrong);
+        }
+    }
+
+    /* #4 — R5 must SASLprep the password. Build a synthetic R5 /U from the
+     * NORMALIZED password, then assert the raw (non-normalized) form verifies. */
+    {
+        /* Split literal so the \xAD escape can't absorb following hex chars.
+         * U+00AD SOFT HYPHEN is deleted by SASLprep → normalizes to "pass256". */
+        const char *raw = "pa\xC2\xAD" "ss256";
+        uint8_t norm[128]; size_t norm_len = 0;
+        if (saslprep(raw, strlen(raw), norm, &norm_len) != 0 || norm_len == 0) {
+            printf("  [FAIL] R5 SASLprep: saslprep() failed on test input\n");
+            total_fail++;
+        } else {
+            PDFEncryptParams p; memset(&p, 0, sizeof(p));
+            p.valid = 1; p.version = 5; p.revision = 5; p.key_length = 256;
+            uint8_t vsalt[8] = {1,2,3,4,5,6,7,8};
+            uint8_t ksalt[8] = {9,10,11,12,13,14,15,16};
+            CC_SHA256_CTX c; CC_SHA256_Init(&c);
+            CC_SHA256_Update(&c, norm, (CC_LONG)norm_len);
+            CC_SHA256_Update(&c, vsalt, 8);
+            CC_SHA256_Final(p.u_value, &c);
+            memcpy(p.u_value + 32, vsalt, 8);
+            memcpy(p.u_value + 40, ksalt, 8);
+            p.u_value_len = 48;
+
+            int raw_ok  = pdf_verify_user_password(&p, raw);        /* needs SASLprep */
+            int norm_ok = pdf_verify_user_password(&p, "pass256");  /* already normal */
+            int wrong   = pdf_verify_user_password(&p, "pass255");
+            int ok = (raw_ok == 1 && norm_ok == 1 && wrong == 0);
+            if (ok) total_pass++; else total_fail++;
+            printf("  [%s] R5 SASLprep: raw-form=%d normalized-form=%d wrong=%d\n",
+                   ok ? "PASS" : "FAIL", raw_ok, norm_ok, wrong);
+        }
+    }
+
+    /* #3 — R2 key length is always 40-bit (5 bytes), even if /Length says 128. */
+    {
+        PDFEncryptParams p; memset(&p, 0, sizeof(p));
+        p.valid = 1; p.version = 2; p.revision = 2; p.key_length = 128;
+        p.file_id_len = 16;   /* zero-filled ID is fine; only the length matters */
+        uint8_t key[16];
+        int kb = pdf_compute_encryption_key(&p, "whatever", key);
+        int ok = (kb == 5);
+        if (ok) total_pass++; else total_fail++;
+        printf("  [%s] R2 with /Length 128 → 5-byte key (got %d)\n",
+               ok ? "PASS" : "FAIL", kb);
     }
     printf("\n");
 
