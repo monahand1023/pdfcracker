@@ -129,6 +129,7 @@ flowchart TD
 | `pdf_gpu_types.h` | GPU parameter structs shared by the Metal host and shader |
 | `fuzz_rules.c` | libFuzzer harness for the rules engine (links the real `rules.c`) |
 | `test_parse_fuzz.c` | ASan/UBSan libFuzzer harness for the PDF encryption parser |
+| `test_verify_fuzz.c` | Fuzz + differential harness for the verify/crypto path (batch4-vs-scalar oracle); libFuzzer + standalone builds |
 | `test_all.c` | Unit test suite: 80 assertions across 8 PDF variants (CoreGraphics + NEON/scalar cross-validation) |
 | `test_integration.sh` | 45 end-to-end integration tests (incl. distributed loopback) |
 | `bench.sh` | Repeatable per-engine benchmark across R2–R6 |
@@ -446,14 +447,17 @@ Each client has a persistent UUID (`~/.pdfcracker_id`) so the server recognises 
 ## Testing
 
 ```bash
-make test                          # all unit suites: test_all (80) + saslprep + test_crypto (6)
+make test                          # all unit suites: test_all (86) + saslprep + test_crypto (6)
 bash test_integration.sh           # 45 end-to-end tests (R2–R6)
-make fuzz-parse && ./fuzz_parse corpus   # ASan/UBSan fuzz of the PDF parser
+make fuzz-parse && ./fuzz_parse corpus            # ASan/UBSan fuzz of the PDF parser
+make verify_fuzz_standalone && ./verify_fuzz_standalone test_*.pdf   # fuzz the verify/crypto path
 ```
 
-CI (`.github/workflows/ci.yml`) runs the build, all unit suites, the integration suite, an ASan/UBSan job, and a fuzz smoke run on every push.
+The parser fuzzer (`test_parse_fuzz.c`) only exercises `pdf_parse_encrypt`. The **verify** fuzzer (`test_verify_fuzz.c`) closes the gap: it parses fuzz input, then drives every password-verification entry point — scalar user/owner for R2–R6 (KDF, RC4, R6 Algorithm 2.B, SHA-256/384/512, AES) and the NEON batch4 paths — under ASan/UBSan, and acts as a **differential oracle** asserting each NEON batch4 lane equals the scalar result (a divergence aborts). It builds as a libFuzzer target (`make fuzz-verify`, needs Homebrew LLVM) or as a standalone ASan/UBSan runner (`make verify_fuzz_standalone`, Apple clang) that replays the seed corpus plus a deterministic mutation loop (`VERIFY_FUZZ_ITERS` overrides the count).
 
-`test_all.c` verifies every verify function against Apple's CoreGraphics API and cross-validates the NEON batch4 path against scalar results per-lane. `test_integration.sh` covers all attack modes end-to-end including checkpoints (corruption + document-mismatch rejection), GPU↔CPU consistency, smart mode, a distributed server↔client loopback, and edge cases.
+CI (`.github/workflows/ci.yml`) runs the build, all unit suites, the integration suite, an ASan/UBSan job (including a 100k-iteration verify-fuzz hard gate), and libFuzzer smoke runs for the rules, parser, and verify path on every push.
+
+`test_all.c` verifies every verify function against Apple's CoreGraphics API, cross-validates the NEON batch4 path against scalar results per-lane, and includes regression guards for the R5/R6 `/Perms`, R5 SASLprep, and R2 key-length fixes. `test_integration.sh` covers all attack modes end-to-end including checkpoints (corruption + document-mismatch rejection), GPU↔CPU consistency, smart mode, a distributed server↔client loopback, and edge cases.
 
 ---
 

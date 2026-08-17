@@ -11,6 +11,8 @@ test_crypto
 test_saslprep
 fuzz_rules
 fuzz_parse
+fuzz_verify
+verify_fuzz_standalone
 corpus/
 crash-*
 *.profraw

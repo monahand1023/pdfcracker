@@ -63,7 +63,7 @@ test: test_all test_saslprep test_crypto
 	./test_crypto
 
 clean:
-	rm -f pdfcrack server client pdfunlock test_all test_crypto test_saslprep fuzz_rules fuzz_parse checkpoint.o rules.o *.o *.air *.metallib *.profraw *.profdata
+	rm -f pdfcrack server client pdfunlock test_all test_crypto test_saslprep fuzz_rules fuzz_parse fuzz_verify verify_fuzz_standalone checkpoint.o rules.o *.o *.air *.metallib *.profraw *.profdata
 
 test-integration: pdfcrack
 	./test_integration.sh
@@ -78,6 +78,19 @@ fuzz-parse: test_parse_fuzz.c pdf_encrypt.c saslprep.c
 	$(FUZZ_CC) -O1 -g -fsanitize=fuzzer,address,undefined \
 	  -o fuzz_parse test_parse_fuzz.c pdf_encrypt.c saslprep.c $(FRAMEWORKS)
 
+# Fuzz + differential harness for the VERIFY/crypto path (parse-then-verify,
+# plus a NEON-batch4-vs-scalar oracle). libFuzzer build for CI.
+fuzz-verify: test_verify_fuzz.c pdf_encrypt.c saslprep.c
+	$(FUZZ_CC) -O1 -g -fsanitize=fuzzer,address,undefined \
+	  -o fuzz_verify test_verify_fuzz.c pdf_encrypt.c saslprep.c $(FRAMEWORKS)
+
+# Standalone runner: same harness under Apple clang's ASan/UBSan (no libFuzzer
+# runtime needed). Replays seed PDFs + a deterministic mutation loop.
+#   ./verify_fuzz_standalone test_*.pdf   (VERIFY_FUZZ_ITERS overrides count)
+verify_fuzz_standalone: test_verify_fuzz.c pdf_encrypt.c saslprep.c
+	$(CC) -DSTANDALONE -O1 -g -fsanitize=address,undefined \
+	  -o verify_fuzz_standalone test_verify_fuzz.c pdf_encrypt.c saslprep.c $(FRAMEWORKS)
+
 # ── Profile-guided optimization (PGO) ───────────────────────
 pgo:
 	$(MAKE) clean
@@ -86,4 +99,4 @@ pgo:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="$(CFLAGS) -fprofile-use -fprofile-correction"
 
-.PHONY: all clean test test-integration fuzz-rules fuzz-parse pgo pdfunlock-clean
+.PHONY: all clean test test-integration fuzz-rules fuzz-parse fuzz-verify pgo pdfunlock-clean

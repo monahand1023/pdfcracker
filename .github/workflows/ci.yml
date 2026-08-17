@@ -22,6 +22,11 @@ jobs:
           make fuzz-parse FUZZ_CC="$(brew --prefix llvm)/bin/clang"
           mkdir -p corpus && cp test_*.pdf corpus/
           ./fuzz_parse corpus -max_total_time=30 || true
+      - name: Smoke-fuzz verify path (30s)
+        run: |
+          make fuzz-verify FUZZ_CC="$(brew --prefix llvm)/bin/clang"
+          mkdir -p corpus && cp test_*.pdf corpus/
+          ./fuzz_verify corpus -max_total_time=30 || true
   asan:
     runs-on: macos-14
     steps:
@@ -30,3 +35,7 @@ jobs:
         run: |
           make CFLAGS="-O1 -g -fsanitize=address,undefined -Wall" test_all test_crypto
           ./test_all && ./test_crypto
+      - name: ASan + differential verify fuzz (hard gate)
+        run: |
+          make verify_fuzz_standalone
+          VERIFY_FUZZ_ITERS=100000 ./verify_fuzz_standalone test_*.pdf
