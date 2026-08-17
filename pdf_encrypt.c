@@ -558,25 +558,37 @@ static inline void rc4_multi_pass_16(const uint8_t *key, int key_len,
         uint8_t mod_key[16];
         for (int j = 0; j < key_len; j++)
             mod_key[j] = key[j] ^ (uint8_t)r;
-        uint8_t temp[16];
-        rc4_encrypt_16(mod_key, key_len, data, temp);
-        memcpy(data, temp, 16);
+        /* In-place: rc4_crypt reads in[k] before writing out[k] at the same
+         * index sequentially, so src==dst is safe — no temp buffer needed. */
+        rc4_encrypt_16(mod_key, key_len, data, data);
     }
 }
 
-/* ── Helper: pad or truncate password to 32 bytes per PDF spec ── */
+/* ── Helper: pad or truncate password to 32 bytes per PDF spec ──
+ * Length-taking core (NUL-safe: does not stop at embedded NUL bytes). */
+static inline void pad_password_len(const uint8_t *pw, size_t plen, uint8_t padded[32])
+{
+    if (plen > 32) plen = 32;
+    if (plen > 0 && pw) memcpy(padded, pw, plen);
+    if (plen < PDF_PASSWORD_PADDING_LEN)
+        memcpy(padded + plen, PDF_PASSWORD_PADDING, PDF_PASSWORD_PADDING_LEN - plen);
+}
+
 static inline void pad_password(const char *password, uint8_t padded[32])
 {
     size_t plen = password ? strlen(password) : 0;
-    if (plen > 32) plen = 32;
-    if (plen > 0) memcpy(padded, password, plen);
-    if (plen < PDF_PASSWORD_PADDING_LEN)
-        memcpy(padded + plen, PDF_PASSWORD_PADDING, PDF_PASSWORD_PADDING_LEN - plen);
+    pad_password_len((const uint8_t *)password, plen, padded);
 }
 
 /* ── Helper: compute key-length in bytes, clamped to [5, 16] ──── */
 static inline int key_bytes_for(const PDFEncryptParams *p)
 {
+    /* R2 is always a 40-bit (5-byte) key per ISO 32000-1, regardless of any
+     * /Length the file carries. Compliant R2 files omit /Length, but a
+     * nonstandard file that sets /Length 128 would otherwise derive a 16-byte
+     * key and make every candidate mismatch (uncrackable). Pin it to 5. */
+    if (p->revision == 2) return 5;
+
     int kb = p->key_length / 8;
     if (kb < 5)  kb = 5;
     if (kb > 16) kb = 16;
@@ -676,6 +688,27 @@ static void compute_u_r3(const PDFEncryptParams *params,
     memcpy(u_out, encrypted, 16);
 }
 
+/* ── Helper: SASLprep-normalize a password for R5/R6 ─────────────
+ * R5/R6 passwords are SASLprep'd (ISO 32000-2 §7.6.4.3.3) before hashing.
+ * Returns a pointer to the bytes to hash (normalized, or the raw password if
+ * SASLprep is a no-op / fails) and their length, capped at 127 bytes so the
+ * fixed-size buffers in algorithm_2b are never overrun. */
+static inline void normalize_password_saslprep(const char *password,
+                                               const uint8_t **out_data,
+                                               size_t *out_len)
+{
+    size_t pw_len = password ? strlen(password) : 0;
+    if (pw_len > 127) pw_len = 127;
+    *out_len = pw_len;
+    *out_data = (const uint8_t *)password;
+    static _Thread_local uint8_t norm_buf[128];
+    size_t norm_len = 0;
+    if (pw_len > 0 && saslprep(password, pw_len, norm_buf, &norm_len) == 0 && norm_len > 0) {
+        *out_data = norm_buf;
+        *out_len = norm_len > 127 ? 127 : norm_len;
+    }
+}
+
 /* ================================================================
  * Algorithm 2.B: R6 iterative hash (ISO 32000-2 section 7.6.4.3.4)
  *
@@ -687,7 +720,10 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
                           const uint8_t *salt, const uint8_t *extra,
                           int extra_len, uint8_t *out)
 {
-    if (pw_len > 127) return; /* normalize_password_r6 caps at 127; defend the buffers */
+    /* Callers normalize+cap at 127; defend the fixed buffers regardless.
+     * On the cap violation, zero the output so a caller that ignores the
+     * (void) return can't memcmp uninitialized stack. */
+    if (pw_len > 127) { memset(out, 0, 32); return; }
     /* Step a: SHA-256(password + salt + extra) */
     uint8_t hash[64]; /* large enough for SHA-512 */
 
@@ -728,7 +764,7 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
         if (extra_len > 0)
             memcpy(seq + pw_len + hash_len, extra, (size_t)extra_len);
 
-        if (seq_len > sizeof(K1) / 64) return;
+        if (seq_len > sizeof(K1) / 64) { memset(out, 0, 32); return; }
         size_t K1_len = seq_len * 64;
 
         /* Doubling memcpy: copy seq once, then double the filled region
@@ -757,11 +793,17 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
 #else
         {
             size_t cc_out_len = 0;
-            /* CCCrypt supports in-place encryption (src==dst) on macOS */
-            CCCrypt(kCCEncrypt, kCCAlgorithmAES, 0,
+            /* CCCrypt supports in-place encryption (src==dst) on macOS.
+             * If it ever fails, cc_out_len can be 0 → K1[aes_len-1] would
+             * underflow. Treat any failure/short output as "not a match". */
+            CCCryptorStatus st = CCCrypt(kCCEncrypt, kCCAlgorithmAES, 0,
                     hash, 16, hash + 16,
                     K1, K1_len,
                     K1, K1_len, &cc_out_len);
+            if (st != kCCSuccess || cc_out_len != K1_len) {
+                memset(out, 0, 32);
+                return;
+            }
             aes_len = cc_out_len;
         }
 #endif
@@ -810,84 +852,51 @@ static void algorithm_2b(const uint8_t *password, size_t pw_len,
 
 /* ================================================================
  * R5 user password verification (Algorithm 2.A simplified)
- * SHA-256(password + validation_salt) == U[0:32]
+ * SHA-256(SASLprep(password) + validation_salt) == U[0:32]
  * validation_salt = U[32:40]
  *
- * When /Perms is present, also cross-validates the decrypted /Perms
- * block: derives the file key via SHA-256(pw + U_key_salt) → AES-256-ECB-
- * decrypt(UE), then decrypts /Perms and asserts bytes [9:11] == 'a','d','b'.
+ * The SHA-256 primary check is cryptographically authoritative: a matching
+ * hash IS the correct user password. We deliberately do NOT gate on the
+ * /Perms integrity block — a producer that writes a nonconforming /Perms
+ * (or omits the 'adb' tag) would otherwise make us reject a password we have
+ * already confirmed correct. /Perms is treated as advisory only.
  * ================================================================ */
 static int verify_user_r5(const PDFEncryptParams *params, const char *password)
 {
     if (params->u_value_len < 40) return 0;
 
-    size_t pw_len = password ? strlen(password) : 0;
-    if (pw_len > 127) pw_len = 127;
+    const uint8_t *pw_data;
+    size_t pw_len;
+    normalize_password_saslprep(password, &pw_data, &pw_len);
 
     /* Primary validation: SHA-256(pw + U_validation_salt) == U[0:32] */
     uint8_t hash[32];
     CC_SHA256_CTX sha256;
     CC_SHA256_Init(&sha256);
-    if (pw_len > 0) CC_SHA256_Update(&sha256, (const uint8_t *)password, (CC_LONG)pw_len);
+    if (pw_len > 0) CC_SHA256_Update(&sha256, pw_data, (CC_LONG)pw_len);
     CC_SHA256_Update(&sha256, params->u_value + 32, 8); /* validation salt */
     CC_SHA256_Final(hash, &sha256);
 
-    if (memcmp(hash, params->u_value, 32) != 0) return 0;
-
-    /* /Perms cross-check (extra correctness gate, only when data is present):
-     * intermediate_key = SHA-256(pw + U_key_salt)
-     * file_key         = AES-256-CBC-decrypt(UE, intermediate_key, IV=0)
-     * perms_plain      = AES-256-ECB-decrypt(Perms, file_key)
-     * assert perms_plain[9:12] == 'a', 'd', 'b'  (ISO 32000-2 §7.6.5.2)  */
-    if (params->has_perms && params->has_ue) {
-        uint8_t int_key[32];
-        CC_SHA256_CTX sha2;
-        CC_SHA256_Init(&sha2);
-        if (pw_len > 0) CC_SHA256_Update(&sha2, (const uint8_t *)password, (CC_LONG)pw_len);
-        CC_SHA256_Update(&sha2, params->u_value + 40, 8); /* key salt */
-        CC_SHA256_Final(int_key, &sha2);
-
-        /* UE is encrypted with AES-256-CBC, zero IV (ISO 32000-2 §7.6.4.4) */
-        uint8_t file_key[32] = {0};
-        uint8_t iv_zero[16]  = {0};
-        size_t fk_out = 0;
-        CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0 /* CBC, no padding */,
-                int_key, kCCKeySizeAES256, iv_zero,
-                params->ue_value, 32,
-                file_key, 32, &fk_out);
-
-        /* /Perms is encrypted with AES-256-ECB */
-        uint8_t perms_plain[16] = {0};
-        size_t pp_out = 0;
-        CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode,
-                file_key, kCCKeySizeAES256, NULL,
-                params->perms_value, 16,
-                perms_plain, 16, &pp_out);
-
-        if (pp_out != 16 ||
-            perms_plain[9] != 'a' || perms_plain[10] != 'd' || perms_plain[11] != 'b')
-            return 0;
-    }
-
-    return 1;
+    return memcmp(hash, params->u_value, 32) == 0;
 }
 
 /* ================================================================
  * R5 owner password verification
- * SHA-256(password + validation_salt + U[0:48]) == O[0:32]
+ * SHA-256(SASLprep(password) + validation_salt + U[0:48]) == O[0:32]
  * validation_salt = O[32:40]
  * ================================================================ */
 static int verify_owner_r5(const PDFEncryptParams *params, const char *password)
 {
     if (params->o_value_len < 40 || params->u_value_len < 48) return 0;
 
-    size_t pw_len = password ? strlen(password) : 0;
-    if (pw_len > 127) pw_len = 127;
+    const uint8_t *pw_data;
+    size_t pw_len;
+    normalize_password_saslprep(password, &pw_data, &pw_len);
 
     uint8_t hash[32];
     CC_SHA256_CTX sha256;
     CC_SHA256_Init(&sha256);
-    if (pw_len > 0) CC_SHA256_Update(&sha256, (const uint8_t *)password, (CC_LONG)pw_len);
+    if (pw_len > 0) CC_SHA256_Update(&sha256, pw_data, (CC_LONG)pw_len);
     CC_SHA256_Update(&sha256, params->o_value + 32, 8); /* validation salt */
     CC_SHA256_Update(&sha256, params->u_value, 48);       /* full U value */
     CC_SHA256_Final(hash, &sha256);
@@ -895,34 +904,12 @@ static int verify_owner_r5(const PDFEncryptParams *params, const char *password)
     return memcmp(hash, params->o_value, 32) == 0;
 }
 
-/* ── Helper: SASLprep normalization for R6 passwords ─────────── */
-static inline void normalize_password_r6(const char *password,
-                                          const uint8_t **out_data,
-                                          size_t *out_len)
-{
-    size_t pw_len = password ? strlen(password) : 0;
-    if (pw_len > 127) pw_len = 127;
-    *out_len = pw_len;
-    /* Try SASLprep normalization; fall back to raw password */
-    static _Thread_local uint8_t norm_buf[128];
-    size_t norm_len = 0;
-    if (pw_len > 0 && saslprep(password, pw_len, norm_buf, &norm_len) == 0 && norm_len > 0) {
-        *out_data = norm_buf;
-        *out_len = norm_len;
-    } else {
-        *out_data = (const uint8_t *)password;
-    }
-}
-
 /* ================================================================
  * R6 user password verification (Algorithm 2.A with 2.B hash)
- * Algorithm2B(password, U_validation_salt, "") == U[0:32]
+ * Algorithm2B(SASLprep(password), U_validation_salt, "") == U[0:32]
  *
- * When /Perms is present, also cross-validates via:
- * intermediate_key = Algorithm2B(pw, U_key_salt, "")
- * file_key         = AES-256-ECB-decrypt(UE, intermediate_key)
- * perms_plain      = AES-256-ECB-decrypt(Perms, file_key)
- * assert perms_plain[9:12] == 'a', 'd', 'b'
+ * As with R5, the Algorithm-2.B hash is authoritative and the /Perms block
+ * is advisory only — we never let it reject a confirmed password.
  * ================================================================ */
 static int verify_user_r6(const PDFEncryptParams *params, const char *password)
 {
@@ -930,7 +917,7 @@ static int verify_user_r6(const PDFEncryptParams *params, const char *password)
 
     const uint8_t *pw_data;
     size_t pw_len;
-    normalize_password_r6(password, &pw_data, &pw_len);
+    normalize_password_saslprep(password, &pw_data, &pw_len);
 
     /* Primary validation */
     uint8_t hash[32];
@@ -940,36 +927,6 @@ static int verify_user_r6(const PDFEncryptParams *params, const char *password)
                  hash);
 
     if (memcmp(hash, params->u_value, 32) != 0) return 0;
-
-    /* /Perms cross-check: same structure as R5 but uses Algorithm2B for key */
-    if (params->has_perms && params->has_ue) {
-        uint8_t int_key[32];
-        algorithm_2b(pw_data, pw_len,
-                     params->u_value + 40, /* key salt */
-                     NULL, 0,
-                     int_key);
-
-        /* UE is encrypted with AES-256-CBC, zero IV */
-        uint8_t file_key[32] = {0};
-        uint8_t iv_zero[16]  = {0};
-        size_t fk_out = 0;
-        CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0 /* CBC, no padding */,
-                int_key, kCCKeySizeAES256, iv_zero,
-                params->ue_value, 32,
-                file_key, 32, &fk_out);
-
-        /* /Perms is encrypted with AES-256-ECB */
-        uint8_t perms_plain[16] = {0};
-        size_t pp_out = 0;
-        CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode,
-                file_key, kCCKeySizeAES256, NULL,
-                params->perms_value, 16,
-                perms_plain, 16, &pp_out);
-
-        if (pp_out != 16 ||
-            perms_plain[9] != 'a' || perms_plain[10] != 'd' || perms_plain[11] != 'b')
-            return 0;
-    }
 
     return 1;
 }
@@ -984,7 +941,7 @@ static int verify_owner_r6(const PDFEncryptParams *params, const char *password)
 
     const uint8_t *pw_data;
     size_t pw_len;
-    normalize_password_r6(password, &pw_data, &pw_len);
+    normalize_password_saslprep(password, &pw_data, &pw_len);
 
     uint8_t hash[32];
     algorithm_2b(pw_data, pw_len,
@@ -1042,9 +999,9 @@ static inline void rc4_owner_decrypt(const uint8_t *key, int key_len, uint8_t da
         uint8_t mod_key[16];
         for (int j = 0; j < key_len; j++)
             mod_key[j] = key[j] ^ (uint8_t)r;
-        uint8_t temp[32];
-        rc4_encrypt(mod_key, key_len, data, temp, 32);
-        memcpy(data, temp, 32);
+        /* In-place (src==dst) is safe: rc4_crypt writes each byte from the
+         * same-index input before advancing. Drops the temp + memcpy. */
+        rc4_encrypt(mod_key, key_len, data, data, 32);
     }
 }
 
@@ -1123,10 +1080,13 @@ int pdf_verify_user_batch4(const PDFEncryptParams *params,
 
     /* ── Algorithm 2 (key derivation) for all 4 passwords ──────── */
 
-    /* Step a: Pad each password to 32 bytes */
+    /* Step a: Pad each password to 32 bytes. Honor the caller-supplied
+     * length (NUL-safe, matching the scalar path) rather than strlen'ing. */
     uint8_t padded[4][32];
-    for (int i = 0; i < 4; i++)
-        pad_password(pw[i], padded[i]);
+    for (int i = 0; i < 4; i++) {
+        size_t plen = (pwlen && pwlen[i] > 0) ? (size_t)pwlen[i] : 0;
+        pad_password_len((const uint8_t *)pw[i], plen, padded[i]);
+    }
 
     /* Steps b-f: Build the MD5 input for each password.
      * Input = padded(32) + O(32) + P(4) + fileID(N) [+ 0xFFFFFFFF if R>=4 && !encryptMeta]
@@ -1314,10 +1274,12 @@ int pdf_verify_owner_batch4(const PDFEncryptParams *params,
 
     /* ── Owner key derivation for all 4 passwords (SIMD MD5) ── */
 
-    /* Step a: Pad each owner password to 32 bytes */
+    /* Step a: Pad each owner password to 32 bytes (NUL-safe via pwlen). */
     uint8_t padded[4][32];
-    for (int i = 0; i < 4; i++)
-        pad_password(pw[i], padded[i]);
+    for (int i = 0; i < 4; i++) {
+        size_t plen = (pwlen && pwlen[i] > 0) ? (size_t)pwlen[i] : 0;
+        pad_password_len((const uint8_t *)pw[i], plen, padded[i]);
+    }
 
     /* Step b: MD5 hash of padded password (4-way SIMD) */
     const uint8_t *ptrs[4] = { padded[0], padded[1], padded[2], padded[3] };
